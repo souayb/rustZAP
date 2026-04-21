@@ -1,0 +1,67 @@
+[package]
+name = "rustzap"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust-based web application security scanner inspired by OWASP ZAP"
+authors = ["RustZAP Contributors"]
+license = "MIT"
+
+[[bin]]
+name = "rustzap"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json", "cookies", "gzip", "deflate", "rustls-tls"], default-features = false }
+
+# Proxy server
+hyper = { version = "0.14", features = ["full"] }
+hyper-rustls = "0.24"
+rustls = "0.21"
+tokio-rustls = "0.24"
+
+# HTML parsing / spidering
+scraper = "0.18"
+
+# CLI
+clap = { version = "4", features = ["derive", "color"] }
+colored = "2"
+indicatif = "0.17"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# URL handling
+url = "2"
+
+# Regex
+regex = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async traits
+async-trait = "0.1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random
+rand = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Channel
+tokio-channel = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
