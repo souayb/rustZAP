@@ -130,29 +130,4 @@ The platform is deployed via Helm charts.
 *   **Encryption**: TLS 1.3 in transit. AES-256 for data at rest (especially for stored Git tokens and credentials).
 *   **Self-Scanning**: The platform must scan itself using its own tools (RustZAP, Semgrep, Trivy) in its CI pipeline.
 
-## 12. Frontend Dashboard Structure
-
-Built with React/Next.js and Tailwind CSS.
-
-*   **Overview Dashboard**: High-level metrics, risk scores across projects, and recent critical alerts.
-*   **Project Detail View**: specific repo/app health, historical trends.
-*   **Findings Triage**: A data grid showing all normalized findings. Features: Filtering, grouping by correlation, ignoring false positives, and ticketing (Jira integration).
-*   **CI/CD Pipeline View**: Visual representation of the security pipeline for a given build.
-*   **Remediation Hub**: Provides actionable advice (e.g., linking Checkov IaC fixes directly to the repo).
-
-## 13. MVP Roadmap
-
-### Phase 1: Foundation (Months 1-2)
-*   Deploy Core Orchestrator and Database schemas.
-*   Integrate RustZAP (DAST) and Semgrep (SAST) via worker nodes.
-*   Basic API and Findings Normalization.
-
-### Phase 2: Complete Toolchain (Months 3-4)
-*   Integrate Trivy, Gitleaks, Checkov.
-*   Develop Frontend Dashboard (Overview and Triage views).
-*   Implement GitHub Actions / GitLab CI templates.
-
-### Phase 3: Advanced Correlation (Months 5-6)
-*   Deploy Falco and the Runtime Correlation Engine.
-*   Implement Jira integration for ticketing.
-*   Release Plugin SDK for third-party integrations.
+ 
