@@ -90,6 +90,17 @@ rustzap proxy --listen 0.0.0.0:9090 --passive --dump captured.json
 Then configure your browser's HTTP proxy to `127.0.0.1:8080` and browse normally.
 Press `Ctrl+C` to stop and save captured transactions.
 
+### Interactive Terminal Dashboard (TUI)
+
+RustZAP includes a fast, Ratatui-powered terminal user interface to view and interact with your scan findings.
+
+```bash
+# Launch the dashboard (automatically parses report.json or rustzap-report.json)
+rustzap tui
+```
+
+Use `↑`/`↓` or `j`/`k` to navigate through the list of findings. Press `q` to quit.
+
 ### Passive Analysis Only
 
 ```bash
