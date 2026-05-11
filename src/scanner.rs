@@ -1,13 +1,14 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use base64::Engine;
 
 use anyhow::Result;
 use colored::*;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::sync::Mutex;
 
 use crate::active::ActiveScanner;
+use crate::events::{ScanEvent, ScanPhase};
 use crate::passive::PassiveScanner;
 use crate::report::Report;
 use crate::spider::Spider;
@@ -217,6 +218,185 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
         "✓ Report saved to:".bright_green().bold(),
         config.output_file.bright_cyan()
     );
+
+    Ok(())
+}
+
+/// TUI-friendly scan: identical phases to `run_scan`, but emits events through
+/// an mpsc channel instead of printing to stdout. Used by the interactive TUI.
+pub async fn run_scan_with_events(
+    config: ScanConfig,
+    tx: tokio::sync::mpsc::UnboundedSender<ScanEvent>,
+) -> Result<()> {
+    let start = Instant::now();
+
+    let _ = tx.send(ScanEvent::Started {
+        target: config.target_url.clone(),
+    });
+    let _ = tx.send(ScanEvent::Log(format!(
+        "depth={} concurrency={} passive_only={} plugins=[{}]",
+        config.max_depth,
+        config.concurrency,
+        config.passive_only,
+        config.plugins.join(",")
+    )));
+
+    let client = Arc::new(build_client(&config)?);
+
+    // ── Phase 1: Spider ────────────────────────────────────────────
+    let _ = tx.send(ScanEvent::PhaseStarted {
+        phase: ScanPhase::Spider,
+        total: None,
+    });
+
+    let spider_pb = ProgressBar::with_draw_target(Some(0), ProgressDrawTarget::hidden());
+    let spider = Spider::new(
+        client.clone(),
+        config.target_url.clone(),
+        config.max_depth,
+        config.concurrency,
+    );
+
+    // Tick task forwards spider progress as it crawls
+    let tick_tx = tx.clone();
+    let tick_pb = spider_pb.clone();
+    let spider_tick = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let _ = tick_tx.send(ScanEvent::SpiderProgress {
+                discovered: tick_pb.position() as usize,
+                message: tick_pb.message().to_string(),
+            });
+            if tick_pb.is_finished() {
+                break;
+            }
+        }
+    });
+
+    let discovered = spider.crawl(&spider_pb).await?;
+    spider_pb.finish();
+    let _ = spider_tick.await;
+
+    let _ = tx.send(ScanEvent::SpiderProgress {
+        discovered: discovered.len(),
+        message: format!("Discovered {} URLs", discovered.len()),
+    });
+
+    // ── Phase 2: Passive ───────────────────────────────────────────
+    let _ = tx.send(ScanEvent::PhaseStarted {
+        phase: ScanPhase::Passive,
+        total: Some(discovered.len()),
+    });
+
+    let passive_pb = ProgressBar::with_draw_target(
+        Some(discovered.len() as u64),
+        ProgressDrawTarget::hidden(),
+    );
+    let total = discovered.len();
+    let tick_tx = tx.clone();
+    let tick_pb = passive_pb.clone();
+    let passive_tick = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = tick_tx.send(ScanEvent::PassiveProgress {
+                done: tick_pb.position() as usize,
+                total,
+            });
+            if tick_pb.is_finished() {
+                break;
+            }
+        }
+    });
+
+    let passive_scanner = PassiveScanner::new(client.clone());
+    let passive_findings = passive_scanner.scan_all(&discovered, &passive_pb).await?;
+    passive_pb.finish();
+    let _ = passive_tick.await;
+
+    for f in &passive_findings {
+        let _ = tx.send(ScanEvent::Finding(f.clone()));
+    }
+    let _ = tx.send(ScanEvent::PassiveProgress {
+        done: discovered.len(),
+        total: discovered.len(),
+    });
+
+    let mut all_findings = passive_findings;
+
+    // ── Phase 3: Active ────────────────────────────────────────────
+    if !config.passive_only {
+        let _ = tx.send(ScanEvent::PhaseStarted {
+            phase: ScanPhase::Active,
+            total: Some(discovered.len()),
+        });
+
+        let active_pb = ProgressBar::with_draw_target(
+            Some(discovered.len() as u64),
+            ProgressDrawTarget::hidden(),
+        );
+        let total = discovered.len();
+        let tick_tx = tx.clone();
+        let tick_pb = active_pb.clone();
+        let active_tick = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = tick_tx.send(ScanEvent::ActiveProgress {
+                    done: tick_pb.position() as usize,
+                    total,
+                });
+                if tick_pb.is_finished() {
+                    break;
+                }
+            }
+        });
+
+        let active_scanner =
+            ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
+        let active_findings = active_scanner.scan_all(&discovered, &active_pb).await?;
+        active_pb.finish();
+        let _ = active_tick.await;
+
+        for f in &active_findings {
+            let _ = tx.send(ScanEvent::Finding(f.clone()));
+        }
+        let _ = tx.send(ScanEvent::ActiveProgress {
+            done: discovered.len(),
+            total: discovered.len(),
+        });
+        all_findings.extend(active_findings);
+    }
+
+    // ── Phase 4: Report ────────────────────────────────────────────
+    let _ = tx.send(ScanEvent::PhaseStarted {
+        phase: ScanPhase::Done,
+        total: None,
+    });
+
+    let elapsed = start.elapsed();
+    let report = Report::new(
+        &config.target_url,
+        discovered.clone(),
+        all_findings,
+        elapsed,
+    );
+
+    let total_findings = report.summary.total_findings;
+    let risk_score = report.summary.risk_score;
+
+    if config.output_file.ends_with(".csv") {
+        report.save_csv(&config.output_file).await?;
+    } else if config.output_file.ends_with(".html") {
+        report.save_html(&config.output_file).await?;
+    } else {
+        report.save_json(&config.output_file).await?;
+    }
+
+    let _ = tx.send(ScanEvent::Completed {
+        duration_secs: elapsed.as_secs_f64(),
+        total_findings,
+        risk_score,
+        report_path: config.output_file,
+    });
 
     Ok(())
 }
