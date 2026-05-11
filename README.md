@@ -54,11 +54,17 @@ rustzap scan \
   --concurrency 20 \
   --output report.json
 
-# Authenticated scan with cookie
+# Export to CSV or HTML formats
+rustzap scan --target https://example.com --output report.csv
+rustzap scan --target https://example.com --output report.html
+
+# Authenticated scan with cookies, API key, and Basic Auth
 rustzap scan \
   --target https://app.example.com \
   --cookies "session=abc123; role=admin" \
-  --auth "Bearer eyJhbGciOiJIUzI1NiJ9..."
+  --auth "Bearer eyJhbGciOiJIUzI1NiJ9..." \
+  --api-key "X-Api-Key: my-secret-key" \
+  --basic-auth "username:password"
 
 # Passive-only (no attack payloads sent)
 rustzap scan --target https://example.com --passive-only

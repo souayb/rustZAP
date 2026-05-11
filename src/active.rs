@@ -1,4 +1,4 @@
-// use std::collections::HashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,7 +131,7 @@ pub fn build_injection_urls_adv(target: &DiscoveredUrl, payload: &str) -> Vec<(S
     let mut variants = Vec::new();
 
     // Inject into query string params
-    if let Ok( parsed) = url::Url::parse(&target.url) {
+    if let Ok(mut parsed) = url::Url::parse(&target.url) {
         let params: Vec<(String, String)> = parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         for (key, _) in &params {
             let mut modified = parsed.clone();

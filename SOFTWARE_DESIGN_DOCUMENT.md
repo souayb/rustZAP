@@ -26,9 +26,12 @@ Responsible for triggering scans based on CI/CD webhooks or scheduled intervals.
 Each tool runs as an independent worker listening to a specific queue.
 *   **SAST Worker**: Runs Semgrep on source code.
 *   **SCA/Container Worker**: Runs Trivy on Docker images and dependencies.
-*   **DAST Worker**: Runs **RustZAP** against staging and production web applications for active/passive scanning and stress testing.
+*   **DAST Worker**: Runs **RustZAP** (and potentially tools like Wapiti and Nikto) against staging and production web applications for active/passive scanning and stress testing.
 *   **Secret Scanner Worker**: Runs Gitleaks on commits and PRs.
 *   **IaC Scanner Worker**: Runs Checkov on Terraform/Kubernetes manifests.
+*   **Reconnaissance & Network Worker**: Runs Nmap and Wireshark for mapping topologies, port scanning, and deep packet inspection.
+*   **Password/Auth Testing Worker**: Runs tools like Hashcat, John The Ripper, Hydra, or Medusa for dictionary, brute-force, and hash-cracking tasks.
+*   **Wireless Security Worker**: Integrates Aircrack-ng or Wifite for wireless network auditing and monitoring.
 
 ### 3.3 Normalization Module
 Takes diverse JSON outputs from different tools (e.g., RustZAP's `rustzap-report.json`, Trivy's JSON) and converts them into a Unified Finding Format (UFF).
@@ -43,6 +46,8 @@ Our strategy leverages native containerization and the existing JSON reporting c
 *   **Gitleaks (Secrets)**: Runs as a pre-commit hook and on every push event to detect hardcoded secrets.
 *   **Checkov (IaC)**: Integrated into the deployment pipeline to block insecure infrastructure before it is provisioned.
 *   **Falco (Runtime)**: Runs as a DaemonSet on K8s nodes. Falco alerts are ingested via webhooks into the Runtime Correlation Engine.
+*   **Reconnaissance (Nmap / Wireshark)**: Scans infrastructure perimeters to enrich assets and ports mapped to discovered apps.
+*   **Authentication Exploitation (Hashcat / John The Ripper)**: Uses known hashed password dumps or brute-forcing mechanisms continuously to identify weak authentication vectors automatically.
 
 ## 5. Runtime Correlation Engine
 
@@ -130,4 +135,34 @@ The platform is deployed via Helm charts.
 *   **Encryption**: TLS 1.3 in transit. AES-256 for data at rest (especially for stored Git tokens and credentials).
 *   **Self-Scanning**: The platform must scan itself using its own tools (RustZAP, Semgrep, Trivy) in its CI pipeline.
 
- 
+## 12. Frontend Dashboard Structure
+
+Built with React/Next.js and Tailwind CSS.
+
+*   **Overview Dashboard**: High-level metrics, risk scores across projects, and recent critical alerts.
+*   **Project Detail View**: specific repo/app health, historical trends.
+*   **Findings Triage**: A data grid showing all normalized findings. Features: Filtering, grouping by correlation, ignoring false positives, and ticketing (Jira integration).
+*   **CI/CD Pipeline View**: Visual representation of the security pipeline for a given build.
+*   **Remediation Hub**: Provides actionable advice (e.g., linking Checkov IaC fixes directly to the repo).
+
+## 13. MVP Roadmap
+
+### Phase 1: Foundation (Months 1-2)
+*   Deploy Core Orchestrator and Database schemas.
+*   Integrate RustZAP (DAST) and Semgrep (SAST) via worker nodes.
+*   Basic API and Findings Normalization.
+
+### Phase 2: Complete Toolchain (Months 3-4)
+*   Integrate Trivy, Gitleaks, Checkov.
+*   Develop Frontend Dashboard (Overview and Triage views).
+*   Implement GitHub Actions / GitLab CI templates.
+
+### Phase 3: Advanced Correlation (Months 5-6)
+*   Deploy Falco and the Runtime Correlation Engine.
+*   Implement Jira integration for ticketing.
+*   Release Plugin SDK for third-party integrations.
+
+### Phase 4: Extended Pentesting Suite (Months 7-8)
+*   Integrate network Reconnaissance capabilities (Nmap, Wireshark).
+*   Add password security & cracking tools (Hashcat, John The Ripper, Hydra).
+*   Incorporate specialized scanning features (Nikto, Wapiti) and WiFi audits (Aircrack-ng).
