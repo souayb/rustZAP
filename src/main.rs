@@ -7,6 +7,8 @@ mod report;
 mod stress;
 mod types;
 mod tui;
+mod events;
+mod tools;
 
 use clap::{Parser, Subcommand};
 use colored::*;

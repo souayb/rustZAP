@@ -23,7 +23,10 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | 🔍 **Passive Scanner** | Analyzes headers and responses for misconfigurations |
 | 💥 **Active Scanner** | Injects attack payloads to find real vulnerabilities |
 | 🔀 **Intercepting Proxy** | HTTP(S) proxy for manual browsing + passive analysis |
-| 📊 **JSON Reports** | Machine-readable findings with OWASP/CWE references |
+| 📊 **JSON / CSV / HTML Reports** | Machine-readable findings with OWASP/CWE references |
+| 🖥️ **Interactive TUI** | Five-tab Ratatui console — configure, launch, monitor scans, drill into findings |
+| 🧰 **Unified Tool Console** | Detects & runs Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Falco, Hashcat, John, Hydra and more from the TUI |
+| 🚀 **Stress Tester** | 5-mode load tester with percentile latency, timeline, and JSON report |
 
 ---
 
@@ -96,16 +99,88 @@ rustzap proxy --listen 0.0.0.0:9090 --passive --dump captured.json
 Then configure your browser's HTTP proxy to `127.0.0.1:8080` and browse normally.
 Press `Ctrl+C` to stop and save captured transactions.
 
-### Interactive Terminal Dashboard (TUI)
+### Interactive Pentesting Console (TUI)
 
-RustZAP includes a fast, Ratatui-powered terminal user interface to view and interact with your scan findings.
+RustZAP ships with a full multi-tab Ratatui-powered console — the operator's "single pane of glass" from the SDD. It lets you configure scans, launch them, watch live phase progress, browse findings, and drive the SDD's external tools (Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Hashcat, John, Hydra, Medusa, Aircrack-ng, Wifite, Falco, tshark) — all without leaving the terminal.
 
 ```bash
-# Launch the dashboard (automatically parses report.json or rustzap-report.json)
 rustzap tui
 ```
 
-Use `↑`/`↓` or `j`/`k` to navigate through the list of findings. Press `q` to quit.
+On launch the TUI auto-loads `report.json` or `rustzap-report.json` if either exists, so you can review prior scans immediately.
+
+#### Tabs
+
+| Tab | What you see | What you can do |
+|---|---|---|
+| **1·Dashboard** | Target card, color-coded risk score (0–100), severity bar chart, top-20 findings | At-a-glance posture overview |
+| **2·Scan** | Inline config form + 3 live phase gauges (Spider · Passive · Active) + streaming findings | Edit target/plugins/output, toggle passive/insecure, tune depth/concurrency, start/cancel scans |
+| **3·Findings** | Findings list + scrolling detail pane (title, CWE, OWASP, evidence, solution) | Browse, severity-filter, deep-dive into each finding |
+| **4·Tools** | Inventory of 15 SDD-listed tools with install status, role, default cmdline | Run any installed tool against the current target — output streams to Logs |
+| **5·Logs** | Timestamped event stream from scans + tool runs (color-coded by type) | Scroll, jump to bottom, clear |
+
+#### Key bindings
+
+**Global**
+
+| Key | Action |
+|---|---|
+| `1`–`5` | Jump to tab |
+| `Tab` / `Shift+Tab` | Cycle tabs |
+| `q` | Quit (aborts running scans/tools) |
+
+**Scan tab**
+
+| Key | Action |
+|---|---|
+| `t` | Edit target URL |
+| `P` | Edit active-scan plugins (comma-separated) |
+| `o` | Edit output file (`.json` / `.csv` / `.html`) |
+| `p` | Toggle passive-only mode |
+| `i` | Toggle insecure TLS |
+| `+` / `-` | Increment / decrement crawl depth |
+| `]` / `[` | Increment / decrement concurrency |
+| `s` | Start scan |
+| `x` | Cancel running scan |
+| `Enter` / `Esc` | Commit / cancel field edit |
+
+**Findings tab**
+
+| Key | Action |
+|---|---|
+| `j` / `k` (or `↓` / `↑`) | Navigate findings |
+| `PgUp` / `PgDn` | Scroll detail pane |
+| `f` | Cycle severity filter (all → Critical → High → Medium → Low → Info → all) |
+| `c` | Clear filter |
+
+**Tools tab**
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Navigate tool list |
+| `r` or `Enter` | Run the highlighted tool (uses configured target if required) |
+| `R` | Re-detect tools on PATH |
+
+**Logs tab**
+
+| Key | Action |
+|---|---|
+| `j` / `k` / `PgUp` / `PgDn` | Scroll |
+| `G` | Jump to bottom |
+| `c` | Clear log buffer |
+
+#### Quick walkthrough
+
+```bash
+rustzap tui            # opens the console
+# → press '2' to go to the Scan tab
+# → press 't', type https://example.com, Enter
+# → press 's' to launch — Spider/Passive/Active gauges fill live
+# → press '3' to browse findings, 'f' to filter by severity
+# → press '4' to see which SDD tools are installed; 'r' runs the highlighted one
+# → press '5' to watch live event logs
+# → 'q' to quit
+```
 
 ### Passive Analysis Only
 
@@ -370,13 +445,16 @@ rustzap/
 ├── src/
 │   ├── main.rs          # CLI (clap) — entry point & subcommands
 │   ├── types.rs         # Shared data types (Finding, Severity, HttpTransaction…)
-│   ├── scanner.rs       # Full-scan orchestrator
+│   ├── scanner.rs       # Full-scan orchestrator (+ TUI event-emitting variant)
 │   ├── spider.rs        # Recursive crawler (links, forms, JS)
 │   ├── passive.rs       # Passive checks (headers, cookies, body analysis)
-│   ├── active.rs        # Active scanner + 8 attack plugins
+│   ├── active.rs        # Active scanner + attack plugins
 │   ├── proxy.rs         # Intercepting HTTP proxy (hyper)
 │   ├── stress.rs        # Load/stress tester (5 modes, percentiles, timeline)
-│   └── report.rs        # JSON report generation
+│   ├── report.rs        # JSON / CSV / HTML report generation
+│   ├── events.rs        # ScanEvent / ScanPhase — telemetry for the TUI
+│   ├── tools.rs         # External tool detection + streaming runner (Semgrep, Trivy, …)
+│   └── tui.rs           # Multi-tab interactive console (Dashboard / Scan / Findings / Tools / Logs)
 └── Cargo.toml
 ```
 
