@@ -6,6 +6,7 @@ mod active;
 mod report;
 mod stress;
 mod types;
+mod tui;
 
 use clap::{Parser, Subcommand};
 use colored::*;
@@ -53,6 +54,10 @@ enum Commands {
         #[arg(long)]
         auth: Option<String>,
         #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long)]
+        basic_auth: Option<String>,
+        #[arg(long)]
         insecure: bool,
         #[arg(long, default_value = "xss,sqli,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti")]
         plugins: String,
@@ -98,6 +103,7 @@ enum Commands {
     ///   soak      — long-duration constant load (find leaks/degradation)
     ///   requests  — send exactly N requests at given concurrency
     Stress {
+        /// Target URL
         /// Target URL
         #[arg(short, long)]
         target: String,
@@ -174,6 +180,9 @@ enum Commands {
         #[arg(long)]
         requests: Option<usize>,
     },
+
+    /// Launch the interactive terminal UI (TUI)
+    Tui,
 }
 
 #[tokio::main]
@@ -196,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Scan {
             target, depth, concurrency, passive_only, output,
-            timeout, user_agent, cookies, auth, insecure, plugins,
+            timeout, user_agent, cookies, auth, api_key, basic_auth, insecure, plugins,
         } => {
             let config = ScanConfig {
                 target_url: target,
@@ -208,6 +217,8 @@ async fn main() -> anyhow::Result<()> {
                 user_agent,
                 cookies,
                 auth_header: auth,
+                api_key,
+                basic_auth,
                 insecure,
                 plugins: plugins.split(',').map(|s| s.trim().to_string()).collect(),
             };
@@ -228,6 +239,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Plugins => {
             active::list_plugins();
+        }
+
+        Commands::Tui => {
+            tui::run_tui().await.expect("TUI error");
         }
 
         Commands::Stress {

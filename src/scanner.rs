@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Instant;
+use base64::Engine;
 
 use anyhow::Result;
 use colored::*;
@@ -24,6 +25,8 @@ pub struct ScanConfig {
     pub user_agent: Option<String>,
     pub cookies: Option<String>,
     pub auth_header: Option<String>,
+    pub api_key: Option<String>,
+    pub basic_auth: Option<String>,
     pub insecure: bool,
     pub plugins: Vec<String>,
 }
@@ -42,22 +45,47 @@ pub fn build_client(config: &ScanConfig) -> Result<reqwest::Client> {
         .unwrap_or_else(|| "RustZAP/0.1 (Security Scanner)".to_string());
     builder = builder.user_agent(ua);
 
+    let mut default_headers = reqwest::header::HeaderMap::new();
+
     if let Some(cookies) = &config.cookies {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
+        default_headers.insert(
             reqwest::header::COOKIE,
             reqwest::header::HeaderValue::from_str(cookies)?,
         );
-        builder = builder.default_headers(headers);
     }
 
     if let Some(auth) = &config.auth_header {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
+        default_headers.insert(
             reqwest::header::AUTHORIZATION,
             reqwest::header::HeaderValue::from_str(auth)?,
         );
-        builder = builder.default_headers(headers);
+    }
+
+    if let Some(api_key) = &config.api_key {
+        // Assume format is "Header-Name: Value"
+        if let Some((k, v)) = api_key.split_once(':') {
+            if let Ok(key) = reqwest::header::HeaderName::from_bytes(k.trim().as_bytes()) {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(v.trim()) {
+                    default_headers.insert(key, val);
+                }
+            }
+        }
+    }
+
+    if let Some(basic_auth) = &config.basic_auth {
+        // basic_auth expected as "username:password"
+        let encoded = base64::engine::general_purpose::STANDARD.encode(basic_auth);
+        let auth_val = format!("Basic {}", encoded);
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&auth_val) {
+            default_headers.insert(
+                reqwest::header::AUTHORIZATION,
+                val,
+            );
+        }
+    }
+
+    if !default_headers.is_empty() {
+        builder = builder.default_headers(default_headers);
     }
 
     Ok(builder.build()?)
@@ -175,7 +203,14 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
         all_findings,
         elapsed,
     );
-    report.save_json(&config.output_file).await?;
+
+    if config.output_file.ends_with(".csv") {
+        report.save_csv(&config.output_file).await?;
+    } else if config.output_file.ends_with(".html") {
+        report.save_html(&config.output_file).await?;
+    } else {
+        report.save_json(&config.output_file).await?;
+    }
 
     println!(
         "\n{} {}",
