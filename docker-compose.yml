@@ -1,0 +1,41 @@
+# docker-compose.yml — RustZAP unified DevSecOps console
+#
+# Quick start:
+#   docker compose run --rm rustzap           # drops into the interactive TUI
+#   docker compose run --rm rustzap scan --target https://example.com
+#   docker compose run --rm rustzap stress --target https://api.example.com --users 50
+#
+# Reports written to ./reports/ on the host via the volume mount.
+
+services:
+  rustzap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rustzap:latest
+    container_name: rustzap
+    # Interactive TUI needs a tty + stdin
+    tty: true
+    stdin_open: true
+    environment:
+      - TERM=xterm-256color
+      - RUST_LOG=rustzap=info
+    volumes:
+      - ./reports:/workspace
+      - ./:/source:ro
+    working_dir: /workspace
+    ports:
+      - "8080:8080"          # intercepting proxy
+    # Override CMD for a one-shot scan with `docker compose run rustzap scan ...`
+    # By default the bare entrypoint launches the TUI.
+    command: []
+
+  # Optional intentionally-vulnerable target for testing.
+  # Bring it up with: docker compose --profile labs up -d juice-shop
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: rustzap-juice-shop
+    profiles: ["labs"]
+    ports:
+      - "3000:3000"
+    restart: unless-stopped

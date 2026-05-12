@@ -9,6 +9,7 @@ mod types;
 mod tui;
 mod events;
 mod tools;
+mod installer;
 
 use clap::{Parser, Subcommand};
 use colored::*;
@@ -26,7 +27,7 @@ use crate::stress::StressCliArgs;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -183,8 +184,29 @@ enum Commands {
         requests: Option<usize>,
     },
 
-    /// Launch the interactive terminal UI (TUI)
+    /// Launch the interactive terminal UI (TUI). Aliases: `ui`, `console`.
+    #[command(alias = "ui", alias = "console")]
     Tui,
+
+    /// Install SDD companion tools (Semgrep, Trivy, Gitleaks, …) for this OS.
+    ///
+    /// Detects macOS / Debian / Fedora / Arch / Alpine and dispatches to the
+    /// right package manager. Aliases: `setup`.
+    #[command(alias = "setup")]
+    Install {
+        /// Print the plan without running anything
+        #[arg(long)]
+        dry_run: bool,
+        /// List supported tools + install commands for the detected OS
+        #[arg(short, long)]
+        list: bool,
+        /// Install only the named tool (e.g. semgrep, trivy, gitleaks)
+        #[arg(long)]
+        tool: Option<String>,
+        /// Assume yes — non-interactive
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -202,9 +224,15 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
+    // Bare `rustzap` (no subcommand) → drop straight into the interactive TUI.
+    let Some(command) = cli.command else {
+        tui::run_tui().await.expect("TUI error");
+        return Ok(());
+    };
+
     print_banner();
 
-    match cli.command {
+    match command {
         Commands::Scan {
             target, depth, concurrency, passive_only, output,
             timeout, user_agent, cookies, auth, api_key, basic_auth, insecure, plugins,
@@ -245,6 +273,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Tui => {
             tui::run_tui().await.expect("TUI error");
+        }
+
+        Commands::Install { dry_run, list, tool, yes } => {
+            installer::run(dry_run, tool, yes, list).await?;
         }
 
         Commands::Stress {

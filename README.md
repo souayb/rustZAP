@@ -32,13 +32,80 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 
 ## Installation
 
+### From source
+
 ```bash
-# Build from source (requires Rust 1.75+)
+# Requires Rust 1.75+
 git clone https://github.com/you/rustzap
 cd rustzap
 cargo build --release
 ./target/release/rustzap --help
 ```
+
+### Install companion tools (OS-aware)
+
+The SDD calls for a unified console driving Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, tshark, Hashcat, John, Hydra, Medusa, and Aircrack-ng. RustZAP can install them for you — it auto-detects your OS and dispatches to the right package manager.
+
+```bash
+rustzap install --list           # see what would be installed on this OS
+rustzap install --dry-run        # print the exact commands, run nothing
+rustzap install                  # interactive install (asks per tool)
+rustzap install --yes            # non-interactive, install everything available
+rustzap install --tool semgrep   # install just one tool
+```
+
+Supported package managers:
+
+| OS | Manager |
+|---|---|
+| macOS | Homebrew |
+| Debian / Ubuntu / Kali | apt + pipx |
+| Fedora / RHEL / Rocky | dnf + pipx |
+| Arch / Manjaro | pacman + pipx |
+| Alpine | apk + pip3 |
+
+The same logic is available as a standalone shell script:
+
+```bash
+./scripts/install-tools.sh --list       # show plan
+./scripts/install-tools.sh --yes        # install everything available
+./scripts/install-tools.sh --tool nmap  # install one
+```
+
+### Docker
+
+A multi-stage `Dockerfile` ships RustZAP with all companion tools pre-installed (no host setup needed):
+
+```bash
+# Build the image (~600 MB, includes Semgrep/Trivy/Gitleaks/Nmap/...)
+docker build -t rustzap .
+
+# Drop into the TUI (interactive)
+docker run --rm -it -v "$PWD/reports:/workspace" rustzap
+
+# One-shot scan from CLI
+docker run --rm -v "$PWD/reports:/workspace" rustzap \
+    scan --target https://example.com --output /workspace/report.json
+
+# Intercepting proxy on host port 8080
+docker run --rm -p 8080:8080 rustzap proxy --listen 0.0.0.0:8080
+```
+
+### docker-compose
+
+```bash
+# Drop into the TUI
+docker compose run --rm rustzap
+
+# One-shot scan with reports written to ./reports/ on the host
+docker compose run --rm rustzap scan --target https://example.com -o /workspace/report.json
+
+# Bring up the optional Juice-Shop lab target
+docker compose --profile labs up -d juice-shop
+docker compose run --rm rustzap scan --target http://juice-shop:3000
+```
+
+The compose file mounts `./reports → /workspace` and exposes the intercepting proxy on `:8080`.
 
 ---
 
@@ -104,10 +171,13 @@ Press `Ctrl+C` to stop and save captured transactions.
 RustZAP ships with a full multi-tab Ratatui-powered console — the operator's "single pane of glass" from the SDD. It lets you configure scans, launch them, watch live phase progress, browse findings, and drive the SDD's external tools (Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Hashcat, John, Hydra, Medusa, Aircrack-ng, Wifite, Falco, tshark) — all without leaving the terminal.
 
 ```bash
-rustzap tui
+rustzap            # bare command → drops straight into the TUI
+rustzap tui        # explicit subcommand
+rustzap ui         # alias
+rustzap console    # alias
 ```
 
-On launch the TUI auto-loads `report.json` or `rustzap-report.json` if either exists, so you can review prior scans immediately.
+Running `rustzap` with no arguments launches the console immediately — useful as a daily-driver entry point. On launch the TUI auto-loads `report.json` or `rustzap-report.json` if either exists, so you can review prior scans without re-running.
 
 #### Tabs
 
@@ -454,7 +524,12 @@ rustzap/
 │   ├── report.rs        # JSON / CSV / HTML report generation
 │   ├── events.rs        # ScanEvent / ScanPhase — telemetry for the TUI
 │   ├── tools.rs         # External tool detection + streaming runner (Semgrep, Trivy, …)
+│   ├── installer.rs     # OS-aware companion-tool installer (`rustzap install`)
 │   └── tui.rs           # Multi-tab interactive console (Dashboard / Scan / Findings / Tools / Logs)
+├── scripts/
+│   └── install-tools.sh # Canonical shell installer — used by Dockerfile & host
+├── Dockerfile           # Multi-stage build with all companion tools pre-installed
+├── docker-compose.yml   # Compose service + optional Juice-Shop lab target
 └── Cargo.toml
 ```
 
