@@ -35,7 +35,10 @@ pub async fn run_proxy(listen: &str, dump: Option<String>, passive: bool) -> Res
     );
 
     if passive {
-        println!("{}", "  ↳ Passive analysis enabled on intercepted traffic".dimmed());
+        println!(
+            "{}",
+            "  ↳ Passive analysis enabled on intercepted traffic".dimmed()
+        );
     }
     if let Some(path) = &dump {
         println!(
@@ -64,11 +67,7 @@ pub async fn run_proxy(listen: &str, dump: Option<String>, passive: bool) -> Res
 
     let make_svc = make_service_fn(move |_conn| {
         let state = state_clone.clone();
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                handle_request(req, state.clone())
-            }))
-        }
+        async move { Ok::<_, Infallible>(service_fn(move |req| handle_request(req, state.clone()))) }
     });
 
     let server = Server::bind(&addr).serve(make_svc);
@@ -79,7 +78,9 @@ pub async fn run_proxy(listen: &str, dump: Option<String>, passive: bool) -> Res
     let dump_path_for_shutdown = dump.clone();
 
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
         println!("\n{}", "\n▶ Stopping proxy...".bright_yellow());
 
         let s = state_for_shutdown.lock().await;
@@ -165,11 +166,17 @@ async fn handle_request(
         method: method.clone(),
         url: forward_uri.clone(),
         headers: headers.clone(),
-        body: if body_str.is_empty() { None } else { Some(body_str.clone()) },
+        body: if body_str.is_empty() {
+            None
+        } else {
+            Some(body_str.clone())
+        },
     };
 
     // Build forwarded request
-    let mut forward_req = Request::builder().method(parts.method.clone()).uri(&forward_uri);
+    let mut forward_req = Request::builder()
+        .method(parts.method.clone())
+        .uri(&forward_uri);
 
     for (k, v) in &headers {
         // Skip proxy-specific headers
@@ -226,14 +233,20 @@ async fn handle_request(
 
             if passive_mode && status == 200 {
                 // Quick passive check on response headers
-                if !resp_headers.iter().any(|(k, _)| k.to_lowercase() == "x-frame-options") {
+                if !resp_headers
+                    .iter()
+                    .any(|(k, _)| k.to_lowercase() == "x-frame-options")
+                {
                     println!(
                         "    {} Missing X-Frame-Options at {}",
                         "[PASSIVE][LOW]".bright_yellow(),
                         forward_uri
                     );
                 }
-                if !resp_headers.iter().any(|(k, _)| k.to_lowercase() == "content-security-policy") {
+                if !resp_headers
+                    .iter()
+                    .any(|(k, _)| k.to_lowercase() == "content-security-policy")
+                {
                     println!(
                         "    {} Missing CSP at {}",
                         "[PASSIVE][MED]".yellow(),
@@ -264,9 +277,9 @@ async fn handle_request(
                 }
             }
 
-            Ok(response.body(Body::from(resp_bytes)).unwrap_or_else(|_| {
-                Response::new(Body::from("Error building response"))
-            }))
+            Ok(response
+                .body(Body::from(resp_bytes))
+                .unwrap_or_else(|_| Response::new(Body::from("Error building response"))))
         }
         Err(e) => {
             warn!("Proxy forward error: {}", e);

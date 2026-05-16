@@ -1,6 +1,6 @@
+use base64::Engine;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use base64::Engine;
 
 use anyhow::Result;
 use colored::*;
@@ -78,10 +78,7 @@ pub fn build_client(config: &ScanConfig) -> Result<reqwest::Client> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(basic_auth);
         let auth_val = format!("Basic {}", encoded);
         if let Ok(val) = reqwest::header::HeaderValue::from_str(&auth_val) {
-            default_headers.insert(
-                reqwest::header::AUTHORIZATION,
-                val,
-            );
+            default_headers.insert(reqwest::header::AUTHORIZATION, val);
         }
     }
 
@@ -140,10 +137,7 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
     );
 
     let discovered = spider.crawl(&spider_pb).await?;
-    spider_pb.finish_with_message(format!(
-        "✓ Discovered {} URLs",
-        discovered.len()
-    ));
+    spider_pb.finish_with_message(format!("✓ Discovered {} URLs", discovered.len()));
 
     // ─── Phase 2: Passive Scanning ────────────────────────────────
     let passive_pb = mp.add(ProgressBar::new(discovered.len() as u64));
@@ -156,20 +150,16 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
     passive_pb.set_prefix("PASSIVE");
 
     let passive_scanner = PassiveScanner::new(client.clone());
-    let passive_findings = passive_scanner
-        .scan_all(&discovered, &passive_pb)
-        .await?;
+    let passive_findings = passive_scanner.scan_all(&discovered, &passive_pb).await?;
 
     {
         let mut f = findings.lock().await;
         f.extend(passive_findings.clone());
     }
-    passive_pb.finish_with_message(format!(
-        "✓ {} findings",
-        passive_findings.len()
-    ));
+    passive_pb.finish_with_message(format!("✓ {} findings", passive_findings.len()));
 
     // ─── Phase 3: Active Scanning ─────────────────────────────────
+    let mut active_module_names: Vec<String> = Vec::new();
     if !config.passive_only {
         let active_pb = mp.add(ProgressBar::new(discovered.len() as u64));
         active_pb.set_style(
@@ -180,10 +170,10 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
         );
         active_pb.set_prefix("ACTIVE ");
 
-        let active_scanner = ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
-        let af = active_scanner
-            .scan_all(&discovered, &active_pb)
-            .await?;
+        let active_scanner =
+            ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
+        active_module_names = active_scanner.enabled_module_names();
+        let af = active_scanner.scan_all(&discovered, &active_pb).await?;
 
         {
             let mut f = findings.lock().await;
@@ -192,11 +182,32 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
         active_pb.finish_with_message(format!("✓ {} findings", af.len()));
     }
 
+    // ─── Phase 3.5: Transport + intel ─────────────────────────────
+    // Per-host TLS probe + optional Shodan enrichment. Both are silent on
+    // success (no findings) and best-effort on failure.
+    let hosts = unique_hosts(&discovered);
+    let mut intel_enabled = false;
+    if !hosts.is_empty() {
+        let tls_findings = crate::tls::check_hosts(&hosts).await;
+        let intel_cfg = crate::intel::IntelConfig::from_env();
+        intel_enabled = intel_cfg.is_enabled();
+        let intel_findings = crate::intel::enrich_hosts(&intel_cfg, &hosts).await;
+        let mut f = findings.lock().await;
+        f.extend(tls_findings);
+        f.extend(intel_findings);
+    }
+
     // ─── Phase 4: Report ──────────────────────────────────────────
     let elapsed = start.elapsed();
     let all_findings = findings.lock().await.clone();
 
     print_summary(&discovered, &all_findings, elapsed);
+    print_module_summary(
+        &all_findings,
+        &active_module_names,
+        !hosts.is_empty(),
+        intel_enabled,
+    );
 
     let report = Report::new(
         &config.target_url,
@@ -265,7 +276,6 @@ pub async fn run_scan_with_events(
             tokio::time::sleep(Duration::from_millis(250)).await;
             let _ = tick_tx.send(ScanEvent::SpiderProgress {
                 discovered: tick_pb.position() as usize,
-                message: tick_pb.message().to_string(),
             });
             if tick_pb.is_finished() {
                 break;
@@ -279,7 +289,6 @@ pub async fn run_scan_with_events(
 
     let _ = tx.send(ScanEvent::SpiderProgress {
         discovered: discovered.len(),
-        message: format!("Discovered {} URLs", discovered.len()),
     });
 
     // ── Phase 2: Passive ───────────────────────────────────────────
@@ -288,10 +297,8 @@ pub async fn run_scan_with_events(
         total: Some(discovered.len()),
     });
 
-    let passive_pb = ProgressBar::with_draw_target(
-        Some(discovered.len() as u64),
-        ProgressDrawTarget::hidden(),
-    );
+    let passive_pb =
+        ProgressBar::with_draw_target(Some(discovered.len() as u64), ProgressDrawTarget::hidden());
     let total = discovered.len();
     let tick_tx = tx.clone();
     let tick_pb = passive_pb.clone();
@@ -320,6 +327,7 @@ pub async fn run_scan_with_events(
         done: discovered.len(),
         total: discovered.len(),
     });
+    emit_module_events(&tx, &passive_findings, crate::passive::known_plugin_names());
 
     let mut all_findings = passive_findings;
 
@@ -352,6 +360,7 @@ pub async fn run_scan_with_events(
 
         let active_scanner =
             ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
+        let active_modules: Vec<String> = active_scanner.enabled_module_names();
         let active_findings = active_scanner.scan_all(&discovered, &active_pb).await?;
         active_pb.finish();
         let _ = active_tick.await;
@@ -363,7 +372,26 @@ pub async fn run_scan_with_events(
             done: discovered.len(),
             total: discovered.len(),
         });
+        let active_module_refs: Vec<&str> = active_modules.iter().map(|s| s.as_str()).collect();
+        emit_module_events(&tx, &active_findings, &active_module_refs);
         all_findings.extend(active_findings);
+    }
+
+    // ── Phase 3.5: Transport + intel ───────────────────────────────
+    let hosts = unique_hosts(&discovered);
+    if !hosts.is_empty() {
+        let tls_findings = crate::tls::check_hosts(&hosts).await;
+        let intel_cfg = crate::intel::IntelConfig::from_env();
+        let intel_findings = crate::intel::enrich_hosts(&intel_cfg, &hosts).await;
+        for f in tls_findings.iter().chain(intel_findings.iter()) {
+            let _ = tx.send(ScanEvent::Finding(f.clone()));
+        }
+        emit_module_events(&tx, &tls_findings, crate::tls::known_plugin_names());
+        if intel_cfg.is_enabled() {
+            emit_module_events(&tx, &intel_findings, crate::intel::known_plugin_names());
+        }
+        all_findings.extend(tls_findings);
+        all_findings.extend(intel_findings);
     }
 
     // ── Phase 4: Report ────────────────────────────────────────────
@@ -451,11 +479,7 @@ fn print_summary(urls: &[DiscoveredUrl], findings: &[Finding], elapsed: std::tim
         sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
 
         for f in &sorted {
-            println!(
-                "  {} {}",
-                f.severity.color_str(),
-                f.title.bright_white()
-            );
+            println!("  {} {}", f.severity.color_str(), f.title.bright_white());
             println!("    URL: {}", f.url.dimmed());
             if let Some(param) = &f.parameter {
                 println!("    Param: {}", param.bright_magenta());
@@ -466,5 +490,127 @@ fn print_summary(urls: &[DiscoveredUrl], findings: &[Finding], elapsed: std::tim
             }
             println!();
         }
+    }
+}
+
+/// Print the per-module roll-up below the main scan summary. Format
+/// matches SDD §9.1 — non-quiet modules first (sorted by max severity),
+/// quiet modules last.
+fn print_module_summary(
+    findings: &[Finding],
+    active_modules: &[String],
+    transport_ran: bool,
+    intel_enabled: bool,
+) {
+    let mut known: Vec<&str> = Vec::new();
+    known.extend(crate::passive::known_plugin_names());
+    known.extend(active_modules.iter().map(|s| s.as_str()));
+    if transport_ran {
+        known.extend(crate::tls::known_plugin_names());
+    }
+    if intel_enabled {
+        known.extend(crate::intel::known_plugin_names());
+    }
+
+    let summaries = crate::types::summarize_modules(findings, &known);
+    if summaries.is_empty() {
+        return;
+    }
+
+    println!("\n{}", "  MODULES".bright_white().bold());
+    println!("{}", "─".repeat(60).dimmed());
+    for s in &summaries {
+        let marker = if s.quiet {
+            "·".dimmed()
+        } else {
+            "✓".bright_green()
+        };
+        let sev_label = match &s.max_severity {
+            Some(sev) => sev.color_str().to_string(),
+            None => "(quiet)".dimmed().to_string(),
+        };
+        let count = if s.findings == 0 {
+            String::new()
+        } else if s.findings == 1 {
+            "1 finding ".to_string()
+        } else {
+            format!("{} findings ", s.findings)
+        };
+        println!(
+            "  {} {:<36} {}{}",
+            marker,
+            s.name.bright_white(),
+            count.dimmed(),
+            sev_label
+        );
+    }
+    println!("{}", "─".repeat(60).dimmed());
+}
+
+/// Emit one `ScanEvent::ModuleRan` per known module after a phase finishes.
+/// Modules with zero findings are still emitted (quiet) so the TUI can show
+/// them folded in the module tree — see SDD §9.1.
+fn emit_module_events(
+    tx: &tokio::sync::mpsc::UnboundedSender<ScanEvent>,
+    findings: &[Finding],
+    known_modules: &[&str],
+) {
+    let summaries = crate::types::summarize_modules(findings, known_modules);
+    for s in summaries {
+        let _ = tx.send(ScanEvent::ModuleRan {
+            name: s.name,
+            findings: s.findings,
+        });
+    }
+}
+
+/// Collect unique hostnames from the discovered URL list (HTTPS only —
+/// TLS probe requires it and IPs/localhost aren't useful for cert checks).
+fn unique_hosts(discovered: &[DiscoveredUrl]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for du in discovered {
+        let Ok(u) = url::Url::parse(&du.url) else {
+            continue;
+        };
+        if u.scheme() != "https" {
+            continue;
+        }
+        let Some(host) = u.host_str() else { continue };
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        if seen.insert(host.to_string()) {
+            out.push(host.to_string());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::UrlSource;
+
+    fn du(url: &str) -> DiscoveredUrl {
+        DiscoveredUrl {
+            url: url.into(),
+            method: "GET".into(),
+            parameters: vec![],
+            source: UrlSource::Seed,
+        }
+    }
+
+    #[test]
+    fn unique_hosts_dedupes_and_filters_non_https() {
+        let urls = vec![
+            du("https://example.com/a"),
+            du("https://example.com/b"),
+            du("http://example.com/c"),
+            du("https://api.example.com/"),
+            du("https://192.168.1.1/"),
+        ];
+        let hosts = unique_hosts(&urls);
+        assert_eq!(hosts, vec!["example.com", "api.example.com"]);
     }
 }

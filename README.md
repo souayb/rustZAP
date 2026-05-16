@@ -19,9 +19,11 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 
 | Feature | Description |
 |---|---|
-| 🕷️ **Spider/Crawler** | Recursive link, form, and JS URL discovery |
-| 🔍 **Passive Scanner** | Analyzes headers and responses for misconfigurations |
-| 💥 **Active Scanner** | Injects attack payloads to find real vulnerabilities |
+| 🕷️ **Spider/Crawler** | Recursive link, form, and JS URL discovery + `robots.txt` / sitemap enrichment |
+| 🔍 **Passive Scanner** | Headers, body, security.txt, deep CSP review, JWT heuristics, tech-stack fingerprint |
+| 💥 **Active Scanner** | 22 plugins — XSS, full SQLi suite, NoSQL, SSRF, XXE, GraphQL introspection, HTTP methods, redirect chain, opt-in path probe |
+| 🔐 **Transport Probe** | Per-host TLS cert summary — expiry, weak signature, hostname mismatch, self-signed |
+| 🛰️ **Intel Hook** | Optional Shodan enrichment when `SHODAN_API_KEY` is set (no-op otherwise) |
 | 🔀 **Intercepting Proxy** | HTTP(S) proxy for manual browsing + passive analysis |
 | 📊 **JSON / CSV / HTML Reports** | Machine-readable findings with OWASP/CWE references |
 | 🖥️ **Interactive TUI** | Five-tab Ratatui console — configure, launch, monitor scans, drill into findings |
@@ -288,35 +290,88 @@ rustzap plugins
 | `xxe` | XML External Entity | A03:2021 | CWE-611 |
 | `cmd-injection` | OS Command Injection | A03:2021 | CWE-78 |
 | `ssti` | Template Injection | A03:2021 | CWE-94 |
+| `graphql-introspection` | GraphQL schema exposure via introspection query | A05:2021 | CWE-200 |
+| `http-methods` | OPTIONS probe — flags dangerous methods (PUT/DELETE/TRACE/PATCH) | A05:2021 | CWE-650 |
+| `redirect-chain` | Redirect chain analyzer — HTTPS→HTTP downgrade, cross-origin, loops, excessive hops | A02:2021 | CWE-601 |
+| `sensitive-paths` ⚠️ | Well-known / backup file probe (`/.git/HEAD`, `/.env`, `/backup.zip`, …) — **opt-in, default OFF** | A05:2021 | CWE-538 |
+
+⚠️ `sensitive-paths` is intentionally excluded from defaults. Enable it only against targets you are explicitly authorized to scan — it issues 25+ HEAD requests against well-known dotfile and backup paths.
 
 Run specific plugins only:
 
 ```bash
+# Default plugin set (everything except sensitive-paths)
+rustzap scan --target https://example.com
+
+# Narrow to a few plugins
 rustzap scan --target https://example.com --plugins xss,sqli,ssrf
+
+# Opt in to sensitive-path probing
+rustzap scan --target https://example.com \
+  --plugins xss,sqli,ssrf,sensitive-paths
 ```
 
 ---
 
 ## Passive Check Coverage
 
-| Check | Severity |
-|---|---|
-| Missing HSTS | Medium |
-| Missing CSP | Medium |
-| Missing X-Frame-Options | Medium |
-| Missing X-Content-Type-Options | Low |
-| Cookie missing HttpOnly | Medium |
-| Cookie missing Secure | Medium |
-| Cookie missing SameSite | Low |
-| Server version disclosure | Low |
-| X-Powered-By disclosure | Low |
-| Stack trace in response | Medium |
-| Mixed content (HTTP in HTTPS) | Medium |
-| API keys / secrets in response | High/Critical |
-| Wildcard CORS | Medium |
-| CORS + credentials | High |
-| Missing cache-control | Low |
-| Missing charset in Content-Type | Low |
+| Check | Plugin id | Severity |
+|---|---|---|
+| Missing HSTS | `passive/missing-headers` | Medium |
+| Missing CSP | `passive/missing-headers` | Medium |
+| Missing X-Frame-Options | `passive/missing-headers` | Medium |
+| Missing X-Content-Type-Options | `passive/missing-headers` | Low |
+| Cookie missing HttpOnly / Secure / SameSite | `passive/cookie-flags` | Medium / Medium / Low |
+| Server version / X-Powered-By disclosure | `passive/info-disclosure` | Low |
+| Stack trace / verbose error in body | `passive/info-disclosure` | Medium |
+| Mixed content (HTTP asset on HTTPS page) | `passive/mixed-content` | Medium |
+| API keys / passwords / private keys in body | `passive/sensitive-data` | High / Critical |
+| Wildcard CORS / CORS + credentials | `passive/cors` | Medium / High |
+| Missing cache-control on sensitive pages | `passive/cache-control` | Low |
+| Missing charset in Content-Type | `passive/content-type` | Low |
+| `security.txt` missing / no Contact / no Expires / expired | `passive/security-txt` | Info / Low / Low / Medium |
+| CSP `unsafe-inline`, `unsafe-eval`, wildcard, `object-src` not `'none'` | `passive/csp-unsafe-directives` | Low → High |
+| Tech-stack fingerprint (Server, generator meta, framework markers) | `passive/tech-fingerprint` | Info |
+| JWT `alg:none`, missing `exp`, lifetime > 1 year | `passive/jwt-heuristic` | High / Medium / Low |
+
+The `security.txt` probe runs **once per origin** (not once per URL). The CSP check inspects both `Content-Security-Policy` and `Content-Security-Policy-Report-Only` — findings on the Report-Only header are downgraded one severity tier.
+
+---
+
+## Spider Enrichment
+
+In addition to recursive HTML link / form / inline-JS extraction, the spider also reads:
+
+- `/robots.txt` — `Allow:` / `Disallow:` paths enqueue as `UrlSource::Robots`; `Sitemap:` lines trigger sitemap fetches.
+- XML sitemaps (`urlset` and `sitemapindex`) — `<loc>` URLs enqueue as `UrlSource::Sitemap`.
+
+All of this is bounded: robots up to 256 KB, sitemaps up to 1 MB each, max 5 sitemap fetches, max 500 enriched URLs per scan. Hosts outside the target's are silently dropped.
+
+---
+
+## Transport & Intel
+
+After the active phase, RustZAP runs a per-host **TLS certificate probe** against every unique HTTPS host discovered by the spider. The probe accepts any cert (so it can inspect expired / mismatched chains), then summarises the leaf via `x509-parser`.
+
+| Check | Plugin id | Severity |
+|---|---|---|
+| Certificate expired | `transport/tls-expired` | Critical |
+| Certificate expires in < 30 days | `transport/tls-expiring-soon` | Medium |
+| Weak signature algorithm (SHA-1 / MD5) | `transport/tls-weak-signature` | Medium |
+| Self-signed (subject == issuer) | `transport/tls-self-signed` | Low |
+| Hostname not covered by SANs (exact + 1-label wildcard) | `transport/tls-hostname-mismatch` | Medium |
+
+**Optional intel enrichment** is gated by environment variables — if none are set, the module is a no-op.
+
+| Env var | Provider | Findings |
+|---|---|---|
+| `SHODAN_API_KEY` | Shodan REST host lookup | `intel/shodan-vulns` (High), `intel/shodan-ports` (Low) |
+
+```bash
+SHODAN_API_KEY=xxx rustzap scan --target https://example.com
+```
+
+Shodan's `/shodan/host/{ip}` endpoint requires an IP — hostnames return 404 and are silently dropped. Provide IPs as scan targets when intel is the goal. Only call these services for hosts you are authorized to scan.
 
 ---
 
@@ -513,23 +568,27 @@ rustzap stress --target https://api.example.com/health \
 ```
 rustzap/
 ├── src/
-│   ├── main.rs          # CLI (clap) — entry point & subcommands
-│   ├── types.rs         # Shared data types (Finding, Severity, HttpTransaction…)
-│   ├── scanner.rs       # Full-scan orchestrator (+ TUI event-emitting variant)
-│   ├── spider.rs        # Recursive crawler (links, forms, JS)
-│   ├── passive.rs       # Passive checks (headers, cookies, body analysis)
-│   ├── active.rs        # Active scanner + attack plugins
-│   ├── proxy.rs         # Intercepting HTTP proxy (hyper)
-│   ├── stress.rs        # Load/stress tester (5 modes, percentiles, timeline)
-│   ├── report.rs        # JSON / CSV / HTML report generation
-│   ├── events.rs        # ScanEvent / ScanPhase — telemetry for the TUI
-│   ├── tools.rs         # External tool detection + streaming runner (Semgrep, Trivy, …)
-│   ├── installer.rs     # OS-aware companion-tool installer (`rustzap install`)
-│   └── tui.rs           # Multi-tab interactive console (Dashboard / Scan / Findings / Tools / Logs)
+│   ├── main.rs              # CLI (clap) — entry point & subcommands
+│   ├── types.rs             # Shared data types (Finding, Severity, UrlSource, …)
+│   ├── scanner.rs           # Full-scan orchestrator (Spider→Passive→Active→TLS+Intel→Report)
+│   ├── spider.rs            # Recursive crawler + robots.txt / sitemap enrichment
+│   ├── passive.rs           # Passive checks (headers, body, security.txt, CSP, tech-fp, JWT)
+│   ├── active.rs            # Active scanner core + 11 in-tree plugins
+│   ├── sqli_advanced.rs     # 10 advanced SQLi/NoSQL plugins (error / boolean / time / union / …)
+│   ├── sensitive_paths.rs   # B2 — opt-in well-known path probe
+│   ├── tls.rs               # C1 — rustls-based per-host TLS cert summary
+│   ├── intel.rs             # C2 — env-gated Shodan / external intel hook
+│   ├── proxy.rs             # Intercepting HTTP proxy (hyper)
+│   ├── stress.rs            # Load/stress tester (5 modes, percentiles, timeline)
+│   ├── report.rs            # JSON / CSV / HTML report generation
+│   ├── events.rs            # ScanEvent / ScanPhase — telemetry for the TUI
+│   ├── tools.rs             # External tool detection + streaming runner (Semgrep, Trivy, …)
+│   ├── installer.rs         # OS-aware companion-tool installer (`rustzap install`)
+│   └── tui.rs               # Multi-tab interactive console (Dashboard / Scan / Findings / Tools / Logs)
 ├── scripts/
-│   └── install-tools.sh # Canonical shell installer — used by Dockerfile & host
-├── Dockerfile           # Multi-stage build with all companion tools pre-installed
-├── docker-compose.yml   # Compose service + optional Juice-Shop lab target
+│   └── install-tools.sh     # Canonical shell installer — used by Dockerfile & host
+├── Dockerfile               # Multi-stage build with all companion tools pre-installed
+├── docker-compose.yml       # Compose service + optional Juice-Shop lab target
 └── Cargo.toml
 ```
 
@@ -551,6 +610,11 @@ impl ScanPlugin for MyPlugin {
     fn name(&self) -> &str { "my-plugin" }
     fn description(&self) -> &str { "Detects XYZ vulnerability" }
 
+    /// Override to `true` when the plugin targets a path itself (e.g. an
+    /// `/admin` endpoint) rather than a query parameter. The default `false`
+    /// keeps the plugin behind the URL-must-have-`?param=` gate.
+    fn always_run(&self) -> bool { false }
+
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // Your detection logic here
         vec![]
@@ -558,7 +622,7 @@ impl ScanPlugin for MyPlugin {
 }
 ```
 
-Then register it in `ActiveScanner::new()` inside `active.rs`.
+Then register it in `ActiveScanner::new()` and `list_plugins()` inside `active.rs` (both lists must stay in sync — the binary uses one for execution, the other for `rustzap plugins`).
 
 ---
 

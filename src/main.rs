@@ -1,15 +1,19 @@
-mod scanner;
-mod proxy;
-mod spider;
-mod passive;
 mod active;
-mod report;
-mod stress;
-mod types;
-mod tui;
 mod events;
-mod tools;
 mod installer;
+mod intel;
+mod passive;
+mod proxy;
+mod report;
+mod scanner;
+mod sensitive_paths;
+mod spider;
+mod sqli_advanced;
+mod stress;
+mod tls;
+mod tools;
+mod tui;
+mod types;
 
 use clap::{Parser, Subcommand};
 use colored::*;
@@ -23,7 +27,7 @@ use crate::stress::StressCliArgs;
 #[command(
     name = "rustzap",
     about = "A fast, fearless web application security scanner",
-    version = "0.1.0",
+    version = "0.1.0"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -62,7 +66,10 @@ enum Commands {
         basic_auth: Option<String>,
         #[arg(long)]
         insecure: bool,
-        #[arg(long, default_value = "xss,sqli,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti")]
+        #[arg(
+            long,
+            default_value = "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain"
+        )]
         plugins: String,
     },
 
@@ -234,8 +241,19 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         Commands::Scan {
-            target, depth, concurrency, passive_only, output,
-            timeout, user_agent, cookies, auth, api_key, basic_auth, insecure, plugins,
+            target,
+            depth,
+            concurrency,
+            passive_only,
+            output,
+            timeout,
+            user_agent,
+            cookies,
+            auth,
+            api_key,
+            basic_auth,
+            insecure,
+            plugins,
         } => {
             let config = ScanConfig {
                 target_url: target,
@@ -255,11 +273,19 @@ async fn main() -> anyhow::Result<()> {
             scanner::run_scan(config).await?;
         }
 
-        Commands::Spider { target, depth, output } => {
+        Commands::Spider {
+            target,
+            depth,
+            output,
+        } => {
             spider::run_spider_cli(&target, depth, output).await?;
         }
 
-        Commands::Proxy { listen, dump, passive } => {
+        Commands::Proxy {
+            listen,
+            dump,
+            passive,
+        } => {
             proxy::run_proxy(&listen, dump, passive).await?;
         }
 
@@ -275,21 +301,56 @@ async fn main() -> anyhow::Result<()> {
             tui::run_tui().await.expect("TUI error");
         }
 
-        Commands::Install { dry_run, list, tool, yes } => {
+        Commands::Install {
+            dry_run,
+            list,
+            tool,
+            yes,
+        } => {
             installer::run(dry_run, tool, yes, list).await?;
         }
 
         Commands::Stress {
-            target, mode, users, duration, method, body, headers,
-            timeout, output, insecure, cookies, auth,
-            expect_status, expect_body,
-            start_users, ramp_secs, spike_at, spike_duration, requests,
+            target,
+            mode,
+            users,
+            duration,
+            method,
+            body,
+            headers,
+            timeout,
+            output,
+            insecure,
+            cookies,
+            auth,
+            expect_status,
+            expect_body,
+            start_users,
+            ramp_secs,
+            spike_at,
+            spike_duration,
+            requests,
         } => {
             let args = StressCliArgs {
-                target, mode, users, duration, method, body, headers,
-                timeout, output, insecure, cookies, auth,
-                expect_status, expect_body,
-                start_users, ramp_secs, spike_at, spike_duration, requests,
+                target,
+                mode,
+                users,
+                duration,
+                method,
+                body,
+                headers,
+                timeout,
+                output,
+                insecure,
+                cookies,
+                auth,
+                expect_status,
+                expect_body,
+                start_users,
+                ramp_secs,
+                spike_at,
+                spike_duration,
+                requests,
             };
             stress::run_stress_cli(args).await?;
         }
@@ -299,14 +360,24 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn print_banner() {
-    println!("{}", r#"
+    println!(
+        "{}",
+        r#"
 ██████╗ ██╗   ██╗███████╗████████╗███████╗ █████╗ ██████╗ 
 ██╔══██╗██║   ██║██╔════╝╚══██╔══╝╚════██║██╔══██╗██╔══██╗
 ██████╔╝██║   ██║███████╗   ██║       ██╔╝███████║██████╔╝
 ██╔══██╗██║   ██║╚════██║   ██║      ██╔╝ ██╔══██║██╔═══╝ 
 ██║  ██║╚██████╔╝███████║   ██║      ██║  ██║  ██║██║     
 ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝      ╚═╝  ╚═╝  ╚═╝╚═╝     
-"#.bright_red());
-    println!("{}", "  Rust Web Application Security Scanner v0.1.0".bright_yellow());
-    println!("{}", "  Inspired by OWASP ZAP — Use responsibly!\n".dimmed());
+"#
+        .bright_red()
+    );
+    println!(
+        "{}",
+        "  Rust Web Application Security Scanner v0.1.0".bright_yellow()
+    );
+    println!(
+        "{}",
+        "  Inspired by OWASP ZAP — Use responsibly!\n".dimmed()
+    );
 }

@@ -45,15 +45,30 @@ impl Report {
         // Sort findings by severity descending
         findings.sort_by(|a, b| b.severity.cmp(&a.severity));
 
-        let critical = findings.iter().filter(|f| f.severity == Severity::Critical).count();
-        let high = findings.iter().filter(|f| f.severity == Severity::High).count();
-        let medium = findings.iter().filter(|f| f.severity == Severity::Medium).count();
-        let low = findings.iter().filter(|f| f.severity == Severity::Low).count();
-        let info = findings.iter().filter(|f| f.severity == Severity::Info).count();
+        let critical = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Critical)
+            .count();
+        let high = findings
+            .iter()
+            .filter(|f| f.severity == Severity::High)
+            .count();
+        let medium = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Medium)
+            .count();
+        let low = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Low)
+            .count();
+        let info = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Info)
+            .count();
 
         // Simple risk score: 0–100
-        let risk_score = ((critical * 20 + high * 10 + medium * 5 + low * 2 + info) as f64)
-            .min(100.0) as u8;
+        let risk_score =
+            ((critical * 20 + high * 10 + medium * 5 + low * 2 + info) as f64).min(100.0) as u8;
 
         Report {
             meta: ReportMeta {
@@ -105,8 +120,14 @@ impl Report {
 
     pub async fn save_html(&self, path: &str) -> Result<()> {
         let mut html = String::from("<html><head><title>RustZAP Report</title><style>body { font-family: sans-serif; } table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #ddd; padding: 8px; }</style></head><body>");
-        html.push_str(&format!("<h1>RustZAP Scan Report: {}</h1>", self.meta.target));
-        html.push_str(&format!("<p>Total Findings: {} | Risk Score: {}</p>", self.summary.total_findings, self.summary.risk_score));
+        html.push_str(&format!(
+            "<h1>RustZAP Scan Report: {}</h1>",
+            self.meta.target
+        ));
+        html.push_str(&format!(
+            "<p>Total Findings: {} | Risk Score: {}</p>",
+            self.summary.total_findings, self.summary.risk_score
+        ));
 
         html.push_str("<table><tr><th>Severity</th><th>Title</th><th>URL</th><th>Parameter</th><th>Description</th></tr>");
         for f in &self.findings {

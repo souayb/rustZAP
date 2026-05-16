@@ -64,6 +64,9 @@ ratatui = "0.30.0"
 crossterm = "0.29.0"
 base64 = "0.22.1"
 
+# C1: TLS certificate inspection (parses peer certs returned by rustls)
+x509-parser = "0.16"
+
 [profile.release]
 opt-level = 3
 lto = true

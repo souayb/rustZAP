@@ -30,7 +30,6 @@ pub enum ScanEvent {
     },
     SpiderProgress {
         discovered: usize,
-        message: String,
     },
     PassiveProgress {
         done: usize,
@@ -42,6 +41,17 @@ pub enum ScanEvent {
     },
     Finding(Finding),
     Log(String),
+    /// Emitted once per module that executed during the scan. `findings` is
+    /// the count this module produced; zero means the module ran but was
+    /// quiet (still shown in the Findings-tab tree, folded by default).
+    /// See SDD §9.1 for the rendering contract.
+    ModuleRan {
+        name: String,
+        findings: usize,
+    },
+    /// Reserved for future scan-failure plumbing. The TUI already routes it
+    /// to the log pane; no scanner code emits it yet.
+    #[allow(dead_code)]
     Error(String),
     Completed {
         duration_secs: f64,

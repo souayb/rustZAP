@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,10 +46,7 @@ pub struct StressConfig {
 #[derive(Debug, Clone)]
 pub enum StressMode {
     /// Constant load: N concurrent users for D seconds
-    Constant {
-        users: usize,
-        duration_secs: u64,
-    },
+    Constant { users: usize, duration_secs: u64 },
     /// Ramp-up: linearly increase from `start` to `peak` users over `ramp_secs`,
     /// hold at peak for `hold_secs`
     Ramp {
@@ -67,15 +64,9 @@ pub enum StressMode {
         total_secs: u64,
     },
     /// Soak: long-running constant load to detect memory leaks / degradation
-    Soak {
-        users: usize,
-        duration_secs: u64,
-    },
+    Soak { users: usize, duration_secs: u64 },
     /// Fixed request count (ignores time)
-    Requests {
-        total: usize,
-        concurrency: usize,
-    },
+    Requests { total: usize, concurrency: usize },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,19 +121,30 @@ impl LiveStats {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
         self.total_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-        self.total_latency_ms.fetch_add(latency_ms, Ordering::Relaxed);
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
 
         // CAS min/max
         let mut cur_min = self.min_latency_ms.load(Ordering::Relaxed);
         while latency_ms < cur_min {
-            match self.min_latency_ms.compare_exchange_weak(cur_min, latency_ms, Ordering::Relaxed, Ordering::Relaxed) {
+            match self.min_latency_ms.compare_exchange_weak(
+                cur_min,
+                latency_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(v) => cur_min = v,
             }
         }
         let mut cur_max = self.max_latency_ms.load(Ordering::Relaxed);
         while latency_ms > cur_max {
-            match self.max_latency_ms.compare_exchange_weak(cur_max, latency_ms, Ordering::Relaxed, Ordering::Relaxed) {
+            match self.max_latency_ms.compare_exchange_weak(
+                cur_max,
+                latency_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(v) => cur_max = v,
             }
@@ -170,7 +172,11 @@ impl LiveStats {
         let total_lat = self.total_latency_ms.load(Ordering::Relaxed);
         let min_lat = self.min_latency_ms.load(Ordering::Relaxed);
         let max_lat = self.max_latency_ms.load(Ordering::Relaxed);
-        let hist: Vec<u64> = self.hist.iter().map(|b| b.load(Ordering::Relaxed)).collect();
+        let hist: Vec<u64> = self
+            .hist
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
 
         StatsSnapshot {
             total,
@@ -359,8 +365,16 @@ pub async fn run_stress(config: StressConfig) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let snap = stats_clone.snapshot();
                 let elapsed = start.elapsed().as_secs_f64();
-                let rps = if elapsed > 0.0 { snap.total as f64 / elapsed } else { 0.0 };
-                let err_pct = if snap.total > 0 { snap.errors as f64 / snap.total as f64 * 100.0 } else { 0.0 };
+                let rps = if elapsed > 0.0 {
+                    snap.total as f64 / elapsed
+                } else {
+                    0.0
+                };
+                let err_pct = if snap.total > 0 {
+                    snap.errors as f64 / snap.total as f64 * 100.0
+                } else {
+                    0.0
+                };
 
                 bar.set_message(format!(
                     "reqs={} rps={:.1} avg={}ms min={}ms max={}ms err={:.1}%",
@@ -377,35 +391,87 @@ pub async fn run_stress(config: StressConfig) -> Result<()> {
 
     // ── Dispatch by mode ──────────────────────────────────────────
     match config.mode.clone() {
-        StressMode::Constant { users, duration_secs } => {
+        StressMode::Constant {
+            users,
+            duration_secs,
+        } => {
             run_constant_load(
-                &client, &config, users, duration_secs,
-                stats.clone(), results.clone(), errors.clone(),
-            ).await?;
+                &client,
+                &config,
+                users,
+                duration_secs,
+                stats.clone(),
+                results.clone(),
+                errors.clone(),
+            )
+            .await?;
         }
-        StressMode::Ramp { start_users, peak_users, ramp_secs, hold_secs } => {
+        StressMode::Ramp {
+            start_users,
+            peak_users,
+            ramp_secs,
+            hold_secs,
+        } => {
             run_ramp_load(
-                &client, &config, start_users, peak_users, ramp_secs, hold_secs,
-                stats.clone(), results.clone(), errors.clone(),
-            ).await?;
+                &client,
+                &config,
+                start_users,
+                peak_users,
+                ramp_secs,
+                hold_secs,
+                stats.clone(),
+                results.clone(),
+                errors.clone(),
+            )
+            .await?;
         }
-        StressMode::Spike { base_users, spike_users, spike_at_secs, spike_duration_secs, total_secs } => {
+        StressMode::Spike {
+            base_users,
+            spike_users,
+            spike_at_secs,
+            spike_duration_secs,
+            total_secs,
+        } => {
             run_spike_load(
-                &client, &config, base_users, spike_users, spike_at_secs, spike_duration_secs, total_secs,
-                stats.clone(), results.clone(), errors.clone(),
-            ).await?;
+                &client,
+                &config,
+                base_users,
+                spike_users,
+                spike_at_secs,
+                spike_duration_secs,
+                total_secs,
+                stats.clone(),
+                results.clone(),
+                errors.clone(),
+            )
+            .await?;
         }
-        StressMode::Soak { users, duration_secs } => {
+        StressMode::Soak {
+            users,
+            duration_secs,
+        } => {
             run_soak_load(
-                &client, &config, users, duration_secs,
-                stats.clone(), results.clone(), errors.clone(),
-            ).await?;
+                &client,
+                &config,
+                users,
+                duration_secs,
+                stats.clone(),
+                results.clone(),
+                errors.clone(),
+            )
+            .await?;
         }
         StressMode::Requests { total, concurrency } => {
             run_fixed_requests(
-                &client, &config, total, concurrency,
-                stats.clone(), results.clone(), errors.clone(),
-            ).await?;
+                &client,
+                &config,
+                total,
+                concurrency,
+                stats.clone(),
+                results.clone(),
+                errors.clone(),
+            )
+            .await?;
         }
     }
 
@@ -425,16 +491,31 @@ pub async fn run_stress(config: StressConfig) -> Result<()> {
     let histogram = build_histogram(&snap.hist, snap.total);
     let error_entries: Vec<ErrorEntry> = all_errors
         .into_iter()
-        .map(|(msg, count)| ErrorEntry { message: msg, count })
+        .map(|(msg, count)| ErrorEntry {
+            message: msg,
+            count,
+        })
         .collect();
 
     // ── Print results ─────────────────────────────────────────────
     print_stress_results(&snap, &percentiles, &histogram, elapsed);
 
     // ── Save report ───────────────────────────────────────────────
-    let rps = if elapsed.as_secs_f64() > 0.0 { snap.total as f64 / elapsed.as_secs_f64() } else { 0.0 };
-    let err_rate = if snap.total > 0 { snap.errors as f64 / snap.total as f64 * 100.0 } else { 0.0 };
-    let kbps = if elapsed.as_secs_f64() > 0.0 { snap.bytes as f64 / elapsed.as_secs_f64() / 1024.0 } else { 0.0 };
+    let rps = if elapsed.as_secs_f64() > 0.0 {
+        snap.total as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    let err_rate = if snap.total > 0 {
+        snap.errors as f64 / snap.total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let kbps = if elapsed.as_secs_f64() > 0.0 {
+        snap.bytes as f64 / elapsed.as_secs_f64() / 1024.0
+    } else {
+        0.0
+    };
 
     let report = StressReport {
         meta: StressReportMeta {
@@ -621,8 +702,8 @@ async fn run_spike_load(
             break;
         }
 
-        let in_spike = elapsed_secs >= spike_at_secs
-            && elapsed_secs < spike_at_secs + spike_duration_secs;
+        let in_spike =
+            elapsed_secs >= spike_at_secs && elapsed_secs < spike_at_secs + spike_duration_secs;
 
         let target = if in_spike { spike_users } else { base_users };
 
@@ -718,20 +799,17 @@ async fn run_fixed_requests(
 // Single request execution
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn fire_request(
-    client: &reqwest::Client,
-    config: &StressConfig,
-) -> RequestResult {
+async fn fire_request(client: &reqwest::Client, config: &StressConfig) -> RequestResult {
     let t_start = Instant::now();
     let timestamp_ms = chrono::Utc::now().timestamp_millis() as u64;
 
     let mut req = match config.method.to_uppercase().as_str() {
         "POST" => client.post(&config.target),
-        "PUT"  => client.put(&config.target),
+        "PUT" => client.put(&config.target),
         "DELETE" => client.delete(&config.target),
-        "PATCH"  => client.patch(&config.target),
-        "HEAD"   => client.head(&config.target),
-        _        => client.get(&config.target),
+        "PATCH" => client.patch(&config.target),
+        "HEAD" => client.head(&config.target),
+        _ => client.get(&config.target),
     };
 
     for (k, v) in &config.headers {
@@ -745,11 +823,7 @@ async fn fire_request(
     match req.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            let bytes = resp
-                .bytes()
-                .await
-                .map(|b| b.len())
-                .unwrap_or(0);
+            let bytes = resp.bytes().await.map(|b| b.len()).unwrap_or(0);
             let latency_ms = t_start.elapsed().as_millis() as u64;
 
             // Assertion checks
@@ -761,7 +835,11 @@ async fn fire_request(
                 status: Some(status),
                 success: status < 400 && status_ok,
                 error: if !status_ok {
-                    Some(format!("Expected status {} got {}", config.expect_status.unwrap(), status))
+                    Some(format!(
+                        "Expected status {} got {}",
+                        config.expect_status.unwrap(),
+                        status
+                    ))
                 } else if status >= 400 {
                     Some(format!("HTTP {}", status))
                 } else {
@@ -821,7 +899,14 @@ async fn record_result(
 
 fn compute_percentiles(results: &[RequestResult]) -> Percentiles {
     if results.is_empty() {
-        return Percentiles { p50_ms: 0, p75_ms: 0, p90_ms: 0, p95_ms: 0, p99_ms: 0, p999_ms: 0 };
+        return Percentiles {
+            p50_ms: 0,
+            p75_ms: 0,
+            p90_ms: 0,
+            p95_ms: 0,
+            p99_ms: 0,
+            p999_ms: 0,
+        };
     }
 
     let mut latencies: Vec<u64> = results.iter().map(|r| r.latency_ms).collect();
@@ -834,19 +919,25 @@ fn compute_percentiles(results: &[RequestResult]) -> Percentiles {
     };
 
     Percentiles {
-        p50_ms:  pct(50.0),
-        p75_ms:  pct(75.0),
-        p90_ms:  pct(90.0),
-        p95_ms:  pct(95.0),
-        p99_ms:  pct(99.0),
+        p50_ms: pct(50.0),
+        p75_ms: pct(75.0),
+        p90_ms: pct(90.0),
+        p95_ms: pct(95.0),
+        p99_ms: pct(99.0),
         p999_ms: pct(99.9),
     }
 }
 
 fn build_histogram(hist: &[u64], total: u64) -> LatencyHistogram {
     let labels = [
-        "0-10ms", "10-25ms", "25-50ms", "50-100ms",
-        "100-250ms", "250-500ms", "500-1000ms", "1000ms+",
+        "0-10ms",
+        "10-25ms",
+        "25-50ms",
+        "50-100ms",
+        "100-250ms",
+        "250-500ms",
+        "500-1000ms",
+        "1000ms+",
     ];
     let buckets = hist
         .iter()
@@ -854,7 +945,11 @@ fn build_histogram(hist: &[u64], total: u64) -> LatencyHistogram {
         .map(|(i, &count)| HistogramBucket {
             label: labels[i].to_string(),
             count,
-            pct: if total > 0 { count as f64 / total as f64 * 100.0 } else { 0.0 },
+            pct: if total > 0 {
+                count as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            },
         })
         .collect();
     LatencyHistogram { buckets }
@@ -870,9 +965,21 @@ fn print_stress_results(
     hist: &LatencyHistogram,
     elapsed: Duration,
 ) {
-    let rps = if elapsed.as_secs_f64() > 0.0 { snap.total as f64 / elapsed.as_secs_f64() } else { 0.0 };
-    let err_rate = if snap.total > 0 { snap.errors as f64 / snap.total as f64 * 100.0 } else { 0.0 };
-    let kbps = if elapsed.as_secs_f64() > 0.0 { snap.bytes as f64 / elapsed.as_secs_f64() / 1024.0 } else { 0.0 };
+    let rps = if elapsed.as_secs_f64() > 0.0 {
+        snap.total as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    let err_rate = if snap.total > 0 {
+        snap.errors as f64 / snap.total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let kbps = if elapsed.as_secs_f64() > 0.0 {
+        snap.bytes as f64 / elapsed.as_secs_f64() / 1024.0
+    } else {
+        0.0
+    };
 
     println!("\n{}", "─".repeat(64).dimmed());
     println!("{}", "  STRESS TEST RESULTS".bright_white().bold());
@@ -880,31 +987,75 @@ fn print_stress_results(
 
     // Summary
     println!("\n  {}", "Summary".bright_white().underline());
-    println!("  {:<30} {}", "Total Requests:".dimmed(),      snap.total.to_string().bright_white());
-    println!("  {:<30} {}", "Successful:".dimmed(),          snap.success.to_string().bright_green());
-    println!("  {:<30} {}", "Failed:".dimmed(),              snap.errors.to_string().bright_red());
-    println!("  {:<30} {:.2}%", "Error Rate:".dimmed(),      err_rate);
+    println!(
+        "  {:<30} {}",
+        "Total Requests:".dimmed(),
+        snap.total.to_string().bright_white()
+    );
+    println!(
+        "  {:<30} {}",
+        "Successful:".dimmed(),
+        snap.success.to_string().bright_green()
+    );
+    println!(
+        "  {:<30} {}",
+        "Failed:".dimmed(),
+        snap.errors.to_string().bright_red()
+    );
+    println!("  {:<30} {:.2}%", "Error Rate:".dimmed(), err_rate);
     println!("  {:<30} {:.1} req/s", "Throughput:".dimmed(), rps);
-    println!("  {:<30} {:.1} KB/s", "Data Rate:".dimmed(),   kbps);
-    println!("  {:<30} {:.1}s", "Duration:".dimmed(),        elapsed.as_secs_f64());
+    println!("  {:<30} {:.1} KB/s", "Data Rate:".dimmed(), kbps);
+    println!(
+        "  {:<30} {:.1}s",
+        "Duration:".dimmed(),
+        elapsed.as_secs_f64()
+    );
 
     // Latency
     println!("\n  {}", "Latency".bright_white().underline());
-    println!("  {:<30} {}ms", "Average:".dimmed(),           snap.avg_latency_ms.to_string().bright_cyan());
-    println!("  {:<30} {}ms", "Min:".dimmed(),               snap.min_latency_ms.to_string().bright_green());
-    println!("  {:<30} {}ms", "Max:".dimmed(),               snap.max_latency_ms.to_string().bright_red());
-    println!("  {:<30} {}ms", "p50 (median):".dimmed(),      pct.p50_ms);
-    println!("  {:<30} {}ms", "p75:".dimmed(),               pct.p75_ms);
-    println!("  {:<30} {}ms", "p90:".dimmed(),               pct.p90_ms);
-    println!("  {:<30} {}ms", "p95:".dimmed(),               pct.p95_ms);
-    println!("  {:<30} {}", "p99:".dimmed(),                 format!("{}ms", pct.p99_ms).bright_yellow());
-    println!("  {:<30} {}", "p99.9:".dimmed(),               format!("{}ms", pct.p999_ms).bright_red());
+    println!(
+        "  {:<30} {}ms",
+        "Average:".dimmed(),
+        snap.avg_latency_ms.to_string().bright_cyan()
+    );
+    println!(
+        "  {:<30} {}ms",
+        "Min:".dimmed(),
+        snap.min_latency_ms.to_string().bright_green()
+    );
+    println!(
+        "  {:<30} {}ms",
+        "Max:".dimmed(),
+        snap.max_latency_ms.to_string().bright_red()
+    );
+    println!("  {:<30} {}ms", "p50 (median):".dimmed(), pct.p50_ms);
+    println!("  {:<30} {}ms", "p75:".dimmed(), pct.p75_ms);
+    println!("  {:<30} {}ms", "p90:".dimmed(), pct.p90_ms);
+    println!("  {:<30} {}ms", "p95:".dimmed(), pct.p95_ms);
+    println!(
+        "  {:<30} {}",
+        "p99:".dimmed(),
+        format!("{}ms", pct.p99_ms).bright_yellow()
+    );
+    println!(
+        "  {:<30} {}",
+        "p99.9:".dimmed(),
+        format!("{}ms", pct.p999_ms).bright_red()
+    );
 
     // Histogram (ASCII bar chart)
     println!("\n  {}", "Latency Distribution".bright_white().underline());
-    let max_count = hist.buckets.iter().map(|b| b.count).max().unwrap_or(1).max(1);
+    let max_count = hist
+        .buckets
+        .iter()
+        .map(|b| b.count)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     for b in &hist.buckets {
-        if b.count == 0 { continue; }
+        if b.count == 0 {
+            continue;
+        }
         let bar_len = (b.count as f64 / max_count as f64 * 30.0) as usize;
         let bar = "█".repeat(bar_len);
         println!(
@@ -974,16 +1125,59 @@ fn mode_display_name(mode: &StressMode) -> &'static str {
 
 fn print_mode_info(mode: &StressMode) {
     match mode {
-        StressMode::Constant { users, duration_secs } =>
-            println!("  {} {} concurrent users for {}s", "▸".dimmed(), users, duration_secs),
-        StressMode::Ramp { start_users, peak_users, ramp_secs, hold_secs } =>
-            println!("  {} ramp {}→{} users over {}s, hold {}s", "▸".dimmed(), start_users, peak_users, ramp_secs, hold_secs),
-        StressMode::Spike { base_users, spike_users, spike_at_secs, spike_duration_secs, total_secs } =>
-            println!("  {} base={} spike={} at={}s for {}s (total {}s)", "▸".dimmed(), base_users, spike_users, spike_at_secs, spike_duration_secs, total_secs),
-        StressMode::Soak { users, duration_secs } =>
-            println!("  {} {} users for {}s ({:.1}min)", "▸".dimmed(), users, duration_secs, *duration_secs as f64 / 60.0),
-        StressMode::Requests { total, concurrency } =>
-            println!("  {} {} total requests at concurrency={}", "▸".dimmed(), total, concurrency),
+        StressMode::Constant {
+            users,
+            duration_secs,
+        } => println!(
+            "  {} {} concurrent users for {}s",
+            "▸".dimmed(),
+            users,
+            duration_secs
+        ),
+        StressMode::Ramp {
+            start_users,
+            peak_users,
+            ramp_secs,
+            hold_secs,
+        } => println!(
+            "  {} ramp {}→{} users over {}s, hold {}s",
+            "▸".dimmed(),
+            start_users,
+            peak_users,
+            ramp_secs,
+            hold_secs
+        ),
+        StressMode::Spike {
+            base_users,
+            spike_users,
+            spike_at_secs,
+            spike_duration_secs,
+            total_secs,
+        } => println!(
+            "  {} base={} spike={} at={}s for {}s (total {}s)",
+            "▸".dimmed(),
+            base_users,
+            spike_users,
+            spike_at_secs,
+            spike_duration_secs,
+            total_secs
+        ),
+        StressMode::Soak {
+            users,
+            duration_secs,
+        } => println!(
+            "  {} {} users for {}s ({:.1}min)",
+            "▸".dimmed(),
+            users,
+            duration_secs,
+            *duration_secs as f64 / 60.0
+        ),
+        StressMode::Requests { total, concurrency } => println!(
+            "  {} {} total requests at concurrency={}",
+            "▸".dimmed(),
+            total,
+            concurrency
+        ),
     }
 }
 
@@ -1019,7 +1213,10 @@ pub async fn run_stress_cli(args: StressCliArgs) -> Result<()> {
             concurrency: args.users,
         },
         other => {
-            anyhow::bail!("Unknown stress mode '{}'. Use: constant|ramp|spike|soak|requests", other);
+            anyhow::bail!(
+                "Unknown stress mode '{}'. Use: constant|ramp|spike|soak|requests",
+                other
+            );
         }
     };
 

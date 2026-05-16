@@ -12,6 +12,12 @@ use url::Url;
 
 use crate::types::{DiscoveredUrl, UrlSource};
 
+/// Hard caps for robots.txt / sitemap parsing to keep the spider polite.
+const ROBOTS_MAX_BYTES: usize = 256 * 1024;
+const SITEMAP_MAX_BYTES: usize = 1024 * 1024;
+const SITEMAP_MAX_FETCHES: usize = 5;
+const ROBOTS_SITEMAP_MAX_URLS: usize = 500;
+
 pub struct Spider {
     client: Arc<reqwest::Client>,
     base_url: String,
@@ -57,13 +63,33 @@ impl Spider {
             vis.insert(self.base_url.clone());
         }
 
-        let queue: Arc<Mutex<VecDeque<(DiscoveredUrl, usize)>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let queue: Arc<Mutex<VecDeque<(DiscoveredUrl, usize)>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
         {
             let mut q = queue.lock().await;
             q.push_back((seed.clone(), 0));
         }
 
         results.lock().await.push(seed);
+
+        // ── A2: robots.txt + sitemap enrichment ───────────────────────
+        // Pull additional URLs from /robots.txt and any declared sitemaps
+        // before the main BFS so they get the same per-depth treatment.
+        if let Ok(base) = Url::parse(&self.base_url) {
+            let enriched = self.fetch_robots_and_sitemaps(&base, &self.base_host).await;
+            if !enriched.is_empty() {
+                let mut vis = visited.lock().await;
+                let mut res = results.lock().await;
+                let mut q = queue.lock().await;
+                for du in enriched {
+                    if vis.insert(du.url.clone()) {
+                        res.push(du.clone());
+                        q.push_back((du, 0));
+                    }
+                }
+                info!("robots/sitemap added {} URLs", res.len() - 1);
+            }
+        }
 
         loop {
             // Drain up to `concurrency` items
@@ -93,7 +119,11 @@ impl Spider {
                             return;
                         }
 
-                        pb.set_message(format!("depth={} {}", depth, &du.url[..du.url.len().min(60)]));
+                        pb.set_message(format!(
+                            "depth={} {}",
+                            depth,
+                            &du.url[..du.url.len().min(60)]
+                        ));
 
                         let body = match client.get(&du.url).send().await {
                             Ok(resp) => {
@@ -121,7 +151,10 @@ impl Spider {
                                 vis.insert(url_str);
                                 results.lock().await.push(discovered.clone());
                                 queue.lock().await.push_back((discovered, depth + 1));
-                                pb.set_message(format!("Found {} URLs", results.lock().await.len()));
+                                pb.set_message(format!(
+                                    "Found {} URLs",
+                                    results.lock().await.len()
+                                ));
                             }
                         }
                     })
@@ -137,6 +170,181 @@ impl Spider {
         info!("Spider finished: {} URLs discovered", final_results.len());
         Ok(final_results)
     }
+
+    /// Fetch `{origin}/robots.txt`, parse it, then fetch any declared sitemaps
+    /// (bounded by the constants above) and return discovered URLs. Returns
+    /// `vec![]` on any network error — robots is best-effort.
+    async fn fetch_robots_and_sitemaps(&self, base: &Url, base_host: &str) -> Vec<DiscoveredUrl> {
+        let mut out: Vec<DiscoveredUrl> = Vec::new();
+        let Ok(robots_url) = base.join("/robots.txt") else {
+            return out;
+        };
+
+        let robots_text =
+            match fetch_capped(&self.client, robots_url.as_str(), ROBOTS_MAX_BYTES).await {
+                Some(t) => t,
+                None => return out,
+            };
+
+        let parsed = parse_robots_txt(&robots_text);
+
+        // Allow/Disallow → enqueue as same-host URLs
+        for path in parsed.paths.iter() {
+            if out.len() >= ROBOTS_SITEMAP_MAX_URLS {
+                break;
+            }
+            if let Some(resolved) = resolve_url(path, Some(base)) {
+                if is_same_host(&resolved, base_host) && is_http_url(&resolved) {
+                    let params = extract_query_params(&resolved);
+                    out.push(DiscoveredUrl {
+                        url: normalize_url(&resolved),
+                        method: "GET".to_string(),
+                        parameters: params,
+                        source: UrlSource::Robots,
+                    });
+                }
+            }
+        }
+
+        // Sitemaps → fetch, parse, enqueue same-host URLs
+        for (i, sitemap_url) in parsed.sitemaps.iter().enumerate() {
+            if i >= SITEMAP_MAX_FETCHES || out.len() >= ROBOTS_SITEMAP_MAX_URLS {
+                break;
+            }
+            let Some(xml) = fetch_capped(&self.client, sitemap_url, SITEMAP_MAX_BYTES).await else {
+                continue;
+            };
+            let urls = parse_sitemap_xml(&xml, ROBOTS_SITEMAP_MAX_URLS - out.len());
+            for u in urls {
+                if let Ok(parsed_url) = Url::parse(&u) {
+                    if is_same_host(&parsed_url, base_host) && is_http_url(&parsed_url) {
+                        let params = extract_query_params(&parsed_url);
+                        out.push(DiscoveredUrl {
+                            url: normalize_url(&parsed_url),
+                            method: "GET".to_string(),
+                            parameters: params,
+                            source: UrlSource::Sitemap,
+                        });
+                    }
+                }
+                if out.len() >= ROBOTS_SITEMAP_MAX_URLS {
+                    break;
+                }
+            }
+        }
+
+        out
+    }
+}
+
+/// Bounded GET that reads at most `max_bytes` of the response body as text.
+/// Returns `None` on transport error or non-2xx status.
+async fn fetch_capped(client: &reqwest::Client, url: &str, max_bytes: usize) -> Option<String> {
+    let resp = client
+        .get(url)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // reqwest doesn't expose a clean byte cap mid-stream; read fully then truncate.
+    // The Content-Length check below short-circuits the common case.
+    if let Some(len) = resp.content_length() {
+        if (len as usize) > max_bytes.saturating_mul(4) {
+            warn!("robots/sitemap response too large: {} bytes", len);
+            return None;
+        }
+    }
+    let body = resp.text().await.ok()?;
+    if body.len() > max_bytes {
+        Some(body[..max_bytes].to_string())
+    } else {
+        Some(body)
+    }
+}
+
+/// Parsed view of a robots.txt file. We deliberately ignore `User-agent`
+/// scoping — for scanning purposes we want *every* path the site mentions.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RobotsInfo {
+    /// Combined Allow + Disallow paths (verbatim values, may be relative).
+    pub paths: Vec<String>,
+    /// Absolute sitemap URLs declared via `Sitemap:` lines.
+    pub sitemaps: Vec<String>,
+}
+
+/// Parse robots.txt into a `RobotsInfo`. Comments (`#`) and empty values
+/// are dropped. `Disallow: /` (block everything) is *kept* because a scanner
+/// wants to probe paths the site is trying to hide.
+pub fn parse_robots_txt(text: &str) -> RobotsInfo {
+    let mut info = RobotsInfo::default();
+    for raw in text.lines() {
+        // Strip inline comments.
+        let line = match raw.find('#') {
+            Some(i) => &raw[..i],
+            None => raw,
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_lowercase();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "allow" | "disallow" => info.paths.push(value.to_string()),
+            "sitemap" => info.sitemaps.push(value.to_string()),
+            _ => {}
+        }
+    }
+    info
+}
+
+/// Extract `<loc>` URLs from a sitemap (urlset) or sitemapindex XML payload.
+/// `max` caps the number of URLs returned. This is a deliberately tiny
+/// parser — we look for `<loc>...</loc>` text content via byte scan rather
+/// than pulling in a full XML library.
+pub fn parse_sitemap_xml(xml: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = xml.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && out.len() < max {
+        if let Some(start) = find_subslice(&bytes[i..], b"<loc>") {
+            let abs_start = i + start + b"<loc>".len();
+            if let Some(end) = find_subslice(&bytes[abs_start..], b"</loc>") {
+                let raw = &xml[abs_start..abs_start + end];
+                let url = decode_xml_entities(raw.trim());
+                if !url.is_empty() {
+                    out.push(url);
+                }
+                i = abs_start + end + b"</loc>".len();
+                continue;
+            }
+        }
+        break;
+    }
+    out
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn decode_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
 }
 
 /// Extract all links, form actions, and JS fetch targets from HTML
@@ -176,7 +384,9 @@ fn extract_urls(html: &str, base: Option<&Url>, base_host: &str) -> Vec<Discover
                     .unwrap_or_else(|| action.to_string())
             };
 
-            if target_url.is_empty() { continue; }
+            if target_url.is_empty() {
+                continue;
+            }
 
             // Extract input names
             let mut params = Vec::new();
@@ -288,16 +498,18 @@ fn normalize_url(url: &Url) -> String {
 }
 
 fn extract_query_params(url: &Url) -> Vec<String> {
-    url.query_pairs()
-        .map(|(k, _)| k.to_string())
-        .collect()
+    url.query_pairs().map(|(k, _)| k.to_string()).collect()
 }
 
 /// CLI entry point for spider-only command
 pub async fn run_spider_cli(target: &str, depth: usize, output: Option<String>) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
 
-    println!("{} {}", "▶ Spidering:".bright_white().bold(), target.bright_cyan());
+    println!(
+        "{} {}",
+        "▶ Spidering:".bright_white().bold(),
+        target.bright_cyan()
+    );
 
     let client = Arc::new(
         reqwest::Client::builder()
@@ -330,7 +542,9 @@ pub async fn run_spider_cli(target: &str, depth: usize, output: Option<String>) 
             if url.parameters.is_empty() {
                 String::new()
             } else {
-                format!("[params: {}]", url.parameters.join(", ")).dimmed().to_string()
+                format!("[params: {}]", url.parameters.join(", "))
+                    .dimmed()
+                    .to_string()
             }
         );
     }
@@ -343,4 +557,81 @@ pub async fn run_spider_cli(target: &str, depth: usize, output: Option<String>) 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_robots_extracts_paths_and_sitemaps() {
+        let text = "\
+User-agent: *
+Disallow: /admin/
+Allow: /admin/public/
+Disallow: /private # admin only
+# Standalone comment
+Sitemap: https://example.com/sitemap.xml
+sitemap: https://example.com/sitemap2.xml
+";
+        let info = parse_robots_txt(text);
+        assert_eq!(info.paths, vec!["/admin/", "/admin/public/", "/private"]);
+        assert_eq!(
+            info.sitemaps,
+            vec![
+                "https://example.com/sitemap.xml",
+                "https://example.com/sitemap2.xml"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_robots_skips_empty_values_and_unknown_keys() {
+        let text = "Disallow:\nCrawl-delay: 5\nSitemap: \n";
+        let info = parse_robots_txt(text);
+        assert!(info.paths.is_empty());
+        assert!(info.sitemaps.is_empty());
+    }
+
+    #[test]
+    fn parse_sitemap_extracts_loc_tags() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/a</loc></url>
+  <url><loc>https://example.com/b?x=1&amp;y=2</loc></url>
+  <url><loc> https://example.com/c </loc></url>
+</urlset>"#;
+        let urls = parse_sitemap_xml(xml, 100);
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/a",
+                "https://example.com/b?x=1&y=2",
+                "https://example.com/c",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sitemap_respects_max() {
+        let xml = "<urlset><url><loc>https://example.com/a</loc></url>\
+<url><loc>https://example.com/b</loc></url>\
+<url><loc>https://example.com/c</loc></url></urlset>";
+        let urls = parse_sitemap_xml(xml, 2);
+        assert_eq!(urls.len(), 2);
+    }
+
+    #[test]
+    fn parse_sitemap_handles_index_with_uppercase_tags() {
+        let xml =
+            "<sitemapindex><sitemap><LOC>https://example.com/s1.xml</LOC></sitemap></sitemapindex>";
+        let urls = parse_sitemap_xml(xml, 10);
+        assert_eq!(urls, vec!["https://example.com/s1.xml"]);
+    }
+
+    #[test]
+    fn parse_sitemap_returns_empty_for_garbage() {
+        assert!(parse_sitemap_xml("not xml", 10).is_empty());
+        assert!(parse_sitemap_xml("", 10).is_empty());
+    }
 }

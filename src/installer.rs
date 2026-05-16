@@ -241,9 +241,7 @@ pub async fn run(dry_run: bool, only: Option<String>, yes: bool, list: bool) -> 
     );
 
     if os == Os::Unknown {
-        anyhow::bail!(
-            "Unsupported OS — install companion tools manually (see SDD section 4)"
-        );
+        anyhow::bail!("Unsupported OS — install companion tools manually (see SDD section 4)");
     }
 
     if list {

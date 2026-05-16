@@ -23,48 +23,152 @@ pub struct ExternalTool {
 
 #[derive(Debug, Clone)]
 pub enum ToolEvent {
-    Started {
-        tool: String,
-        cmdline: String,
-    },
-    Output {
-        tool: String,
-        line: String,
-    },
-    Completed {
-        tool: String,
-        exit_code: i32,
-    },
-    Error {
-        tool: String,
-        error: String,
-    },
+    Started { tool: String, cmdline: String },
+    Output { tool: String, line: String },
+    Completed { tool: String, exit_code: i32 },
+    Error { tool: String, error: String },
 }
 
-fn definitions() -> Vec<(&'static str, &'static str, &'static str, &'static str, Vec<&'static str>, bool)> {
+fn definitions() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Vec<&'static str>,
+    bool,
+)> {
     vec![
         // (name, cmd, category, role, default_args, needs_target)
-        ("Semgrep", "semgrep", "SAST", "Static code analysis", vec!["scan", "--quiet", "--json", "."], false),
-        ("Trivy", "trivy", "SCA", "Container/dep scanning", vec!["fs", "--quiet", "--format", "json", "."], false),
-        ("Gitleaks", "gitleaks", "Secrets", "Secret detection", vec!["detect", "--no-banner"], false),
-        ("Checkov", "checkov", "IaC", "Infra-as-code scanning", vec!["-d", ".", "--quiet", "--compact"], false),
-        ("Nmap", "nmap", "Recon", "Network port/service map", vec!["-sV", "-T4"], true),
-        ("Nikto", "nikto", "DAST", "Web vuln scanner", vec!["-h"], true),
-        ("Wapiti", "wapiti", "DAST", "Web vuln scanner", vec!["-u"], true),
-        ("tshark", "tshark", "Packet", "Packet capture", vec!["-c", "20"], false),
-        ("Hashcat", "hashcat", "Cracking", "GPU hash cracking", vec!["--version"], false),
-        ("John", "john", "Cracking", "Password cracker", vec!["--list=help"], false),
-        ("Hydra", "hydra", "Auth", "Brute-force tool", vec!["-h"], false),
-        ("Medusa", "medusa", "Auth", "Brute-force tool", vec!["-h"], false),
-        ("Aircrack-ng", "aircrack-ng", "Wireless", "WiFi auditing", vec!["--help"], false),
-        ("Wifite", "wifite", "Wireless", "WiFi auditing", vec!["--help"], false),
-        ("Falco", "falco", "Runtime", "Runtime threat detection", vec!["--version"], false),
+        (
+            "Semgrep",
+            "semgrep",
+            "SAST",
+            "Static code analysis",
+            vec!["scan", "--quiet", "--json", "."],
+            false,
+        ),
+        (
+            "Trivy",
+            "trivy",
+            "SCA",
+            "Container/dep scanning",
+            vec!["fs", "--quiet", "--format", "json", "."],
+            false,
+        ),
+        (
+            "Gitleaks",
+            "gitleaks",
+            "Secrets",
+            "Secret detection",
+            vec!["detect", "--no-banner"],
+            false,
+        ),
+        (
+            "Checkov",
+            "checkov",
+            "IaC",
+            "Infra-as-code scanning",
+            vec!["-d", ".", "--quiet", "--compact"],
+            false,
+        ),
+        (
+            "Nmap",
+            "nmap",
+            "Recon",
+            "Network port/service map",
+            vec!["-sV", "-T4"],
+            true,
+        ),
+        (
+            "Nikto",
+            "nikto",
+            "DAST",
+            "Web vuln scanner",
+            vec!["-h"],
+            true,
+        ),
+        (
+            "Wapiti",
+            "wapiti",
+            "DAST",
+            "Web vuln scanner",
+            vec!["-u"],
+            true,
+        ),
+        (
+            "tshark",
+            "tshark",
+            "Packet",
+            "Packet capture",
+            vec!["-c", "20"],
+            false,
+        ),
+        (
+            "Hashcat",
+            "hashcat",
+            "Cracking",
+            "GPU hash cracking",
+            vec!["--version"],
+            false,
+        ),
+        (
+            "John",
+            "john",
+            "Cracking",
+            "Password cracker",
+            vec!["--list=help"],
+            false,
+        ),
+        (
+            "Hydra",
+            "hydra",
+            "Auth",
+            "Brute-force tool",
+            vec!["-h"],
+            false,
+        ),
+        (
+            "Medusa",
+            "medusa",
+            "Auth",
+            "Brute-force tool",
+            vec!["-h"],
+            false,
+        ),
+        (
+            "Aircrack-ng",
+            "aircrack-ng",
+            "Wireless",
+            "WiFi auditing",
+            vec!["--help"],
+            false,
+        ),
+        (
+            "Wifite",
+            "wifite",
+            "Wireless",
+            "WiFi auditing",
+            vec!["--help"],
+            false,
+        ),
+        (
+            "Falco",
+            "falco",
+            "Runtime",
+            "Runtime threat detection",
+            vec!["--version"],
+            false,
+        ),
     ]
 }
 
 fn is_installed(cmd: &str) -> bool {
     std::process::Command::new("/usr/bin/env")
-        .args(["sh", "-c", &format!("command -v {} >/dev/null 2>&1", shell_escape(cmd))])
+        .args([
+            "sh",
+            "-c",
+            &format!("command -v {} >/dev/null 2>&1", shell_escape(cmd)),
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -72,7 +176,9 @@ fn is_installed(cmd: &str) -> bool {
 
 fn shell_escape(s: &str) -> String {
     // Only allow simple command names; reject anything funky.
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         s.to_string()
     } else {
         String::new()

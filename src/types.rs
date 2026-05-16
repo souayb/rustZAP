@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Severity levels for findings
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -141,6 +141,59 @@ pub enum UrlSource {
     Form,
     Script,
     Redirect,
+    Robots,
+    Sitemap,
+}
+
+/// Roll-up of one module's contribution to the scan. See SDD §9.1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleSummary {
+    /// Plugin id, e.g. `passive/security-txt` or `active/sqli`.
+    pub name: String,
+    /// Number of findings this module produced.
+    pub findings: usize,
+    /// Highest severity in this module's findings (None when quiet).
+    pub max_severity: Option<Severity>,
+    /// True when the module ran but produced zero findings.
+    pub quiet: bool,
+}
+
+/// Bucket findings by their `plugin` field and union with `known_modules`
+/// (so modules that ran quietly still appear in the result). Returns one
+/// `ModuleSummary` per distinct module name, sorted: non-quiet first (by
+/// max severity descending), then quiet (alphabetical).
+pub fn summarize_modules(findings: &[Finding], known_modules: &[&str]) -> Vec<ModuleSummary> {
+    use std::collections::BTreeMap;
+    let mut buckets: BTreeMap<String, (usize, Option<Severity>)> = BTreeMap::new();
+    for k in known_modules {
+        buckets.entry((*k).to_string()).or_insert((0, None));
+    }
+    for f in findings {
+        let entry = buckets.entry(f.plugin.clone()).or_insert((0, None));
+        entry.0 += 1;
+        entry.1 = Some(match entry.1.as_ref() {
+            Some(prev) if prev > &f.severity => prev.clone(),
+            _ => f.severity.clone(),
+        });
+    }
+    let mut out: Vec<ModuleSummary> = buckets
+        .into_iter()
+        .map(|(name, (count, sev))| ModuleSummary {
+            quiet: count == 0,
+            findings: count,
+            max_severity: sev,
+            name,
+        })
+        .collect();
+    out.sort_by(|a, b| match (a.quiet, b.quiet) {
+        (false, true) => std::cmp::Ordering::Less,
+        (true, false) => std::cmp::Ordering::Greater,
+        _ => b
+            .max_severity
+            .cmp(&a.max_severity)
+            .then_with(|| a.name.cmp(&b.name)),
+    });
+    out
 }
 
 /// Generate a simple UUID-like identifier
@@ -155,4 +208,68 @@ pub fn uuid_v4() -> String {
         (rng.gen::<u16>() & 0x3fff) | 0x8000,
         rng.gen::<u64>() & 0xffffffffffff,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(plugin: &str, sev: Severity) -> Finding {
+        Finding::new("t", sev, "https://x", "d", "s", plugin)
+    }
+
+    #[test]
+    fn summarize_modules_buckets_by_plugin() {
+        let findings = vec![
+            mk("active/sqli", Severity::Critical),
+            mk("active/xss", Severity::High),
+            mk("active/xss", Severity::Medium),
+            mk("passive/security-txt", Severity::Info),
+        ];
+        let known: &[&str] = &["active/sqli", "active/xss", "passive/security-txt"];
+        let summaries = summarize_modules(&findings, known);
+        let by_name: std::collections::HashMap<_, _> =
+            summaries.iter().map(|s| (s.name.clone(), s)).collect();
+        assert_eq!(by_name["active/sqli"].findings, 1);
+        assert_eq!(by_name["active/xss"].findings, 2);
+        // Max severity within active/xss is High (not Medium).
+        assert_eq!(by_name["active/xss"].max_severity, Some(Severity::High));
+    }
+
+    #[test]
+    fn summarize_modules_surfaces_quiet_modules() {
+        let findings: Vec<Finding> = vec![];
+        let known: &[&str] = &["passive/missing-headers", "active/xss"];
+        let summaries = summarize_modules(&findings, known);
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|s| s.quiet));
+        assert!(summaries.iter().all(|s| s.max_severity.is_none()));
+    }
+
+    #[test]
+    fn summarize_modules_sorts_non_quiet_first_by_severity() {
+        let findings = vec![
+            mk("active/a", Severity::Low),
+            mk("active/b", Severity::Critical),
+            mk("active/c", Severity::Medium),
+        ];
+        let known: &[&str] = &["active/quiet-one", "active/a", "active/b", "active/c"];
+        let summaries = summarize_modules(&findings, known);
+        // Order: Critical (b), Medium (c), Low (a), then quiet.
+        assert_eq!(summaries[0].name, "active/b");
+        assert_eq!(summaries[1].name, "active/c");
+        assert_eq!(summaries[2].name, "active/a");
+        assert_eq!(summaries[3].name, "active/quiet-one");
+        assert!(summaries[3].quiet);
+    }
+
+    #[test]
+    fn summarize_modules_picks_up_unknown_plugins() {
+        // A plugin not in `known_modules` but present in findings still
+        // appears in the result.
+        let findings = vec![mk("custom/special", Severity::Medium)];
+        let known: &[&str] = &["passive/security-txt"];
+        let summaries = summarize_modules(&findings, known);
+        assert!(summaries.iter().any(|s| s.name == "custom/special"));
+    }
 }

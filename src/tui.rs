@@ -7,7 +7,7 @@
 //!   4·Tools     — detect SDD tools (Semgrep/Trivy/Gitleaks/Checkov/Nmap/…) and run them
 //!   5·Logs      — live event stream from scans and tool runs
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -21,9 +21,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        BarChart, Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap,
-    },
+    widgets::{BarChart, Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::mpsc;
@@ -34,13 +32,43 @@ use crate::scanner::{run_scan_with_events, ScanConfig};
 use crate::tools::{detect_tools, run_tool, ExternalTool, ToolEvent};
 use crate::types::{Finding, Severity};
 
-const TAB_TITLES: &[&str] = &[
-    "1·Dashboard",
-    "2·Scan",
-    "3·Findings",
-    "4·Tools",
-    "5·Logs",
-];
+const TAB_TITLES: &[&str] = &["1·Dashboard", "2·Scan", "3·Findings", "4·Tools", "5·Logs"];
+
+/// State for one module group in the Findings-tab tree (SDD §9.1).
+/// `ran` is set when a `ScanEvent::ModuleRan` arrives; it differentiates
+/// modules that executed from those merely seen via a `Finding` event.
+/// `folded` controls collapsed/expanded rendering.
+#[derive(Debug, Clone)]
+struct ModuleNode {
+    ran: bool,
+    folded: bool,
+}
+
+impl Default for ModuleNode {
+    fn default() -> Self {
+        Self {
+            ran: false,
+            folded: true,
+        }
+    }
+}
+
+/// One visible row in the flattened module tree. The findings tab navigates
+/// this list; selecting a `Header` and pressing Enter toggles its fold.
+#[derive(Debug, Clone)]
+enum TreeRow {
+    Header {
+        module: String,
+        finding_count: usize,
+        max_severity: Option<Severity>,
+        folded: bool,
+        quiet: bool,
+    },
+    Finding {
+        module: String,
+        index: usize,
+    },
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -106,7 +134,7 @@ impl Default for ConfigForm {
             target: "https://example.com".to_string(),
             depth: 3,
             concurrency: 10,
-            plugins: "xss,sqli,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti".to_string(),
+            plugins: "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain".to_string(),
             output: "rustzap-report.json".to_string(),
             passive_only: false,
             insecure: false,
@@ -129,7 +157,11 @@ impl ConfigForm {
             api_key: None,
             basic_auth: None,
             insecure: self.insecure,
-            plugins: self.plugins.split(',').map(|s| s.trim().to_string()).collect(),
+            plugins: self
+                .plugins
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect(),
         }
     }
 }
@@ -170,6 +202,8 @@ struct App {
     findings_state: ListState,
     severity_filter: HashSet<Severity>,
     detail_scroll: u16,
+    /// Module tree state (SDD §9.1). Keyed by plugin id (e.g. `active/sqli`).
+    modules: BTreeMap<String, ModuleNode>,
 
     tools: Vec<ExternalTool>,
     tools_state: ListState,
@@ -205,6 +239,7 @@ impl App {
             findings_state,
             severity_filter: HashSet::new(),
             detail_scroll: 0,
+            modules: BTreeMap::new(),
 
             tools: detect_tools(),
             tools_state,
@@ -222,11 +257,13 @@ impl App {
         // Pre-load any existing report so the dashboard isn't empty on first run.
         for path in ["report.json", "rustzap-report.json"] {
             if let Ok(contents) = std::fs::read_to_string(path) {
-                if let Ok(parsed) =
-                    serde_json::from_str::<crate::report::Report>(&contents)
-                {
+                if let Ok(parsed) = serde_json::from_str::<crate::report::Report>(&contents) {
                     app.findings = parsed.findings;
-                    app.log(format!("Loaded {} findings from {}", app.findings.len(), path));
+                    app.log(format!(
+                        "Loaded {} findings from {}",
+                        app.findings.len(),
+                        path
+                    ));
                     break;
                 }
             }
@@ -243,11 +280,96 @@ impl App {
         self.logs.push_back(format!("[{}] {}", ts, line));
     }
 
-    fn visible_findings(&self) -> Vec<&Finding> {
-        self.findings
-            .iter()
-            .filter(|f| self.severity_filter.is_empty() || self.severity_filter.contains(&f.severity))
-            .collect()
+    /// Build the flattened module tree shown in the Findings tab (SDD §9.1).
+    /// Severity filter only hides findings; module headers always appear so
+    /// the operator sees coverage even when the filter is restrictive.
+    fn tree_rows(&self) -> Vec<TreeRow> {
+        // Bucket finding indices by their `plugin` field.
+        let mut by_module: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, f) in self.findings.iter().enumerate() {
+            if !self.severity_filter.is_empty() && !self.severity_filter.contains(&f.severity) {
+                continue;
+            }
+            by_module.entry(f.plugin.clone()).or_default().push(i);
+        }
+        // Make sure every known/registered module appears even if 0 findings.
+        for k in self.modules.keys() {
+            by_module.entry(k.clone()).or_default();
+        }
+
+        // Per-module max severity (highest first).
+        let mut headers: Vec<(String, Vec<usize>, Option<Severity>)> = by_module
+            .into_iter()
+            .map(|(name, idxs)| {
+                let max_sev = idxs
+                    .iter()
+                    .map(|&i| self.findings[i].severity.clone())
+                    .max();
+                (name, idxs, max_sev)
+            })
+            .collect();
+        // Non-quiet first (by max severity descending), then quiet (alphabetical).
+        headers.sort_by(|a, b| {
+            let a_quiet = a.1.is_empty();
+            let b_quiet = b.1.is_empty();
+            match (a_quiet, b_quiet) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)),
+            }
+        });
+
+        let mut rows = Vec::new();
+        for (name, idxs, max_sev) in headers {
+            let node = self.modules.get(&name);
+            let folded = node.map(|n| n.folded).unwrap_or(idxs.is_empty());
+            let quiet = idxs.is_empty();
+            rows.push(TreeRow::Header {
+                module: name.clone(),
+                finding_count: idxs.len(),
+                max_severity: max_sev,
+                folded,
+                quiet,
+            });
+            if !folded {
+                for i in idxs {
+                    rows.push(TreeRow::Finding {
+                        module: name.clone(),
+                        index: i,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    /// Toggle the folded state of the module under the focused row. If the
+    /// focused row is a finding, fold its parent module.
+    fn toggle_focused_module(&mut self) {
+        let rows = self.tree_rows();
+        let sel = self
+            .findings_state
+            .selected()
+            .unwrap_or(0)
+            .min(rows.len().saturating_sub(1));
+        let module = match rows.get(sel) {
+            Some(TreeRow::Header { module, .. }) => module.clone(),
+            Some(TreeRow::Finding { module, .. }) => module.clone(),
+            None => return,
+        };
+        let entry = self.modules.entry(module).or_default();
+        entry.folded = !entry.folded;
+    }
+
+    fn set_all_modules_folded(&mut self, folded: bool) {
+        // Make sure every observed module has a state entry first.
+        let plugins: Vec<String> = self.findings.iter().map(|f| f.plugin.clone()).collect();
+        for p in plugins {
+            self.modules.entry(p).or_default();
+        }
+        for node in self.modules.values_mut() {
+            node.folded = folded;
+        }
     }
 
     fn start_scan(&mut self) {
@@ -317,6 +439,7 @@ impl App {
                         &mut self.scan_status,
                         &mut self.findings,
                         &mut self.logs,
+                        &mut self.modules,
                         ev,
                     ),
                     Err(mpsc::error::TryRecvError::Empty) => break,
@@ -365,6 +488,7 @@ impl App {
         status: &mut ScanStatus,
         findings: &mut Vec<Finding>,
         logs: &mut VecDeque<String>,
+        modules: &mut BTreeMap<String, ModuleNode>,
         ev: ScanEvent,
     ) {
         let push_log = |logs: &mut VecDeque<String>, msg: String| {
@@ -388,11 +512,7 @@ impl App {
                         total.map(|t| format!(" ({} URLs)", t)).unwrap_or_default()
                     ),
                 );
-                if let ScanStatus::Running {
-                    phase: p,
-                    ..
-                } = status
-                {
+                if let ScanStatus::Running { phase: p, .. } = status {
                     *p = phase;
                 }
             }
@@ -416,10 +536,36 @@ impl App {
                     logs,
                     format!("Finding [{}] {} @ {}", f.severity, f.title, f.url),
                 );
+                // Register the module group on first finding so it shows up
+                // in the tree even before ModuleRan arrives.
+                let entry = modules.entry(f.plugin.clone()).or_default();
+                // Auto-expand groups that have findings — quiet defaults to folded.
+                if !entry.ran {
+                    entry.folded = false;
+                }
                 findings.push(f);
             }
             ScanEvent::Log(msg) => push_log(logs, msg),
             ScanEvent::Error(msg) => push_log(logs, format!("ERROR: {}", msg)),
+            ScanEvent::ModuleRan { name, findings: n } => {
+                let marker = if n == 0 { "·" } else { "✓" };
+                push_log(
+                    logs,
+                    format!(
+                        "{} module {} ({})",
+                        marker,
+                        name,
+                        if n == 0 {
+                            "quiet".to_string()
+                        } else if n == 1 {
+                            "1 finding".to_string()
+                        } else {
+                            format!("{} findings", n)
+                        }
+                    ),
+                );
+                modules.entry(name).or_default().ran = true;
+            }
             ScanEvent::Completed {
                 duration_secs,
                 total_findings,
@@ -617,7 +763,9 @@ fn handle_scan_keys(app: &mut App, code: KeyCode) {
 }
 
 fn handle_findings_keys(app: &mut App, code: KeyCode) {
-    let len = app.visible_findings().len();
+    // Navigate the module tree (headers + visible findings) rather than a
+    // flat list. Fold state is mutable from here too.
+    let len = app.tree_rows().len();
     if len == 0 {
         return;
     }
@@ -632,6 +780,16 @@ fn handle_findings_keys(app: &mut App, code: KeyCode) {
             let next = if selected == 0 { len - 1 } else { selected - 1 };
             app.findings_state.select(Some(next));
             app.detail_scroll = 0;
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            app.toggle_focused_module();
+            app.detail_scroll = 0;
+        }
+        KeyCode::Char('o') => {
+            app.set_all_modules_folded(false);
+        }
+        KeyCode::Char('O') => {
+            app.set_all_modules_folded(true);
         }
         KeyCode::PageDown => app.detail_scroll = app.detail_scroll.saturating_add(5),
         KeyCode::PageUp => app.detail_scroll = app.detail_scroll.saturating_sub(5),
@@ -685,12 +843,8 @@ fn handle_tools_keys(app: &mut App, code: KeyCode) {
 
 fn handle_logs_keys(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.log_scroll = app.log_scroll.saturating_add(1)
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.log_scroll = app.log_scroll.saturating_sub(1)
-        }
+        KeyCode::Down | KeyCode::Char('j') => app.log_scroll = app.log_scroll.saturating_add(1),
+        KeyCode::Up | KeyCode::Char('k') => app.log_scroll = app.log_scroll.saturating_sub(1),
         KeyCode::PageDown => app.log_scroll = app.log_scroll.saturating_add(10),
         KeyCode::PageUp => app.log_scroll = app.log_scroll.saturating_sub(10),
         KeyCode::Char('G') => app.log_scroll = u16::MAX,
@@ -734,16 +888,10 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let tabs = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " RustZAP · Unified DevSecOps Pentesting Console ",
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(Span::styled(
+            " RustZAP · Unified DevSecOps Pentesting Console ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )))
         .select(app.tab.index())
         .highlight_style(
             Style::default()
@@ -808,7 +956,9 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
     let target_card = Paragraph::new(vec![
         Line::from(Span::styled(
             &app.config.target,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(format!(
             "depth={} concurrency={}",
@@ -839,7 +989,9 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             format!("  {} / 100", score),
-            Style::default().fg(score_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(score_color)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -1168,50 +1320,110 @@ fn draw_findings(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    let visible: Vec<&Finding> = app.visible_findings();
+    let rows = app.tree_rows();
+    let total_findings = app.findings.len();
+    let modules_ran = rows
+        .iter()
+        .filter(|r| matches!(r, TreeRow::Header { .. }))
+        .count();
+    let quiet_count = rows
+        .iter()
+        .filter(|r| matches!(r, TreeRow::Header { quiet: true, .. }))
+        .count();
 
     let filter_label = if app.severity_filter.is_empty() {
         "Filter: all".to_string()
     } else {
-        let names: Vec<String> = app
-            .severity_filter
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let names: Vec<String> = app.severity_filter.iter().map(|s| s.to_string()).collect();
         format!("Filter: {}", names.join(","))
     };
 
-    let items: Vec<ListItem> = visible
+    let items: Vec<ListItem> = rows
         .iter()
-        .enumerate()
-        .map(|(i, fnd)| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:>3}. ", i + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("[{:<8}]", fnd.severity),
-                    Style::default().fg(severity_color(&fnd.severity)),
-                ),
-                Span::raw(" "),
-                Span::raw(&fnd.title),
-            ]))
+        .map(|row| match row {
+            TreeRow::Header {
+                module,
+                finding_count,
+                max_severity,
+                folded,
+                quiet,
+            } => {
+                let caret = if *quiet {
+                    "·"
+                } else if *folded {
+                    "▶"
+                } else {
+                    "▼"
+                };
+                let sev_style = max_severity
+                    .as_ref()
+                    .map(severity_color)
+                    .map(|c| Style::default().fg(c))
+                    .unwrap_or_else(|| Style::default().fg(Color::DarkGray));
+                let sev_label = match max_severity {
+                    Some(s) => format!("[{}]", s),
+                    None => "(quiet)".to_string(),
+                };
+                let count_label = if *quiet {
+                    String::new()
+                } else if *finding_count == 1 {
+                    "  1 finding ".to_string()
+                } else {
+                    format!("  {} findings ", finding_count)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", caret),
+                        Style::default().fg(if *quiet { Color::DarkGray } else { Color::Cyan }),
+                    ),
+                    Span::styled(
+                        module.clone(),
+                        Style::default()
+                            .fg(if *quiet {
+                                Color::DarkGray
+                            } else {
+                                Color::White
+                            })
+                            .add_modifier(if *quiet {
+                                Modifier::DIM
+                            } else {
+                                Modifier::BOLD
+                            }),
+                    ),
+                    Span::styled(count_label, Style::default().fg(Color::DarkGray)),
+                    Span::styled(sev_label, sev_style),
+                ]))
+            }
+            TreeRow::Finding { index, .. } => {
+                let fnd = &app.findings[*index];
+                ListItem::new(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        format!("[{:<8}]", fnd.severity),
+                        Style::default().fg(severity_color(&fnd.severity)),
+                    ),
+                    Span::raw(" "),
+                    Span::raw(fnd.title.clone()),
+                ]))
+            }
         })
         .collect();
 
     let mut state = app.findings_state.clone();
-    if !visible.is_empty() {
-        let cur = state.selected().unwrap_or(0).min(visible.len() - 1);
+    if !rows.is_empty() {
+        let cur = state.selected().unwrap_or(0).min(rows.len() - 1);
         state.select(Some(cur));
     }
 
+    let title = format!(
+        " Modules ({} ran · {} quiet · {} findings) · {} ",
+        modules_ran.saturating_sub(quiet_count),
+        quiet_count,
+        total_findings,
+        filter_label
+    );
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Findings ({}) · {} ", visible.len(), filter_label)),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -1220,32 +1432,57 @@ fn draw_findings(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, cols[0], &mut state);
 
-    // Detail pane
-    let detail_text = if visible.is_empty() {
+    // Detail pane — module-level info when a header is selected, full
+    // finding detail when a finding row is selected.
+    let sel = app
+        .findings_state
+        .selected()
+        .unwrap_or(0)
+        .min(rows.len().saturating_sub(1));
+    let detail_text = if rows.is_empty() {
         "No findings yet. Run a scan from the Scan tab.".to_string()
     } else {
-        let idx = app
-            .findings_state
-            .selected()
-            .unwrap_or(0)
-            .min(visible.len() - 1);
-        let fnd = visible[idx];
-        format!(
-            "Title:       {}\nSeverity:    {}\nPlugin:      {}\nURL:         {}\nParameter:   {}\nCWE:         {}\nOWASP:       {}\nFound at:    {}\n\nDescription\n────────────\n{}\n\nEvidence\n────────────\n{}\n\nSolution\n────────────\n{}\n",
-            fnd.title,
-            fnd.severity,
-            fnd.plugin,
-            fnd.url,
-            fnd.parameter.as_deref().unwrap_or("—"),
-            fnd.cwe
-                .map(|c| format!("CWE-{}", c))
-                .unwrap_or_else(|| "—".into()),
-            fnd.owasp_category.as_deref().unwrap_or("—"),
-            fnd.found_at,
-            fnd.description,
-            fnd.evidence.as_deref().unwrap_or("—"),
-            fnd.solution,
-        )
+        match &rows[sel] {
+            TreeRow::Header {
+                module,
+                finding_count,
+                max_severity,
+                folded,
+                quiet,
+            } => {
+                format!(
+                    "Module:      {}\nStatus:      {}\nFindings:    {}\nMax severity:{}\nFolded:      {}\n\nPress Enter / Space to {} this group.\n'o' opens all module groups, 'O' collapses all.",
+                    module,
+                    if *quiet { "Ran (quiet)" } else { "Ran" },
+                    finding_count,
+                    max_severity
+                        .as_ref()
+                        .map(|s| format!(" {}", s))
+                        .unwrap_or_else(|| " —".into()),
+                    if *folded { "yes" } else { "no" },
+                    if *folded { "expand" } else { "collapse" },
+                )
+            }
+            TreeRow::Finding { index, .. } => {
+                let fnd = &app.findings[*index];
+                format!(
+                    "Title:       {}\nSeverity:    {}\nPlugin:      {}\nURL:         {}\nParameter:   {}\nCWE:         {}\nOWASP:       {}\nFound at:    {}\n\nDescription\n────────────\n{}\n\nEvidence\n────────────\n{}\n\nSolution\n────────────\n{}\n",
+                    fnd.title,
+                    fnd.severity,
+                    fnd.plugin,
+                    fnd.url,
+                    fnd.parameter.as_deref().unwrap_or("—"),
+                    fnd.cwe
+                        .map(|c| format!("CWE-{}", c))
+                        .unwrap_or_else(|| "—".into()),
+                    fnd.owasp_category.as_deref().unwrap_or("—"),
+                    fnd.found_at,
+                    fnd.description,
+                    fnd.evidence.as_deref().unwrap_or("—"),
+                    fnd.solution,
+                )
+            }
+        }
     };
 
     let detail = Paragraph::new(detail_text)
@@ -1284,9 +1521,7 @@ fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(format!(" {} ", badge), Style::default().fg(badge_color)),
                 Span::styled(
                     format!("{:<18}", t.name),
-                    Style::default()
-                        .fg(name_color)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("[{}] ", t.category),
@@ -1299,15 +1534,11 @@ fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
 
     let mut state = app.tools_state.clone();
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(
-                    " Integrated Tools — {}/{} installed ",
-                    app.tools.iter().filter(|t| t.installed).count(),
-                    app.tools.len()
-                )),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Integrated Tools — {}/{} installed ",
+            app.tools.iter().filter(|t| t.installed).count(),
+            app.tools.len()
+        )))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -1384,7 +1615,11 @@ fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let detail = Paragraph::new(detail_lines)
-        .block(Block::default().borders(Borders::ALL).title(" Tool detail "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Tool detail "),
+        )
         .wrap(Wrap { trim: true });
     f.render_widget(detail, cols[1]);
 }
@@ -1425,7 +1660,9 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.tab {
         Tab::Dashboard => "1-5/Tab: switch · q: quit",
         Tab::Scan => "t/P/o: edit · p/i: toggle · +/-/[/]: tune · s: start · x: cancel",
-        Tab::Findings => "j/k: navigate · PgUp/PgDn: scroll · f: filter · c: clear",
+        Tab::Findings => {
+            "j/k: nav · Enter/Space: fold · o: open-all · O: close-all · f: filter · c: clear"
+        }
         Tab::Tools => "j/k: navigate · r/Enter: run · R: re-detect",
         Tab::Logs => "j/k/PgUp/PgDn: scroll · G: bottom · c: clear",
     };
@@ -1453,13 +1690,15 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled(
             scan_label,
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(hints, Style::default().fg(Color::DarkGray)),
     ]);
 
-    let bar = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).title(" Controls "));
+    let bar =
+        Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" Controls "));
     f.render_widget(bar, area);
 }
