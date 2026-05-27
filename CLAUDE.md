@@ -37,7 +37,7 @@ Before saying work is complete:
 cargo test
 ```
 
-(There may be few or no tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers and report serialization. See `FEATURE.md` Tier D.)
+(There may be few or no tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers and report serialization. See `FEATURE.md` backlog item **D2** (passive golden matrix).)
 
 ### Smoke run (after build)
 
@@ -67,7 +67,8 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 | `src/tui.rs` | Ratatui UI; keeps plugin defaults in sync with CLI where applicable |
 | `src/tools.rs` | External tool detection + execution |
 | `src/installer.rs` | OS-aware companion tool installs |
-| `FEATURE.md` | Planned modules + implementation tasks |
+| `FEATURE.md` | Implemented passive/active items + backlog; platform detail in `IMPLEMENTATION_PLAN.md` |
+| `IMPLEMENTATION_PLAN.md` | **Detailed specs** for analyze/audit, JSON `modules`, SARIF, `serve`, agentic mode |
 | `SOFTWARE_DESIGN_DOCUMENT.md` | Platform / SDD context (orchestration, UFF, workers) |
 
 ---
@@ -79,7 +80,7 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 1. **Spider** discovers `DiscoveredUrl` values (GET-focused extraction).
 2. **Passive** runs on discovered URLs (`PassiveScanner::scan_all`); **skips non-GET** in current code.
 3. **Active** runs when not `passive_only`; `ActiveScanner` filters plugins by `--plugins` (substring match or `all`).
-4. **Report** merges findings; JSON is the primary machine-readable contract for downstream platforms.
+4. **Report** merges findings; JSON is the primary machine-readable contract for downstream platforms. Module roll-up is printed after scans and surfaced in the TUI; serialization of **`modules`** into JSON is specified in **`IMPLEMENTATION_PLAN.md`** Phase 1 (`report.rs` must stay in sync with `print_module_summary` / `summarize_modules`).
 
 ### Active plugins (`ScanPlugin`)
 
@@ -120,7 +121,7 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 
 ## Adding a new scanner capability
 
-1. Read **`FEATURE.md`** for prioritized module ideas and task breakdowns.
+1. Read **`FEATURE.md`** for what's shipped vs backlog; **`IMPLEMENTATION_PLAN.md`** for phased specs.
 2. Choose **passive** (header/body) vs **active** (`ScanPlugin`) vs **spider** (discovery).
 3. Add **stable** `plugin` identifiers and OWASP/CWE metadata where appropriate.
 4. Extend CLI defaults (`--plugins` in `main.rs`, TUI defaults in `tui.rs`) only when the feature is **safe and expected**.
@@ -174,6 +175,8 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 | List active plugins | `cargo run -- plugins` |
 | Passive-only scan | `cargo run -- scan --target URL --passive-only -o out.json` |
 | Full scan | `cargo run -- scan --target URL --plugins xss,sqli -o out.json` |
+| SARIF (Code Scanning) | `cargo run -- scan --target URL -o out.sarif` or `--sarif-out out.sarif` |
+| Analyze / audit | `cargo run -- analyze --repo . --tools semgrep,trivy,gitleaks -o a.json` · `cargo run -- audit --repo . --target URL …` |
 | Spider only | `cargo run -- spider --target URL` |
 | TUI | `cargo run -- tui` or bare `cargo run` |
 

@@ -149,6 +149,11 @@ transport/    tls-expired, tls-expiring-soon, tls-weak-signature, tls-self-signe
               tls-hostname-mismatch
 intel/        shodan-vulns, shodan-ports
 spider/       (reserved — robots/sitemap discovery, currently informational)
+sast/         static analysis — planned Semgrep rules → `Finding` (IMPLEMENTATION_PLAN Phase 1)
+sca/          supply-chain — planned Trivy → `Finding` (IMPLEMENTATION_PLAN Phase 2)
+secrets/      secret scanning — planned Gitleaks → `Finding` (IMPLEMENTATION_PLAN Phase 2)
+iac/          infra-as-code — planned Checkov → `Finding` (IMPLEMENTATION_PLAN Phase 2)
+agentic/      LLM/agent abuse tests — planned, strictly opt-in (IMPLEMENTATION_PLAN Phase 5)
 ```
 
 #### Event protocol (scanner → TUI)
@@ -232,7 +237,7 @@ Module-group ordering: **by max severity descending**, then alphabetical. Quiet 
 
 #### JSON report extension
 
-The `Report` JSON gains an optional `modules` array (additive — existing consumers ignore it):
+The `Report` JSON should include a `modules` array (additive — existing consumers ignore unknown fields). **Current status:** module roll-up is implemented for the CLI `MODULES` block and TUI (`summarize_modules` + `ScanEvent::ModuleRan`); serializing the same structure into JSON is **specified in [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) Phase 1** (`report.rs`).
 
 ```json
 "modules": [
@@ -241,7 +246,7 @@ The `Report` JSON gains an optional `modules` array (additive — existing consu
 ]
 ```
 
-This lets the platform-level dashboard render the same tree the TUI shows without re-deriving it from finding bodies.
+This lets the platform-level dashboard render the same tree the TUI shows without re-deriving it from finding bodies. Later phases add `correlations[]`, SARIF export, and optional `scan_coverage` — see the implementation plan.
 
 #### Non-goals (this iteration)
 
@@ -249,6 +254,16 @@ This lets the platform-level dashboard render the same tree the TUI shows withou
 * No persistence of fold state across runs.
 * No deep-link from a module header into the source file or docs (deferred to platform UI).
 * Spider sub-modules (`Robots`, `Sitemap` URL sources) are tracked as crawl provenance, not as finding-producing modules.
+
+### 9.2 RustZAP implementation tracking (in-repo)
+
+The repository carries a **detailed engineering spec** for extending RustZAP beyond DAST: code analysis (`analyze`), unified multi-tool runs (`audit`), correlation, HTTP worker mode (`serve`), and opt-in agentic testing. It maps work to concrete files, CLI flags, JSON fields, tests, and acceptance criteria.
+
+* **Authoritative spec:** [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md)
+* **DAST modules (status + backlog):** [`FEATURE.md`](./FEATURE.md)
+* **Platform / UFF / correlation context:** this SDD (§3.3, §5, §6)
+
+Contributors should update the implementation plan when a phase ships (mark items Done, adjust schema if the JSON contract changes).
 
 ## 10. Kubernetes Deployment
 

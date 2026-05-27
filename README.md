@@ -29,6 +29,22 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | 🖥️ **Interactive TUI** | Five-tab Ratatui console — configure, launch, monitor scans, drill into findings |
 | 🧰 **Unified Tool Console** | Detects & runs Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Falco, Hashcat, John, Hydra and more from the TUI |
 | 🚀 **Stress Tester** | 5-mode load tester with percentile latency, timeline, and JSON report |
+| 📋 **Roadmap** | [FEATURE.md](FEATURE.md) (DAST status + backlog) · [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) (analyze/audit/agent/API) |
+
+---
+
+## Documentation
+
+| Document | Contents |
+|----------|----------|
+| [README.md](README.md) | Install, Docker, CLI usage, architecture overview |
+| [FEATURE.md](FEATURE.md) | Passive/active/spider **status table** + backlog; platform phases in IMPLEMENTATION_PLAN |
+| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | **Detailed implementation spec**: JSON `modules`, `analyze`/`audit`/`serve`/`agent`, parsers, correlation, SARIF, tests |
+| [SOFTWARE_DESIGN_DOCUMENT.md](SOFTWARE_DESIGN_DOCUMENT.md) | Unified DevSecOps platform, UFF, correlation engine, APIs |
+| [CLAUDE.md](CLAUDE.md) | Contributor / AI assistant guardrails |
+| [CONTRIBUTION.md](CONTRIBUTION.md) | PR workflow + dev expectations |
+
+> **Note:** `rustzap analyze`, `rustzap audit`, JSON `"modules"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2. Later phases (`serve`, `agent`, OpenAPI/Nuclei) remain planned.
 
 ---
 
@@ -130,6 +146,10 @@ rustzap scan \
 rustzap scan --target https://example.com --output report.csv
 rustzap scan --target https://example.com --output report.html
 
+# SARIF 2.1 (e.g. GitHub Code Scanning uploads)
+rustzap scan --target https://example.com --output findings.sarif
+rustzap scan --target https://example.com -o report.json --sarif-out findings.sarif
+
 # Authenticated scan with cookies, API key, and Basic Auth
 rustzap scan \
   --target https://app.example.com \
@@ -147,6 +167,33 @@ rustzap scan --target https://staging.example.com --insecure
 # Verbose output
 rustzap scan --target https://example.com -vv
 ```
+
+### Analyze & audit (static tools + optional DAST)
+
+```bash
+# Static analysis: Semgrep, Trivy (fs), Gitleaks (default: semgrep only)
+rustzap analyze --repo . --tools semgrep,trivy,gitleaks --output analyze-report.json
+
+# CI-friendly: parse existing tool JSON (no subprocess)
+rustzap analyze --repo . \
+  --semgrep-json tests/fixtures/semgrep_small.json \
+  --trivy-json tests/fixtures/trivy_small.json \
+  --gitleaks-json tests/fixtures/gitleaks_small.json \
+  --output analyze-report.json
+
+# Correlate SAST SQL signals with DAST SQLi + emit SARIF
+rustzap analyze --repo . --semgrep-json semgrep.json --correlate \
+  --output analyze-report.json --sarif-out analyze.sarif
+
+# Unified audit: static tools + optional live scan against --target
+rustzap audit --repo . --target https://lab.example.com \
+  --tools semgrep,trivy,gitleaks --passive-only --depth 2 \
+  --output audit-report.json --sarif-out audit.sarif
+```
+
+Scan and analyze/audit JSON reports include a **`modules`** array (per-plugin roll-up) and optional **`correlations`** when `--correlate` is set.
+
+**GitHub Code Scanning:** build SARIF with `rustzap … --sarif-out rustzap.sarif` (or `scan --output rustzap.sarif`), upload the artifact with `github/codeql-action/upload-sarif` against your default branch or PR; confirm the run appears under the repository **Security** tab (manual check).
 
 ### Spider Only
 
@@ -573,8 +620,8 @@ rustzap/
 │   ├── scanner.rs           # Full-scan orchestrator (Spider→Passive→Active→TLS+Intel→Report)
 │   ├── spider.rs            # Recursive crawler + robots.txt / sitemap enrichment
 │   ├── passive.rs           # Passive checks (headers, body, security.txt, CSP, tech-fp, JWT)
-│   ├── active.rs            # Active scanner core + 11 in-tree plugins
-│   ├── sqli_advanced.rs     # 10 advanced SQLi/NoSQL plugins (error / boolean / time / union / …)
+│   ├── active.rs            # Active scanner core + ScanPlugin registrations (core plugins)
+│   ├── sqli_advanced.rs     # Advanced SQLi/NoSQL/stacked/etc. ScanPlugins
 │   ├── sensitive_paths.rs   # B2 — opt-in well-known path probe
 │   ├── tls.rs               # C1 — rustls-based per-host TLS cert summary
 │   ├── intel.rs             # C2 — env-gated Shodan / external intel hook

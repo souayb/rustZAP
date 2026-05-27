@@ -39,7 +39,7 @@ pub enum ScanEvent {
         done: usize,
         total: usize,
     },
-    Finding(Finding),
+    Finding(Box<Finding>),
     Log(String),
     /// Emitted once per module that executed during the scan. `findings` is
     /// the count this module produced; zero means the module ran but was

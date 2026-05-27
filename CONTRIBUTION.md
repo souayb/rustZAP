@@ -36,7 +36,8 @@ Optional: use `rustup` to pin a stable toolchain if your distro ships an older c
 | Document | Purpose |
 |----------|---------|
 | `README.md` | User-facing install, CLI usage, Docker |
-| `FEATURE.md` | Planned modules and implementation task ideas |
+| `FEATURE.md` | DAST module **implementation status** + backlog (platform specs in IMPLEMENTATION_PLAN) |
+| `IMPLEMENTATION_PLAN.md` | Phased implementation specs, JSON/schema, CLI plans, acceptance checklists |
 | `CLAUDE.md` | Architecture notes, plugin wiring traps, verification commands (useful for humans too) |
 | `SOFTWARE_DESIGN_DOCUMENT.md` | Broader platform / orchestration context |
 
@@ -73,13 +74,14 @@ Use **your own lab targets** for aggressive `--plugins` runs.
 
 ### Adding a feature
 
-1. **Check `FEATURE.md`** for roadmap items and suggested tasks.
+1. **Check [`FEATURE.md`](./FEATURE.md)** for shipped vs backlog scanner work, and **`IMPLEMENTATION_PLAN.md`** for platform features (analyze, audit, SARIF, HTTP worker, agents).
 2. Decide where it lives:
    - **Passive checks** → `src/passive.rs` (helpers + `PassiveScanner::check_url`).
    - **Active plugins** → `src/active.rs` (`ScanPlugin`) or a submodule; register in `ActiveScanner::new` and `list_plugins()`.
    - **Crawl / discovery** → `src/spider.rs`.
 3. Add **tests** when behavior is non-trivial (golden headers/body, mock server, or unit tests for pure logic).
 4. Update **`README.md`** if users see new flags, commands, or plugin names.
+5. If you ship a **Phase** from **`IMPLEMENTATION_PLAN.md`**, update that doc’s checklist and status prose in the same change set.
 
 **Important:** `README.md` may list plugins that are not yet registered in the binary. If you add plugins, ensure `cargo run -- plugins` matches the documentation, or fix the docs in the same PR.
 

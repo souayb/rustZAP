@@ -150,6 +150,7 @@ impl ConfigForm {
             concurrency: self.concurrency,
             passive_only: self.passive_only,
             output_file: self.output.clone(),
+            sarif_out: None,
             timeout_secs: 10,
             user_agent: None,
             cookies: None,
@@ -543,7 +544,7 @@ impl App {
                 if !entry.ran {
                     entry.folded = false;
                 }
-                findings.push(f);
+                findings.push(*f);
             }
             ScanEvent::Log(msg) => push_log(logs, msg),
             ScanEvent::Error(msg) => push_log(logs, format!("ERROR: {}", msg)),
@@ -697,11 +698,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             KeyCode::Backspace => {
                 app.input_buffer.pop();
             }
-            KeyCode::Char(c) => {
-                if !(mods.contains(KeyModifiers::CONTROL) && c == 'c') {
-                    app.input_buffer.push(c);
-                }
+            KeyCode::Char(c) if !(mods.contains(KeyModifiers::CONTROL) && c == 'c') => {
+                app.input_buffer.push(c);
             }
+            KeyCode::Char(_) => {}
             _ => {}
         }
         return;
@@ -1409,7 +1409,7 @@ fn draw_findings(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let mut state = app.findings_state.clone();
+    let mut state = app.findings_state;
     if !rows.is_empty() {
         let cur = state.selected().unwrap_or(0).min(rows.len() - 1);
         state.select(Some(cur));
@@ -1532,7 +1532,7 @@ fn draw_tools(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let mut state = app.tools_state.clone();
+    let mut state = app.tools_state;
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(format!(
             " Integrated Tools — {}/{} installed ",

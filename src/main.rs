@@ -1,10 +1,13 @@
 mod active;
+mod analyze;
+mod correlate;
 mod events;
 mod installer;
 mod intel;
 mod passive;
 mod proxy;
 mod report;
+mod sarif;
 mod scanner;
 mod sensitive_paths;
 mod spider;
@@ -52,6 +55,9 @@ enum Commands {
         passive_only: bool,
         #[arg(short, long, default_value = "rustzap-report.json")]
         output: String,
+        /// Additional SARIF 2.1 file (GitHub Code Scanning). `--output foo.sarif` also works.
+        #[arg(long)]
+        sarif_out: Option<String>,
         #[arg(long, default_value = "10")]
         timeout: u64,
         #[arg(long)]
@@ -103,6 +109,93 @@ enum Commands {
 
     /// List available scan plugins
     Plugins,
+
+    /// Run static analysis on a local repository
+    Analyze {
+        /// Path to a local repository to analyze
+        #[arg(short, long, default_value = ".")]
+        repo: String,
+
+        /// Tools to run: semgrep,trivy,gitleaks
+        #[arg(long, default_value = "semgrep")]
+        tools: String,
+
+        /// Optional Semgrep JSON input file (skip running Semgrep)
+        #[arg(long)]
+        semgrep_json: Option<String>,
+
+        /// Optional Trivy JSON input file (skip running Trivy)
+        #[arg(long)]
+        trivy_json: Option<String>,
+
+        /// Optional Gitleaks JSON input file (skip running Gitleaks)
+        #[arg(long)]
+        gitleaks_json: Option<String>,
+
+        /// Correlate static + dynamic findings when both are present
+        #[arg(long)]
+        correlate: bool,
+
+        /// Output JSON report path
+        #[arg(short, long, default_value = "analyze-report.json")]
+        output: String,
+
+        /// Optional SARIF export path
+        #[arg(long)]
+        sarif_out: Option<String>,
+    },
+
+    /// Unified audit: static analysis + optional DAST scan
+    Audit {
+        #[arg(short, long, default_value = ".")]
+        repo: String,
+
+        /// Optional live target URL for DAST (spider + passive + active)
+        #[arg(short, long)]
+        target: Option<String>,
+
+        #[arg(long, default_value = "semgrep,trivy,gitleaks")]
+        tools: String,
+
+        #[arg(long)]
+        semgrep_json: Option<String>,
+
+        #[arg(long)]
+        trivy_json: Option<String>,
+
+        #[arg(long)]
+        gitleaks_json: Option<String>,
+
+        #[arg(long)]
+        correlate: bool,
+
+        #[arg(short, long, default_value = "audit-report.json")]
+        output: String,
+
+        #[arg(long)]
+        sarif_out: Option<String>,
+
+        #[arg(long)]
+        passive_only: bool,
+
+        #[arg(short, long, default_value = "3")]
+        depth: usize,
+
+        #[arg(short = 'j', long, default_value = "5")]
+        concurrency: usize,
+
+        #[arg(long, default_value = "10")]
+        timeout: u64,
+
+        #[arg(long)]
+        insecure: bool,
+
+        #[arg(
+            long,
+            default_value = "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain"
+        )]
+        plugins: String,
+    },
 
     /// Stress test / load test an API endpoint
     ///
@@ -246,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
             passive_only,
             output,
+            sarif_out,
             timeout,
             user_agent,
             cookies,
@@ -261,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
                 concurrency,
                 passive_only,
                 output_file: output,
+                sarif_out,
                 timeout_secs: timeout,
                 user_agent,
                 cookies,
@@ -295,6 +390,66 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Plugins => {
             active::list_plugins();
+        }
+
+        Commands::Analyze {
+            repo,
+            tools,
+            semgrep_json,
+            trivy_json,
+            gitleaks_json,
+            correlate,
+            output,
+            sarif_out,
+        } => {
+            analyze::run_analyze_cli(
+                repo,
+                tools,
+                semgrep_json,
+                trivy_json,
+                gitleaks_json,
+                correlate,
+                output,
+                sarif_out,
+            )
+            .await?;
+        }
+
+        Commands::Audit {
+            repo,
+            target,
+            tools,
+            semgrep_json,
+            trivy_json,
+            gitleaks_json,
+            correlate,
+            output,
+            sarif_out,
+            passive_only,
+            depth,
+            concurrency,
+            timeout,
+            insecure,
+            plugins,
+        } => {
+            analyze::run_audit_cli(
+                repo,
+                target,
+                tools,
+                semgrep_json,
+                trivy_json,
+                gitleaks_json,
+                correlate,
+                output,
+                sarif_out,
+                passive_only,
+                depth,
+                concurrency,
+                plugins,
+                timeout,
+                insecure,
+            )
+            .await?;
         }
 
         Commands::Tui => {

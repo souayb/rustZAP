@@ -4,12 +4,25 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{DiscoveredUrl, Finding, Severity};
+use crate::types::{DiscoveredUrl, Finding, ModuleSummary, Severity};
+
+/// Cross-tool correlation group (Phase 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Correlation {
+    pub id: String,
+    pub finding_ids: Vec<String>,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elevated_severity: Option<Severity>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Report {
     pub meta: ReportMeta,
     pub summary: ReportSummary,
+    pub modules: Vec<ModuleSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub correlations: Vec<Correlation>,
     pub urls: Vec<DiscoveredUrl>,
     pub findings: Vec<Finding>,
 }
@@ -38,6 +51,7 @@ pub struct ReportSummary {
 impl Report {
     pub fn new(
         target: &str,
+        modules: Vec<ModuleSummary>,
         urls: Vec<DiscoveredUrl>,
         mut findings: Vec<Finding>,
         elapsed: Duration,
@@ -88,9 +102,16 @@ impl Report {
                 info,
                 risk_score,
             },
+            modules,
+            correlations: Vec::new(),
             urls,
             findings,
         }
+    }
+
+    pub fn with_correlations(mut self, correlations: Vec<Correlation>) -> Self {
+        self.correlations = correlations;
+        self
     }
 
     pub async fn save_json(&self, path: &str) -> Result<()> {
@@ -152,5 +173,102 @@ impl Report {
 
         tokio::fs::write(path, html).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{CodeLocation, Finding, ModuleSummary, Severity};
+
+    #[test]
+    fn report_serializes_modules_array() {
+        let modules = vec![ModuleSummary {
+            name: "sast/semgrep".to_string(),
+            findings: 1,
+            max_severity: Some(Severity::High),
+            quiet: false,
+        }];
+
+        let finding = Finding {
+            id: "id-1".to_string(),
+            title: "t".to_string(),
+            severity: Severity::High,
+            url: "file:///tmp/x#L1".to_string(),
+            parameter: Some("check".to_string()),
+            evidence: Some("e".to_string()),
+            description: "d".to_string(),
+            solution: "s".to_string(),
+            cwe: None,
+            owasp_category: None,
+            plugin: "sast/semgrep".to_string(),
+            source_tool: Some("semgrep".to_string()),
+            location: Some(CodeLocation {
+                file: "/tmp/x".to_string(),
+                line_start: 1,
+                line_end: None,
+            }),
+            correlated_with: vec![],
+            poc_validated: false,
+            found_at: chrono::Utc::now(),
+        };
+
+        let report = Report::new(
+            "target",
+            modules.clone(),
+            vec![],
+            vec![finding],
+            std::time::Duration::from_secs(1),
+        );
+
+        let json = serde_json::to_string(&report).expect("json serialize");
+        let decoded: Report = serde_json::from_str(&json).expect("json deserialize");
+        assert_eq!(decoded.modules.len(), 1);
+        assert_eq!(decoded.modules[0].name, "sast/semgrep");
+        assert_eq!(decoded.findings.len(), 1);
+    }
+
+    #[test]
+    fn report_serializes_quiet_module_with_zero_findings() {
+        let modules = vec![ModuleSummary {
+            name: "sast/semgrep".to_string(),
+            findings: 0,
+            max_severity: None,
+            quiet: true,
+        }];
+
+        let report = Report::new(
+            "target",
+            modules.clone(),
+            vec![],
+            vec![],
+            std::time::Duration::from_secs(1),
+        );
+
+        assert!(report.modules[0].quiet);
+        assert_eq!(report.modules[0].findings, 0);
+
+        let json = serde_json::to_string(&report).expect("json serialize");
+        assert!(json.contains("\"modules\""));
+    }
+
+    #[test]
+    fn report_serializes_correlations_when_set() {
+        let report = Report::new(
+            "target",
+            vec![],
+            vec![],
+            vec![],
+            std::time::Duration::from_secs(0),
+        )
+        .with_correlations(vec![Correlation {
+            id: "corr-1".to_string(),
+            finding_ids: vec!["a".to_string(), "b".to_string()],
+            reason: "test".to_string(),
+            elevated_severity: Some(Severity::Critical),
+        }]);
+        let json = serde_json::to_string(&report).expect("json");
+        assert!(json.contains("\"correlations\""));
+        assert!(json.contains("corr-1"));
     }
 }

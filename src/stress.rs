@@ -183,7 +183,7 @@ impl LiveStats {
             success,
             errors,
             bytes,
-            avg_latency_ms: if total > 0 { total_lat / total } else { 0 },
+            avg_latency_ms: total_lat.checked_div(total).unwrap_or(0),
             min_latency_ms: if min_lat == u64::MAX { 0 } else { min_lat },
             max_latency_ms: max_lat,
             hist,
@@ -390,6 +390,13 @@ pub async fn run_stress(config: StressConfig) -> Result<()> {
     }
 
     // ── Dispatch by mode ──────────────────────────────────────────
+    let load_ctx = LoadContext {
+        client: &client,
+        config: &config,
+        stats: stats.clone(),
+        results: results.clone(),
+        errors: errors.clone(),
+    };
     match config.mode.clone() {
         StressMode::Constant {
             users,
@@ -412,18 +419,7 @@ pub async fn run_stress(config: StressConfig) -> Result<()> {
             ramp_secs,
             hold_secs,
         } => {
-            run_ramp_load(
-                &client,
-                &config,
-                start_users,
-                peak_users,
-                ramp_secs,
-                hold_secs,
-                stats.clone(),
-                results.clone(),
-                errors.clone(),
-            )
-            .await?;
+            run_ramp_load(&load_ctx, start_users, peak_users, ramp_secs, hold_secs).await?;
         }
         StressMode::Spike {
             base_users,
@@ -433,16 +429,12 @@ pub async fn run_stress(config: StressConfig) -> Result<()> {
             total_secs,
         } => {
             run_spike_load(
-                &client,
-                &config,
+                &load_ctx,
                 base_users,
                 spike_users,
                 spike_at_secs,
                 spike_duration_secs,
                 total_secs,
-                stats.clone(),
-                results.clone(),
-                errors.clone(),
             )
             .await?;
         }
@@ -560,6 +552,14 @@ pub async fn run_stress(config: StressConfig) -> Result<()> {
 // Load drivers
 // ─────────────────────────────────────────────────────────────────────────────
 
+struct LoadContext<'a> {
+    client: &'a reqwest::Client,
+    config: &'a StressConfig,
+    stats: Arc<LiveStats>,
+    results: Arc<Mutex<Vec<RequestResult>>>,
+    errors: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+}
+
 async fn run_constant_load(
     client: &reqwest::Client,
     config: &StressConfig,
@@ -606,15 +606,11 @@ async fn run_constant_load(
 }
 
 async fn run_ramp_load(
-    client: &reqwest::Client,
-    config: &StressConfig,
+    ctx: &LoadContext<'_>,
     start_users: usize,
     peak_users: usize,
     ramp_secs: u64,
     hold_secs: u64,
-    stats: Arc<LiveStats>,
-    results: Arc<Mutex<Vec<RequestResult>>>,
-    errors: Arc<Mutex<std::collections::HashMap<String, u64>>>,
 ) -> Result<()> {
     println!(
         "  {} {}→{} users over {}s, hold {}s",
@@ -648,11 +644,11 @@ async fn run_ramp_load(
 
         // Acquire slot up to current users
         if let Ok(permit) = sem.clone().try_acquire_owned() {
-            let client = client.clone();
-            let config = config.clone();
-            let stats = stats.clone();
-            let results = results.clone();
-            let errors = errors.clone();
+            let config = ctx.config.clone();
+            let stats = ctx.stats.clone();
+            let results = ctx.results.clone();
+            let errors = ctx.errors.clone();
+            let client = ctx.client.clone();
             let h = tokio::spawn(async move {
                 let r = fire_request(&client, &config).await;
                 record_result(r, &stats, &results, &errors).await;
@@ -671,16 +667,12 @@ async fn run_ramp_load(
 }
 
 async fn run_spike_load(
-    client: &reqwest::Client,
-    config: &StressConfig,
+    ctx: &LoadContext<'_>,
     base_users: usize,
     spike_users: usize,
     spike_at_secs: u64,
     spike_duration_secs: u64,
     total_secs: u64,
-    stats: Arc<LiveStats>,
-    results: Arc<Mutex<Vec<RequestResult>>>,
-    errors: Arc<Mutex<std::collections::HashMap<String, u64>>>,
 ) -> Result<()> {
     println!(
         "  {} base={} spike={} at={}s for {}s total={}s",
@@ -711,11 +703,11 @@ async fn run_spike_load(
         let available = max_sem.available_permits();
         if available > spike_users.saturating_sub(target) {
             if let Ok(permit) = max_sem.clone().try_acquire_owned() {
-                let client = client.clone();
-                let config = config.clone();
-                let stats = stats.clone();
-                let results = results.clone();
-                let errors = errors.clone();
+                let client = ctx.client.clone();
+                let config = ctx.config.clone();
+                let stats = ctx.stats.clone();
+                let results = ctx.results.clone();
+                let errors = ctx.errors.clone();
                 let h = tokio::spawn(async move {
                     let r = fire_request(&client, &config).await;
                     record_result(r, &stats, &results, &errors).await;

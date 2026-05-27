@@ -282,7 +282,7 @@ impl ScanPlugin for SqliTimePlugin {
                             "SQL Injection — Time-Based Blind",
                             Severity::Critical,
                             &target.url,
-                            &format!(
+                            format!(
                                 "A {}-second delay was triggered via a {} time-delay payload, confirming blind SQL injection. The database appears to be {}.",
                                 SLEEP_SECS, elapsed_ms, db_label
                             ),
@@ -347,7 +347,7 @@ impl ScanPlugin for SqliUnionPlugin {
                                     "SQL Injection — UNION-Based",
                                     Severity::Critical,
                                     &target.url,
-                                    &format!(
+                                    format!(
                                         "UNION-based SQL injection confirmed. The query has {} column(s) and position {} is reflected. An attacker can extract arbitrary data from the database.",
                                         col_count, canary_pos + 1
                                     ),
@@ -508,7 +508,7 @@ impl ScanPlugin for SqliOobPlugin {
                                 "SQL Injection — Potential Out-of-Band (OOB)",
                                 Severity::High,
                                 &target.url,
-                                &format!(
+                                format!(
                                     "An OOB SQL payload ({}) did not produce a visible syntax error and caused an abnormal response (HTTP {}). Confirm with an interactsh/Burp Collaborator listener.",
                                     label, status
                                 ),
@@ -760,7 +760,7 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                                     "NoSQL Injection — MongoDB Operator Injection",
                                     Severity::Critical,
                                     &target.url,
-                                    &format!(
+                                    format!(
                                         "MongoDB operator injection ({}) returned a successful response suggesting authentication bypass or unauthorized data access.",
                                         op_label
                                     ),
@@ -810,7 +810,7 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                                     "NoSQL Injection — MongoDB GET Operator",
                                     Severity::High,
                                     &target.url,
-                                    &format!(
+                                    format!(
                                         "MongoDB query operator injected via GET parameter ({}) returned privileged data.",
                                         label
                                     ),
@@ -842,7 +842,7 @@ pub struct SqliFingerprintPlugin;
 pub enum DbType {
     MySQL,
     PostgreSQL,
-    MSSQL,
+    Mssql,
     Oracle,
     SQLite,
     /// Sentinel returned by callers that cannot determine the backend.
@@ -856,7 +856,7 @@ impl std::fmt::Display for DbType {
         match self {
             DbType::MySQL => write!(f, "MySQL"),
             DbType::PostgreSQL => write!(f, "PostgreSQL"),
-            DbType::MSSQL => write!(f, "Microsoft SQL Server"),
+            DbType::Mssql => write!(f, "Microsoft SQL Server"),
             DbType::Oracle => write!(f, "Oracle"),
             DbType::SQLite => write!(f, "SQLite"),
             DbType::Unknown => write!(f, "Unknown"),
@@ -901,12 +901,12 @@ impl ScanPlugin for SqliFingerprintPlugin {
             // MSSQL
             (
                 "' UNION SELECT @@version,NULL-- -",
-                DbType::MSSQL,
+                DbType::Mssql,
                 &["microsoft sql server", "sql server 2019", "sql server 2022"],
             ),
             (
                 "'; SELECT @@version-- -",
-                DbType::MSSQL,
+                DbType::Mssql,
                 &["microsoft", "windows nt", "sql server"],
             ),
             // Oracle
@@ -932,10 +932,10 @@ impl ScanPlugin for SqliFingerprintPlugin {
                         if bl.contains(sig) {
                             return vec![
                                 Finding::new(
-                                    &format!("Database Fingerprinted — {}", db),
+                                    format!("Database Fingerprinted — {}", db),
                                     Severity::Medium,
                                     &target.url,
-                                    &format!(
+                                    format!(
                                         "The database version was identified as {} via SQL injection. Version information aids targeted exploitation.",
                                         db
                                     ),

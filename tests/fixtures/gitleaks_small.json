@@ -1,0 +1,11 @@
+[
+  {
+    "RuleID": "generic-api-key",
+    "Description": "Generic API Key",
+    "File": "src/config.rs",
+    "StartLine": 7,
+    "EndLine": 7,
+    "Match": "api_key=sk-test-1234567890",
+    "Secret": "sk-test-1234567890"
+  }
+]

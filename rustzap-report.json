@@ -2,29 +2,235 @@
   "meta": {
     "scanner": "RustZAP",
     "version": "0.1.0",
-    "target": "https://encrix.com",
-    "scan_date": "2026-05-16T20:58:14.379276+00:00",
-    "duration_secs": 1.212239792
+    "target": "http://localhost:5174/",
+    "scan_date": "2026-05-27T02:43:29.150719+00:00",
+    "duration_secs": 0.676152042
   },
   "summary": {
     "total_urls": 2,
-    "total_findings": 19,
-    "critical": 0,
+    "total_findings": 20,
+    "critical": 1,
     "high": 0,
-    "medium": 9,
-    "low": 3,
-    "info": 7,
-    "risk_score": 58
+    "medium": 7,
+    "low": 7,
+    "info": 5,
+    "risk_score": 74
   },
+  "modules": [
+    {
+      "name": "passive/sensitive-data",
+      "findings": 2,
+      "max_severity": "critical",
+      "quiet": false
+    },
+    {
+      "name": "passive/info-disclosure",
+      "findings": 1,
+      "max_severity": "medium",
+      "quiet": false
+    },
+    {
+      "name": "passive/missing-headers",
+      "findings": 14,
+      "max_severity": "medium",
+      "quiet": false
+    },
+    {
+      "name": "passive/cache-control",
+      "findings": 1,
+      "max_severity": "low",
+      "quiet": false
+    },
+    {
+      "name": "passive/security-txt",
+      "findings": 2,
+      "max_severity": "low",
+      "quiet": false
+    },
+    {
+      "name": "active/cmd-injection",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/graphql-introspection",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/http-methods",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/nosql",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/open-redirect",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/path-traversal",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/redirect-chain",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-boolean",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-error",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-fingerprint",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-oob",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-second-order",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-stacked",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-time",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-union",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/sqli-waf-bypass",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/ssrf",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/ssti",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/xss",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "active/xxe",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "passive/content-type",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "passive/cookie-flags",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "passive/cors",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "passive/csp-unsafe-directives",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "passive/error-disclosure",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "passive/jwt-heuristic",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "passive/mixed-content",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    },
+    {
+      "name": "passive/tech-fingerprint",
+      "findings": 0,
+      "max_severity": null,
+      "quiet": true
+    }
+  ],
   "urls": [
     {
-      "url": "https://encrix.com",
+      "url": "http://localhost:5174/",
       "method": "GET",
       "parameters": [],
       "source": "Seed"
     },
     {
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
       "method": "GET",
       "parameters": [],
       "source": "Script"
@@ -32,10 +238,26 @@
   ],
   "findings": [
     {
-      "id": "29331caa-90fc-4634-9526-f01f338aea74",
+      "id": "e62d4359-71b2-4baf-a3ab-c22418ec637b",
+      "title": "Password Exposed in Response",
+      "severity": "critical",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
+      "parameter": null,
+      "evidence": "password:\"Secure Pas...[REDACTED]",
+      "description": "Sensitive data pattern detected in response body: Password Exposed in Response",
+      "solution": "Remove sensitive data from responses. Use environment variables for secrets.",
+      "cwe": 200,
+      "owasp_category": "A02:2021 – Cryptographic Failures",
+      "plugin": "passive/sensitive-data",
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.786508Z"
+    },
+    {
+      "id": "a8f06927-7b08-4b09-9933-ca7e9a87bd16",
       "title": "Missing HSTS Header",
       "severity": "medium",
-      "url": "https://encrix.com",
+      "url": "http://localhost:5174/",
       "parameter": null,
       "evidence": null,
       "description": "The server is not enforcing HTTPS via HSTS. Browsers may allow HTTP connections.",
@@ -43,13 +265,15 @@
       "cwe": 16,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.006242Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.747957Z"
     },
     {
-      "id": "26a61f61-891d-4d58-a830-3980016362cf",
+      "id": "23337419-3cb9-4248-8a9d-16ae60fa0e3b",
       "title": "Missing X-Frame-Options Header",
       "severity": "medium",
-      "url": "https://encrix.com",
+      "url": "http://localhost:5174/",
       "parameter": null,
       "evidence": null,
       "description": "The page can be embedded in iframes, enabling clickjacking attacks.",
@@ -57,13 +281,15 @@
       "cwe": 1021,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.006249Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.747965Z"
     },
     {
-      "id": "c263914c-7bec-42fa-bc39-2e047ff35b4a",
+      "id": "fff478f0-e242-4720-9f4d-4ae8c1d1bc6a",
       "title": "Missing Content-Security-Policy Header",
       "severity": "medium",
-      "url": "https://encrix.com",
+      "url": "http://localhost:5174/",
       "parameter": null,
       "evidence": null,
       "description": "No CSP header found. XSS attacks may be more impactful.",
@@ -71,27 +297,15 @@
       "cwe": 1021,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.006251Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.747967Z"
     },
     {
-      "id": "787690cc-a769-4f00-a988-3581aacdbe8a",
-      "title": "Wildcard CORS Policy",
-      "severity": "medium",
-      "url": "https://encrix.com",
-      "parameter": null,
-      "evidence": "Access-Control-Allow-Origin: *",
-      "description": "The server returns Access-Control-Allow-Origin: * which allows any origin to make cross-origin requests.",
-      "solution": "Restrict CORS to known, trusted origins. Avoid wildcard for authenticated endpoints.",
-      "cwe": 942,
-      "owasp_category": "A05:2021 – Security Misconfiguration",
-      "plugin": "passive/cors",
-      "found_at": "2026-05-16T20:58:14.015551Z"
-    },
-    {
-      "id": "a613cb80-fd92-4a0e-90b4-93cd2a9fe9f5",
+      "id": "39b62c64-cae6-495d-8d51-7720ed50bd95",
       "title": "Missing HSTS Header",
       "severity": "medium",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
       "parameter": null,
       "evidence": null,
       "description": "The server is not enforcing HTTPS via HSTS. Browsers may allow HTTP connections.",
@@ -99,13 +313,15 @@
       "cwe": 16,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.130713Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.775588Z"
     },
     {
-      "id": "914c0374-db90-49b9-a3eb-846bc01cd347",
+      "id": "5bb9f0bf-feb6-452d-a1d5-b4b35da5fefd",
       "title": "Missing X-Frame-Options Header",
       "severity": "medium",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
       "parameter": null,
       "evidence": null,
       "description": "The page can be embedded in iframes, enabling clickjacking attacks.",
@@ -113,13 +329,15 @@
       "cwe": 1021,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.130758Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.775595Z"
     },
     {
-      "id": "a26b176b-5bc9-4003-9b75-357edd7e42bd",
+      "id": "f14fc234-62f8-4f12-9c47-f997d4185ab2",
       "title": "Missing Content-Security-Policy Header",
       "severity": "medium",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
       "parameter": null,
       "evidence": null,
       "description": "No CSP header found. XSS attacks may be more impactful.",
@@ -127,41 +345,63 @@
       "cwe": 1021,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.130762Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.775596Z"
     },
     {
-      "id": "3567f962-e13c-489a-b92d-e915b3572bf8",
+      "id": "5a5b9c76-5114-4699-97d7-430e2d53b3c0",
       "title": "Stack trace detected",
       "severity": "medium",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
       "parameter": null,
-      "evidence": "at )?)/);yo=e&&e[1]||\"\",cf=-1<n.stack.indexOf(`\n    at`)?\" (<anonymous>)\":-1<n.stack.indexOf(\"@\")?\"@unknown:0:0\":\"\"}return`\n`+yo+t+cf}var go=!1;function vo(t,e){if(!t||go)return\"\";go=!0;var n=Error.pr",
+      "evidence": "at )?)/);N=t&&t[1]||\"\"}return`\n`+N+e}var le=!1;function de(e,t){if(!e||le)return\"\";le=!0;var n=Error.prepareStackTrace;Error.prepareStackTrace=void 0;try{if(t)if(t=function(){throw Error()},Object.def",
       "description": "Java/Node.js stack trace may leak internal paths",
       "solution": "Disable verbose error output in production. Configure a custom error page.",
       "cwe": 209,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/info-disclosure",
-      "found_at": "2026-05-16T20:58:14.131067Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.775757Z"
     },
     {
-      "id": "39055237-facb-400f-b97a-2a935ada5391",
-      "title": "Wildcard CORS Policy",
-      "severity": "medium",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "id": "c901316d-31c6-40cc-b04b-788849c393eb",
+      "title": "Missing X-Content-Type-Options Header",
+      "severity": "low",
+      "url": "http://localhost:5174/",
       "parameter": null,
-      "evidence": "Access-Control-Allow-Origin: *",
-      "description": "The server returns Access-Control-Allow-Origin: * which allows any origin to make cross-origin requests.",
-      "solution": "Restrict CORS to known, trusted origins. Avoid wildcard for authenticated endpoints.",
-      "cwe": 942,
+      "evidence": null,
+      "description": "Without nosniff, browsers may MIME-sniff responses, enabling XSS attacks.",
+      "solution": "Add: X-Content-Type-Options: nosniff",
+      "cwe": 693,
       "owasp_category": "A05:2021 – Security Misconfiguration",
-      "plugin": "passive/cors",
-      "found_at": "2026-05-16T20:58:14.173682Z"
+      "plugin": "passive/missing-headers",
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.747964Z"
     },
     {
-      "id": "b1c6fe87-bba8-44e0-b4e3-f820d21cb24c",
+      "id": "7af0faca-c8c3-4842-ac62-91419c447b17",
+      "title": "Missing Referrer-Policy Header",
+      "severity": "low",
+      "url": "http://localhost:5174/",
+      "parameter": null,
+      "evidence": null,
+      "description": "Without a Referrer-Policy, sensitive URLs may be leaked via the Referer header.",
+      "solution": "Add: Referrer-Policy: no-referrer or strict-origin-when-cross-origin",
+      "cwe": 116,
+      "owasp_category": "A05:2021 – Security Misconfiguration",
+      "plugin": "passive/missing-headers",
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.747971Z"
+    },
+    {
+      "id": "b873ef2e-f4bc-4fd1-bd56-8f3046a9003d",
       "title": "Sensitive Page May Be Cached",
       "severity": "low",
-      "url": "https://encrix.com",
+      "url": "http://localhost:5174/",
       "parameter": null,
       "evidence": null,
       "description": "The response does not set cache-control: no-store, meaning sensitive content could be cached by proxies or browsers.",
@@ -169,13 +409,15 @@
       "cwe": 525,
       "owasp_category": "A02:2021 – Cryptographic Failures",
       "plugin": "passive/cache-control",
-      "found_at": "2026-05-16T20:58:14.015545Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.756465Z"
     },
     {
-      "id": "de8a487a-19b3-4c78-8801-13583c94dd79",
+      "id": "cad13284-7a0f-47a0-85d2-7fcc02877f6c",
       "title": "security.txt Missing Contact Field",
       "severity": "low",
-      "url": "https://encrix.com/.well-known/security.txt",
+      "url": "http://localhost:5174/.well-known/security.txt",
       "parameter": null,
       "evidence": null,
       "description": "A security.txt file is served but contains no Contact field. RFC 9116 requires at least one Contact entry.",
@@ -183,13 +425,15 @@
       "cwe": null,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/security-txt",
-      "found_at": "2026-05-16T20:58:14.068866Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.759584Z"
     },
     {
-      "id": "77eec942-6968-45d8-a87a-387cfe87bde5",
+      "id": "0bf3d124-10ab-4671-a64a-d9b08eaefc51",
       "title": "security.txt Missing Expires",
       "severity": "low",
-      "url": "https://encrix.com/.well-known/security.txt",
+      "url": "http://localhost:5174/.well-known/security.txt",
       "parameter": null,
       "evidence": null,
       "description": "A security.txt file is served but has no Expires field. RFC 9116 §2.5.5 requires this field to bound the file's validity.",
@@ -197,13 +441,47 @@
       "cwe": null,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/security-txt",
-      "found_at": "2026-05-16T20:58:14.068868Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.759601Z"
     },
     {
-      "id": "e515e14a-2cba-476b-9084-8ffc1edaa8fd",
+      "id": "70965e2a-3731-43cf-98f8-89f90b4ce9a4",
+      "title": "Missing X-Content-Type-Options Header",
+      "severity": "low",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
+      "parameter": null,
+      "evidence": null,
+      "description": "Without nosniff, browsers may MIME-sniff responses, enabling XSS attacks.",
+      "solution": "Add: X-Content-Type-Options: nosniff",
+      "cwe": 693,
+      "owasp_category": "A05:2021 – Security Misconfiguration",
+      "plugin": "passive/missing-headers",
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.775593Z"
+    },
+    {
+      "id": "e39020c5-05a4-4d97-ac2d-35c8fe093f7e",
+      "title": "Missing Referrer-Policy Header",
+      "severity": "low",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
+      "parameter": null,
+      "evidence": null,
+      "description": "Without a Referrer-Policy, sensitive URLs may be leaked via the Referer header.",
+      "solution": "Add: Referrer-Policy: no-referrer or strict-origin-when-cross-origin",
+      "cwe": 116,
+      "owasp_category": "A05:2021 – Security Misconfiguration",
+      "plugin": "passive/missing-headers",
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.775601Z"
+    },
+    {
+      "id": "7a18c524-3bda-4aa7-9da9-2da97b942058",
       "title": "Missing X-XSS-Protection Header",
       "severity": "info",
-      "url": "https://encrix.com",
+      "url": "http://localhost:5174/",
       "parameter": null,
       "evidence": null,
       "description": "Legacy XSS filter header not present (affects older browsers).",
@@ -211,13 +489,15 @@
       "cwe": 693,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.006254Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.747969Z"
     },
     {
-      "id": "4d21042d-7284-48d7-8e0e-080f554366cc",
+      "id": "ecf9302c-1dac-4c4e-bece-4ab70dbeac54",
       "title": "Missing Permissions-Policy Header",
       "severity": "info",
-      "url": "https://encrix.com",
+      "url": "http://localhost:5174/",
       "parameter": null,
       "evidence": null,
       "description": "No Permissions-Policy header restricting browser feature access.",
@@ -225,27 +505,15 @@
       "cwe": 693,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.006256Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.747972Z"
     },
     {
-      "id": "2059f4b7-190f-441a-a032-003b4a7a88aa",
-      "title": "Technology Stack Fingerprint",
-      "severity": "info",
-      "url": "https://encrix.com",
-      "parameter": null,
-      "evidence": "server: cloudflare",
-      "description": "The response leaks information about the underlying technology stack via headers, generators, or script paths. By itself this is informational; combined with known CVEs it accelerates exploitation.",
-      "solution": "Strip Server, X-Powered-By, X-AspNet-Version and similar headers; remove generator meta tags; avoid versioned asset paths.",
-      "cwe": 200,
-      "owasp_category": "A05:2021 – Security Misconfiguration",
-      "plugin": "passive/tech-fingerprint",
-      "found_at": "2026-05-16T20:58:14.015687Z"
-    },
-    {
-      "id": "e35cf5df-78c0-4739-a13b-8e4bf0644e5d",
+      "id": "99e49582-f56d-4074-b83a-72c7d53cfb50",
       "title": "Missing X-XSS-Protection Header",
       "severity": "info",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
       "parameter": null,
       "evidence": null,
       "description": "Legacy XSS filter header not present (affects older browsers).",
@@ -253,13 +521,15 @@
       "cwe": 693,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.130766Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.775598Z"
     },
     {
-      "id": "cc5ea719-73ba-40a2-809a-abd46e899416",
+      "id": "83a2da80-2143-499a-b255-bfd17f318542",
       "title": "Missing Permissions-Policy Header",
       "severity": "info",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
       "parameter": null,
       "evidence": null,
       "description": "No Permissions-Policy header restricting browser feature access.",
@@ -267,35 +537,25 @@
       "cwe": 693,
       "owasp_category": "A05:2021 – Security Misconfiguration",
       "plugin": "passive/missing-headers",
-      "found_at": "2026-05-16T20:58:14.130770Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.775602Z"
     },
     {
-      "id": "fcf7799e-bedb-4077-a39e-5d96d2036d7d",
+      "id": "43a52fe7-7cc5-4cf2-b653-0940ddd2f193",
       "title": "Email Address Disclosed",
       "severity": "info",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
+      "url": "http://localhost:5174/assets/index-i9mND0jB.js",
       "parameter": null,
-      "evidence": "alex@company.com\",co...[REDACTED]",
+      "evidence": "alex@nexus.health\",c...[REDACTED]",
       "description": "Sensitive data pattern detected in response body: Email Address Disclosed",
       "solution": "Remove sensitive data from responses. Use environment variables for secrets.",
       "cwe": 200,
       "owasp_category": "A02:2021 – Cryptographic Failures",
       "plugin": "passive/sensitive-data",
-      "found_at": "2026-05-16T20:58:14.173663Z"
-    },
-    {
-      "id": "1068e6fa-c463-40a4-b870-dd15a360a42c",
-      "title": "Technology Stack Fingerprint",
-      "severity": "info",
-      "url": "https://encrix.com/assets/index-DyM0mWJe.js",
-      "parameter": null,
-      "evidence": "server: cloudflare",
-      "description": "The response leaks information about the underlying technology stack via headers, generators, or script paths. By itself this is informational; combined with known CVEs it accelerates exploitation.",
-      "solution": "Strip Server, X-Powered-By, X-AspNet-Version and similar headers; remove generator meta tags; avoid versioned asset paths.",
-      "cwe": 200,
-      "owasp_category": "A05:2021 – Security Misconfiguration",
-      "plugin": "passive/tech-fingerprint",
-      "found_at": "2026-05-16T20:58:14.193597Z"
+      "correlated_with": [],
+      "poc_validated": false,
+      "found_at": "2026-05-27T02:43:28.816256Z"
     }
   ]
 }

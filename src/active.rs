@@ -432,38 +432,35 @@ impl ScanPlugin for OpenRedirectPlugin {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 // Use no-redirect policy to catch the 3xx
-                match client
+                if let Ok(resp) = client
                     .get(&url)
                     .timeout(Duration::from_secs(8))
                     .send()
                     .await
                 {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        if (300..=399).contains(&status) {
-                            if let Some(loc) = resp.headers().get("location") {
-                                let loc_str = loc.to_str().unwrap_or("");
-                                if loc_str.contains("rustzap-canary") || loc_str.starts_with("//") {
-                                    findings.push(
-                                        Finding::new(
-                                            "Open Redirect",
-                                            Severity::Medium,
-                                            &target.url,
-                                            "The application redirects to a user-supplied URL without validation, enabling phishing attacks.",
-                                            "Validate redirect targets against an allowlist of permitted domains.",
-                                            "active/open-redirect",
-                                        )
-                                        .with_parameter(&param)
-                                        .with_evidence(format!("HTTP {} Location: {}", status, loc_str))
-                                        .with_cwe(601)
-                                        .with_owasp("A01:2021 – Broken Access Control"),
-                                    );
-                                    return findings;
-                                }
+                    let status = resp.status().as_u16();
+                    if (300..=399).contains(&status) {
+                        if let Some(loc) = resp.headers().get("location") {
+                            let loc_str = loc.to_str().unwrap_or("");
+                            if loc_str.contains("rustzap-canary") || loc_str.starts_with("//") {
+                                findings.push(
+                                    Finding::new(
+                                        "Open Redirect",
+                                        Severity::Medium,
+                                        &target.url,
+                                        "The application redirects to a user-supplied URL without validation, enabling phishing attacks.",
+                                        "Validate redirect targets against an allowlist of permitted domains.",
+                                        "active/open-redirect",
+                                    )
+                                    .with_parameter(&param)
+                                    .with_evidence(format!("HTTP {} Location: {}", status, loc_str))
+                                    .with_cwe(601)
+                                    .with_owasp("A01:2021 – Broken Access Control"),
+                                );
+                                return findings;
                             }
                         }
                     }
-                    Err(_) => {}
                 }
             }
         }
@@ -567,7 +564,7 @@ impl ScanPlugin for XxePlugin {
 <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
 <root><param>&xxe;</param></root>"#;
 
-        match client
+        if let Ok(resp) = client
             .post(&target.url)
             .header("Content-Type", "application/xml")
             .body(xxe_payload)
@@ -575,25 +572,22 @@ impl ScanPlugin for XxePlugin {
             .send()
             .await
         {
-            Ok(resp) => {
-                let body = resp.text().await.unwrap_or_default();
-                if body.contains("root:x:0:0") || body.contains("/bin/bash") {
-                    findings.push(
-                        Finding::new(
-                            "XML External Entity (XXE) Injection",
-                            Severity::Critical,
-                            &target.url,
-                            "The XML parser processes external entity declarations, enabling file read, SSRF, and denial of service.",
-                            "Disable external entity processing in your XML parser. Use a JSON API where possible.",
-                            "active/xxe",
-                        )
-                        .with_evidence("XXE payload successfully read /etc/passwd".to_string())
-                        .with_cwe(611)
-                        .with_owasp("A03:2021 – Injection"),
-                    );
-                }
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("root:x:0:0") || body.contains("/bin/bash") {
+                findings.push(
+                    Finding::new(
+                        "XML External Entity (XXE) Injection",
+                        Severity::Critical,
+                        &target.url,
+                        "The XML parser processes external entity declarations, enabling file read, SSRF, and denial of service.",
+                        "Disable external entity processing in your XML parser. Use a JSON API where possible.",
+                        "active/xxe",
+                    )
+                    .with_evidence("XXE payload successfully read /etc/passwd".to_string())
+                    .with_cwe(611)
+                    .with_owasp("A03:2021 – Injection"),
+                );
             }
-            Err(_) => {}
         }
 
         findings

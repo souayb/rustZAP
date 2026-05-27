@@ -82,10 +82,7 @@ impl PassiveScanner {
 
         let status = response.status().as_u16();
         let headers = response.headers().clone();
-        let body = match response.text().await {
-            Ok(b) => b,
-            Err(_) => String::new(),
-        };
+        let body = response.text().await.unwrap_or_default();
 
         let mut findings = Vec::new();
 
@@ -499,7 +496,7 @@ fn check_sensitive_data_exposure(url: &str, body: &str) -> Vec<Finding> {
                         title,
                         severity,
                         url,
-                        &format!("Sensitive data pattern detected in response body: {}", title),
+                        format!("Sensitive data pattern detected in response body: {}", title),
                         "Remove sensitive data from responses. Use environment variables for secrets.",
                         "passive/sensitive-data",
                     )
@@ -527,7 +524,7 @@ fn check_error_messages(url: &str, status: u16, body: &str) -> Vec<Finding> {
                     "Verbose Server Error Message",
                     Severity::Medium,
                     url,
-                    &format!("Server returned HTTP {} with a verbose error message that may disclose internal information.", status),
+                    format!("Server returned HTTP {} with a verbose error message that may disclose internal information.", status),
                     "Return generic error pages in production. Log detailed errors server-side only.",
                     "passive/error-disclosure",
                 )

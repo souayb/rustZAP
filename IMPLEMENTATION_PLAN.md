@@ -1,0 +1,439 @@
+# RustZAP — Detailed implementation plan
+
+This document turns the platform roadmap into **actionable specs**: file layout, data contracts, CLI shapes, phased deliverables, and acceptance criteria. It extends the high-level vision in [`SOFTWARE_DESIGN_DOCUMENT.md`](./SOFTWARE_DESIGN_DOCUMENT.md) and complements module ideas in [`FEATURE.md`](./FEATURE.md).
+
+**Status legend**
+
+| Label | Meaning |
+|-------|---------|
+| **Done** | Shipped in the current tree |
+| **Planned** | Spec’d here; not implemented |
+| **Partial** | Some plumbing exists; completion work listed |
+
+---
+
+## Table of contents
+
+1. [Goals and constraints](#1-goals-and-constraints)
+2. [Current architecture (as implemented)](#2-current-architecture-as-implemented)
+3. [Target architecture](#3-target-architecture)
+4. [Reference open-source integrations](#4-reference-open-source-integrations)
+5. [Phase 1 — JSON report modules, analyze CLI, Semgrep](#phase-1--json-report-modules-analyze-cli-semgrep)
+6. [Phase 2 — Multi-tool audit, correlation, SARIF](#phase-2--multi-tool-audit-correlation-sarif)
+7. [Phase 3 — OpenAPI/HAR, Nuclei, DAST depth](#phase-3--openapihar-nuclei-dast-depth)
+8. [Phase 4 — HTTP API worker mode](#phase-4--http-api-worker-mode)
+9. [Phase 5 — Agentic security](#phase-5--agentic-security)
+10. [Phase 6 — Platform and long tail](#phase-6--platform-and-long-tail)
+11. [Testing strategy](#11-testing-strategy)
+12. [Documentation maintenance](#12-documentation-maintenance)
+
+---
+
+## 1. Goals and constraints
+
+### 1.1 Product goals
+
+- **Unified machine-readable output**: One JSON contract (evolving additively) for DAST + future SAST/SCA/tool runs, suitable for CI and the Unified Finding Format (UFF) described in the SDD.
+- **Code analysis in the CLI**: Today Semgrep/Trivy/Gitleaks run from the TUI with streamed logs only — bring **parsed findings** into `Finding` and reports.
+- **Optional agentic mode**: Human-in-the-loop, scope-enforced, never default-on; aligns with patterns from [Strix](https://github.com/usestrix/strix), [PentAGI](https://github.com/vxcontrol/pentagi), and OWASP Agentic guidance.
+- **DAST parity growth**: Borrow breadth ideas from [OWASP ZAP](https://www.zaproxy.org/), [Argus](https://github.com/jasonxtn/Argus), and optional template engines ([Nuclei](https://github.com/projectdiscovery/nuclei)).
+
+### 1.2 Non-negotiables (from `CLAUDE.md`)
+
+- No unauthorized-scan assumptions; intrusive behavior stays **opt-in** and documented.
+- Stable `Finding::plugin` prefixes where possible (`passive/`, `active/`, `sast/`, `sca/`, …). Breaking renames require a version/migration note in this file and README.
+- New high-rate or exploitation features: explicit flags + README warnings + tests on mock/lab targets.
+
+---
+
+## 2. Current architecture (as implemented)
+
+### 2.1 Scan pipeline (**Done**)
+
+`scanner::run_scan` / `run_scan_with_events`:
+
+1. **Spider** → `Vec<DiscoveredUrl>`
+2. **Passive** → findings merged by `PassiveScanner`
+3. **Active** → `ActiveScanner` + `ScanPlugin`s (URLs without query params skipped unless plugin uses `always_run()`)
+4. **TLS** (`tls.rs`) + **Intel** (`intel.rs`, env-gated)
+5. **Report** (`report.rs`): JSON primary; CSV/HTML secondary
+
+CLI entry: `src/main.rs` subcommands (`scan`, `spider`, `proxy`, `passive`, `plugins`, `tui`, `install`, `stress`).
+
+### 2.2 Module roll-up (**Partial**)
+
+- **CLI / TUI**: `types::summarize_modules` + `passive::known_plugin_names`, `ActiveScanner::enabled_module_names`, `tls::known_plugin_names`, `intel::known_plugin_names` drive the **MODULES** banner and `ScanEvent::ModuleRan`.
+- **JSON report**: `Report` in `report.rs` includes `modules[]` and optional `correlations[]` (Phase 1–2 **Done**).
+
+### 2.3 External tools (**Partial**)
+
+- `tools.rs`: detects tools, spawns processes, streams lines as `ToolEvent`.
+- **Gap**: no JSON parse path from Semgrep/Trivy/Gitleaks into `Finding`.
+
+### 2.4 Key types (**Done**)
+
+- `Finding`, `ModuleSummary`, `DiscoveredUrl`, `UrlSource` — `src/types.rs`
+- `ScanEvent` — `src/events.rs`
+- `ScanPlugin` — `src/active.rs`
+
+---
+
+## 3. Target architecture
+
+```text
+                         ┌─────────────────────────────────────┐
+                         │ CLI: scan | analyze | audit | agent │
+                         │      serve (future HTTP worker)      │
+                         └─────────────────┬───────────────────┘
+                                           │
+           ┌───────────────────────────────┼───────────────────────────────┐
+           │                               │                               │
+           ▼                               ▼                               ▼
+   ┌───────────────┐              ┌─────────────────┐               ┌─────────────┐
+   │ scanner.rs    │              │ analyze/audit   │               │ agent/      │
+   │ (existing)    │              │ orchestrator    │               │ (Phase 5)   │
+   └───────┬───────┘              └────────┬────────┘               └──────┬──────┘
+           │                               │                               │
+           │         ┌─────────────────────┴─────────────────────┐         │
+           │         │ normalize (UFF-ish Finding assembly)       │◄────────┘
+           │         └─────────────────────┬─────────────────────┘
+           │                               │
+           ▼                               ▼
+   ┌───────────────────────────────────────────────────────────────────────┐
+   │ report.rs — JSON + optional SARIF; modules[], correlations[], coverage  │
+   └───────────────────────────────────────────────────────────────────────┘
+```
+
+**New top-level Rust modules (Planned)**
+
+| Path | Responsibility |
+|------|----------------|
+| `src/analyze/mod.rs` | Orchestrate static/tool scans from CLI |
+| `src/analyze/semgrep.rs` | Parse Semgrep JSON → `Vec<Finding>` |
+| `src/analyze/trivy.rs` | Parse Trivy JSON → `Vec<Finding>` |
+| `src/analyze/gitleaks.rs` | Parse Gitleaks JSON → `Vec<Finding>` |
+| `src/analyze/checkov.rs` | Parse Checkov JSON → `Vec<Finding>` (optional; noisy) |
+| `src/normalize/mod.rs` | Shared helpers: severity mapping, plugin id rules |
+| `src/correlate.rs` | Rule-based join of static + dynamic findings (Phase 2) |
+| `src/sarif.rs` | Emit SARIF 2.1 for GitHub Code Scanning (Phase 2) |
+| `src/agent/mod.rs` | Agent loop, tool registry, safety — Phase 5 only |
+
+Each new `mod` must be declared in `src/main.rs` (or a `lib.rs` if the project splits later).
+
+---
+
+## 4. Reference open-source integrations
+
+| Project | Role | Integration style |
+|---------|------|-------------------|
+| [Semgrep](https://github.com/semgrep/semgrep) | SAST | Subprocess `--json`; map rules → `Finding` |
+| [Trivy](https://github.com/aquasecurity/trivy) | SCA / fs | `--format json`; CVE + path |
+| [Gitleaks](https://github.com/gitleaks/gitleaks) | Secrets | JSON report mode |
+| [Checkov](https://github.com/bridgecrewio/checkov) | IaC | JSON output; optional `--framework` filters |
+| [Nuclei](https://github.com/projectdiscovery/nuclei) | Template DAST | Subprocess `-jsonl` or `-json-export` |
+| [OWASP ZAP](https://www.zaproxy.org/) | UX / parity | Concepts: context, HAR, authenticated scan |
+| [Argus](https://github.com/jasonxtn/Argus) | Module ideas | Naming + breadth reference (`FEATURE.md`) |
+| [Strix](https://github.com/usestrix/strix) | Agentic + CI | Headless flags, sandbox, PoC validation patterns |
+| [PentAGI](https://github.com/vxcontrol/pentagi) | Multi-agent pentest | Planning + memory graph inspiration |
+| [Agent-Smith](https://github.com/0x0pointer/agent-smith) | Full-stack flows | Repo → routes/sinks → DAST pivot |
+| [Crucible](https://github.com/crucible-security/crucible) | Agentic AI security | LLM/agent abuse test modules |
+
+---
+
+## Phase 1 — JSON report modules, analyze CLI, Semgrep
+
+**Objective**: Close the SDD §9.1 gap for JSON consumers and ship the first **code analyzer** path in the CLI.
+
+### 1.1 JSON report: `modules` array (**Planned**)
+
+**Schema (additive)**
+
+Extend `report::Report` with an optional field (use `#[serde(default)]` if deserializing old reports is ever needed):
+
+```json
+{
+  "meta": { "...": "..." },
+  "summary": { "...": "..." },
+  "modules": [
+    {
+      "name": "active/sqli",
+      "findings": 1,
+      "max_severity": "critical",
+      "quiet": false
+    }
+  ],
+  "urls": [],
+  "findings": []
+}
+```
+
+**Implementation steps**
+
+1. Add `pub modules: Vec<ModuleSummary>` to `Report` in `src/report.rs` (or wrap in `Option<Vec<ModuleSummary>>` — prefer **required empty vec** for new writes, `Option` only if backward compat for parsers that omit the field matters).
+2. Change `Report::new` signature to accept `modules: Vec<ModuleSummary>` **or** compute inside `Report::from_scan(...)` helper that duplicates the **same known-module list** as `scanner::print_module_summary`:
+   - `passive::known_plugin_names()`
+   - `ActiveScanner::enabled_module_names()`
+   - `tls::known_plugin_names()` if TLS ran
+   - `intel::known_plugin_names()` if intel enabled  
+   Recommendation: extract a small `scanner::compute_module_summaries(findings, scan_context) -> Vec<ModuleSummary>` to avoid divergence between CLI banner and JSON.
+3. Update `scanner::run_scan` and `run_scan_with_events` completion paths wherever `Report::new` is called.
+4. **Acceptance**: A passive-only scan against `example.com` produces JSON with `modules` including quiet passive plugins; active scan lists enabled `active/*` modules.
+
+### 1.2 New subcommand: `analyze` (**Planned**)
+
+**CLI shape (recommended)**
+
+```text
+rustzap analyze --repo <PATH> [--semgrep-json <file.json>] --output <file.json>
+```
+
+- Default `--repo` = `.`
+- For Phase 1, `rustzap analyze` is **Semgrep-first only**.
+- If `--semgrep-json` is provided, RustZAP parses it (no Semgrep runtime dependency).
+
+**Semgrep invocation**
+
+- Command (default, when `--semgrep-json` is omitted): `semgrep scan --quiet --json --config auto .`
+- Working directory: `repo` path.
+- Parse stdout JSON on success; map each result to `Finding`:
+
+| Semgrep field | `Finding` field |
+|---------------|-----------------|
+| `check_id` or rule id | `plugin`: `sast/semgrep` + `parameter`: check_id |
+| `message` or `extra.message` | `title`, `description` |
+| `path` + `start.line` | `location` + `url` as `file://...#Lx` |
+| Severity from `extra.severity` or metadata | Map to `Severity` with a lookup table |
+
+**Plugin ID rules**
+
+- Prefix: `sast/semgrep` — stable module id for Phase 1 Semgrep results.
+- `url`: Use `file://` + absolute path + optional `#L42` fragment for tooling, **or** `repo-relative` string in evidence only — pick one convention and document in README.
+
+### 1.3 `Finding` extensions (**Planned**, backward compatible)
+
+Add **optional** serde fields to `Finding` in `types.rs`:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub source_tool: Option<String>,   // "semgrep", "rustzap", …
+
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub location: Option<CodeLocation>, // file + start line (+ optional end)
+
+#[serde(default)]
+pub poc_validated: bool,           // reserved for Phase 5; default false
+
+#[serde(default)]
+pub correlated_with: Vec<String>,  // Finding ids — Phase 2
+```
+
+```rust
+pub struct CodeLocation {
+    pub file: String,
+    pub line_start: u32,
+    pub line_end: Option<u32>,
+}
+```
+
+Rules:
+
+- Existing JSON consumers ignore unknown fields if they parse loosely; serde **skip** ensures minimal diff for empties.
+- DAST findings leave `location: None`; SAST populates it.
+
+### 1.4 Tests (**Planned**)
+
+- **Unit**: Golden minimal Semgrep JSON fixture under `tests/fixtures/semgrep_small.json` → assert N findings and one `plugin` shape.
+- **Integration**: `cargo test` with `#[cfg]` skipping if `semgrep` absent, **or** unit-only fixtures (preferred for CI determinism).
+
+### 1.5 Phase 1 acceptance checklist
+
+- [x] `rustzap scan -o report.json` includes `"modules": [...]` consistent with MODULES CLI block (`scanner::collect_scan` + `Report.modules`).
+- [x] `rustzap analyze --repo . --output semgrep-findings.json` writes a valid report with `modules[]` (CI: `--semgrep-json tests/fixtures/semgrep_small.json`).
+- [x] README documents `analyze` and the new JSON fields.
+
+---
+
+## Phase 2 — Multi-tool audit, correlation, SARIF
+
+### 2.1 Subcommand: `audit` (**Done**)
+
+```text
+rustzap audit [--repo DIR] [--target URL] [--tools semgrep,trivy,gitleaks]
+              [--correlate] [--output unified.json] [--sarif-out …]
+```
+
+Execution model (implemented in `analyze/mod.rs`):
+
+1. If `--target`: in-process `scanner::collect_scan`.
+2. Static tools on `--repo` via `run_static_analysis` (fixture paths or subprocess).
+3. Merge findings, build `modules[]`, optional `correlate_findings`, JSON + optional SARIF.
+
+### 2.2 Parsers (**Done** for Semgrep, Trivy, Gitleaks)
+
+| Tool | Output flag | Mapper module |
+|------|-------------|---------------|
+| Trivy | `trivy fs --format json` | `analyze/trivy.rs` → `plugin` id `sca/trivy` |
+| Gitleaks | `gitleaks detect --report-format json` | `analyze/gitleaks.rs` → `secrets/gitleaks` |
+| Checkov | JSON to stdout | Deferred (future `analyze/checkov.rs`) |
+
+### 2.3 Correlation engine (**Done**, extensible)
+
+**File**: `src/correlate.rs`
+
+**Deterministic rules**
+
+1. Semgrep SQL-ish signal + `active/sqli*` when paths align → severity bump + pairwise `correlated_with`.
+2. Trivy vulnerable package (from evidence) referenced in Semgrep fields/path + at least one HTTP(S) `active/*` or `passive/*` finding → tripartite correlation; **Critical** Trivy adds `elevated_severity` / may bump the linked web finding to High.
+
+Emit **optional** `correlations[]`:
+
+```json
+"correlations": [
+  {
+    "id": "corr-<uuid>",
+    "finding_ids": ["...", "..."],
+    "reason": "SAST SQL sink + confirmed DAST SQLi",
+    "elevated_severity": "critical"
+  }
+]
+```
+
+Report-level `correlations[]` plus per-finding `correlated_with` (best-effort).
+
+### 2.4 SARIF export (**Done**)
+
+**File**: `src/sarif.rs`  
+**CLI**: `--sarif-out` on `analyze` / `audit`; **`scan`** supports `--output … .sarif` or `--sarif-out` alongside JSON/HTML/CSV.
+
+Minimum: SARIF 2.1 `runs[].results[]` from `Finding` with regions from `CodeLocation` when present.
+
+### 2.5 Phase 2 acceptance checklist
+
+- [x] `audit` produces one JSON with mixed `plugin` prefixes (`audit_merges_static_fixtures_without_dast` test).
+- [x] Correlation rules covered by unit tests (`correlate::tests`: SQLi path + Trivy/Semgrep/web).
+- [ ] SARIF validates in GitHub’s upload (manual: README notes + `upload-sarif` workflow on your repo).
+
+---
+
+## Phase 3 — OpenAPI/HAR, Nuclei, DAST depth
+
+### 3.1 OpenAPI import (**Planned**)
+
+- New CLI flags on `scan`: `--openapi-path` or `--openapi-url` (fetch once).
+- Parse operations → synthetic `DiscoveredUrl` rows withmethod + path template + parameter names.
+- **Plugin IDs**: discovery-only findings optional `passive/openapi-import` info finding.
+
+### 3.2 HAR replay (**Planned**)
+
+- `--har-path recording.har` → extract unique requests (host filter = target origin); enqueue as spider seeds or direct active targets.
+- Respect **allowlist**: only same-origin as `--target`.
+
+### 3.3 Nuclei (**Planned**)
+
+- Opt-in `--nuclei` or plugin substring `nuclei` spawning `nuclei -u <target>` with `-jsonl` export.
+- Map lines to findings `active/nuclei/<template-id>` capped rate.
+
+### 3.4 Phase 3 acceptance checklist
+
+- [ ] Documented Juice-Shop or local lab example for OpenAPI + scan.
+- [ ] Nuclei behind explicit flag; README warns on scope.
+
+---
+
+## Phase 4 — HTTP API worker mode
+
+### 4.1 `serve` subcommand (**Planned**)
+
+```text
+rustzap serve --listen 127.0.0.1:8090 [--auth-token ENV]
+```
+
+**MVP endpoints** (mirror SDD §6 subset)
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| POST | `/api/v1/scans` | `{ "target", "plugins", "passive_only" }` | `{ "id" }` |
+| GET | `/api/v1/scans/{id}` | — | status + path to report |
+| GET | `/api/v1/scans/{id}/report` | — | JSON report |
+
+**Implementation notes**
+
+- Use `axum` or `warp` (new dependency — justify in PR).
+- Run scans in `tokio::spawn` with job table `Arc<Mutex<HashMap<Uuid, JobState>>>`.
+- **Security**: bind default `localhost`; prod requires token; document threat model.
+
+### 4.2 Phase 4 acceptance checklist
+
+- [ ] Docker Compose optional sidecar invoking `serve` documented.
+- [ ] No default open bind on `0.0.0.0` without README warning.
+
+---
+
+## Phase 5 — Agentic security
+
+### 5.1 Principles
+
+- **Opt-in**: `rustzap agent ...` never implied by bare `rustzap`.
+- **Scope file**: YAML/JSON listing allowed schemes, hosts, max requests/min, forbidden paths regex.
+- **Approval gates**: `--require-approval-for exploit|rce|exfil`.
+- **Trace**: append-only `agent-trace.jsonl` with tool calls + redacted headers.
+
+Reference UX: non-interactive CI flag (`-n`) pattern from **Strix** docs; multi-agent decomposition from **PentAGI**.
+
+### 5.2 `AgentTool` registry (**Planned**)
+
+Wrap without duplicating scanner logic:
+
+- `SpiderCrawl`
+- `RunPlugin { plugin, url_hint }`
+- `HttpProbe { req }` — bounded
+- Future: `RunSemgrepPath`
+
+Planner: pluggable trait `AgentBrain` with two impls: `LlmBrain` (HTTP to OpenAI-compatible API) and `ScriptedBrain` (tests).
+
+### 5.3 AI red team module (**Planned**)
+
+When crawl detects LLM-like routes (`/v1/chat/completions`, etc.), optional subtree `agentic/*` plugins (see OWASP LLM Top 10 / Agentic Top 10) — **behind `--agent-ai-redteam`** flag.
+
+### 5.4 Phase 5 acceptance checklist
+
+- [ ] Agent cannot run without scope file (--scope required).
+- [ ] README “Ethics” section mentions LLM misuse and MCP risks (Crucible-style).
+
+---
+
+## Phase 6 — Platform and long tail
+
+- Falco webhook ingest (`POST /webhooks/falco`) — extend `serve`.
+- Native lightweight Rust SAST (tree-sitter) — **optional**, large scope.
+- gRPC plugin SDK — align with SDD §9 Kubernetes worker story.
+- Extend `CONTRIBUTION.md` with UFF normalization guidelines once `normalize/` grows.
+
+---
+
+## 11. Testing strategy
+
+| Layer | Approach |
+|-------|----------|
+| Parsers | Fixture JSON → unit tests (`tests/fixtures/`). |
+| Correlation | Synthetic `Finding` vectors. |
+| Report | Snapshot or insta (see `FEATURE.md` backlog **D2** passive golden matrix). |
+| HTTP API | `axum::Router` tests with `tower::ServiceExt`. |
+| Agent | Mock `AgentBrain`; no live LLM in CI. |
+
+**CI policy**: Prefer fixtures over requiring Semgrep/Nuclei in GitHub Actions; optional jobs with tools allowed.
+
+---
+
+## 12. Documentation maintenance
+
+When implementing a phase:
+
+1. Update this file’s **Status** (move sections from Planned → Done).
+2. Update **README** CLI section and architecture tree.
+3. Update **SOFTWARE_DESIGN_DOCUMENT.md** Phase roadmap checkboxes if present.
+4. Keep **CHANGELOG** or GitHub Releases note (if project adopts them later).
+
+---
+
+*End of IMPLEMENTATION_PLAN.md*

@@ -29,14 +29,16 @@ pub enum ToolEvent {
     Error { tool: String, error: String },
 }
 
-fn definitions() -> Vec<(
+type ToolDef = (
     &'static str,
     &'static str,
     &'static str,
     &'static str,
     Vec<&'static str>,
     bool,
-)> {
+);
+
+fn definitions() -> Vec<ToolDef> {
     vec![
         // (name, cmd, category, role, default_args, needs_target)
         (

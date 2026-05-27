@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use colored::*;
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget};
 use tokio::sync::Mutex;
 
 use crate::active::ActiveScanner;
@@ -12,7 +12,14 @@ use crate::events::{ScanEvent, ScanPhase};
 use crate::passive::PassiveScanner;
 use crate::report::Report;
 use crate::spider::Spider;
-use crate::types::{DiscoveredUrl, Finding};
+use crate::types::{DiscoveredUrl, Finding, ModuleSummary};
+
+/// Result of an in-process scan (no file I/O).
+pub struct ScanCollected {
+    pub discovered: Vec<DiscoveredUrl>,
+    pub findings: Vec<Finding>,
+    pub modules: Vec<ModuleSummary>,
+}
 
 /// Full scan configuration
 #[derive(Debug, Clone)]
@@ -22,6 +29,8 @@ pub struct ScanConfig {
     pub concurrency: usize,
     pub passive_only: bool,
     pub output_file: String,
+    /// Emit SARIF 2.1 in addition to `--output`, or alongside JSON/CSV/HTML.
+    pub sarif_out: Option<String>,
     pub timeout_secs: u64,
     pub user_agent: Option<String>,
     pub cookies: Option<String>,
@@ -89,6 +98,73 @@ pub fn build_client(config: &ScanConfig) -> Result<reqwest::Client> {
     Ok(builder.build()?)
 }
 
+/// Run spider → passive → active → transport/intel without writing a report.
+pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
+    let client = Arc::new(build_client(&config)?);
+    let findings: Arc<Mutex<Vec<Finding>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let spider_pb = ProgressBar::with_draw_target(Some(0), ProgressDrawTarget::hidden());
+    let spider = Spider::new(
+        client.clone(),
+        config.target_url.clone(),
+        config.max_depth,
+        config.concurrency,
+    );
+    let discovered = spider.crawl(&spider_pb).await?;
+    spider_pb.finish();
+
+    let passive_pb =
+        ProgressBar::with_draw_target(Some(discovered.len() as u64), ProgressDrawTarget::hidden());
+    let passive_scanner = PassiveScanner::new(client.clone());
+    let passive_findings = passive_scanner.scan_all(&discovered, &passive_pb).await?;
+    passive_pb.finish();
+    {
+        let mut f = findings.lock().await;
+        f.extend(passive_findings);
+    }
+
+    let mut active_module_names: Vec<String> = Vec::new();
+    if !config.passive_only {
+        let active_pb = ProgressBar::with_draw_target(
+            Some(discovered.len() as u64),
+            ProgressDrawTarget::hidden(),
+        );
+        let active_scanner =
+            ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
+        active_module_names = active_scanner.enabled_module_names();
+        let af = active_scanner.scan_all(&discovered, &active_pb).await?;
+        active_pb.finish();
+        let mut f = findings.lock().await;
+        f.extend(af);
+    }
+
+    let hosts = unique_hosts(&discovered);
+    let mut intel_enabled = false;
+    if !hosts.is_empty() {
+        let tls_findings = crate::tls::check_hosts(&hosts).await;
+        let intel_cfg = crate::intel::IntelConfig::from_env();
+        intel_enabled = intel_cfg.is_enabled();
+        let intel_findings = crate::intel::enrich_hosts(&intel_cfg, &hosts).await;
+        let mut f = findings.lock().await;
+        f.extend(tls_findings);
+        f.extend(intel_findings);
+    }
+
+    let all_findings = findings.lock().await.clone();
+    let modules = compute_module_summaries(
+        &all_findings,
+        &active_module_names,
+        !hosts.is_empty(),
+        intel_enabled,
+    );
+
+    Ok(ScanCollected {
+        discovered,
+        findings: all_findings,
+        modules,
+    })
+}
+
 /// Entry point for a full scan
 pub async fn run_scan(config: ScanConfig) -> Result<()> {
     let start = Instant::now();
@@ -114,109 +190,23 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
     }
     println!();
 
-    let client = Arc::new(build_client(&config)?);
-    let findings: Arc<Mutex<Vec<Finding>>> = Arc::new(Mutex::new(Vec::new()));
-    let mp = MultiProgress::new();
-
-    // ─── Phase 1: Spider ──────────────────────────────────────────
-    let spider_pb = mp.add(ProgressBar::new_spinner());
-    spider_pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {prefix:.bold} {msg}")
-            .unwrap(),
-    );
-    spider_pb.set_prefix("SPIDER");
-    spider_pb.set_message("Crawling...");
-    spider_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    let spider = Spider::new(
-        client.clone(),
-        config.target_url.clone(),
-        config.max_depth,
-        config.concurrency,
-    );
-
-    let discovered = spider.crawl(&spider_pb).await?;
-    spider_pb.finish_with_message(format!("✓ Discovered {} URLs", discovered.len()));
-
-    // ─── Phase 2: Passive Scanning ────────────────────────────────
-    let passive_pb = mp.add(ProgressBar::new(discovered.len() as u64));
-    passive_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{prefix:.bold} [{bar:40.green/white}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("█▉▊▋▌▍▎▏  "),
-    );
-    passive_pb.set_prefix("PASSIVE");
-
-    let passive_scanner = PassiveScanner::new(client.clone());
-    let passive_findings = passive_scanner.scan_all(&discovered, &passive_pb).await?;
-
-    {
-        let mut f = findings.lock().await;
-        f.extend(passive_findings.clone());
-    }
-    passive_pb.finish_with_message(format!("✓ {} findings", passive_findings.len()));
-
-    // ─── Phase 3: Active Scanning ─────────────────────────────────
-    let mut active_module_names: Vec<String> = Vec::new();
-    if !config.passive_only {
-        let active_pb = mp.add(ProgressBar::new(discovered.len() as u64));
-        active_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{prefix:.bold} [{bar:40.red/white}] {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("█▉▊▋▌▍▎▏  "),
-        );
-        active_pb.set_prefix("ACTIVE ");
-
-        let active_scanner =
-            ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
-        active_module_names = active_scanner.enabled_module_names();
-        let af = active_scanner.scan_all(&discovered, &active_pb).await?;
-
-        {
-            let mut f = findings.lock().await;
-            f.extend(af.clone());
-        }
-        active_pb.finish_with_message(format!("✓ {} findings", af.len()));
-    }
-
-    // ─── Phase 3.5: Transport + intel ─────────────────────────────
-    // Per-host TLS probe + optional Shodan enrichment. Both are silent on
-    // success (no findings) and best-effort on failure.
-    let hosts = unique_hosts(&discovered);
-    let mut intel_enabled = false;
-    if !hosts.is_empty() {
-        let tls_findings = crate::tls::check_hosts(&hosts).await;
-        let intel_cfg = crate::intel::IntelConfig::from_env();
-        intel_enabled = intel_cfg.is_enabled();
-        let intel_findings = crate::intel::enrich_hosts(&intel_cfg, &hosts).await;
-        let mut f = findings.lock().await;
-        f.extend(tls_findings);
-        f.extend(intel_findings);
-    }
-
-    // ─── Phase 4: Report ──────────────────────────────────────────
+    let collected = collect_scan(config.clone()).await?;
     let elapsed = start.elapsed();
-    let all_findings = findings.lock().await.clone();
 
-    print_summary(&discovered, &all_findings, elapsed);
-    print_module_summary(
-        &all_findings,
-        &active_module_names,
-        !hosts.is_empty(),
-        intel_enabled,
-    );
+    print_summary(&collected.discovered, &collected.findings, elapsed);
+    print_module_summary_from_modules(&collected.modules);
 
     let report = Report::new(
         &config.target_url,
-        discovered.clone(),
-        all_findings,
+        collected.modules,
+        collected.discovered.clone(),
+        collected.findings,
         elapsed,
     );
 
-    if config.output_file.ends_with(".csv") {
+    if config.output_file.ends_with(".sarif") {
+        crate::sarif::write_sarif(&report, &config.output_file)?;
+    } else if config.output_file.ends_with(".csv") {
         report.save_csv(&config.output_file).await?;
     } else if config.output_file.ends_with(".html") {
         report.save_html(&config.output_file).await?;
@@ -224,11 +214,26 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
         report.save_json(&config.output_file).await?;
     }
 
+    if let Some(ref sarif_path) = config.sarif_out {
+        if sarif_path != &config.output_file {
+            crate::sarif::write_sarif(&report, sarif_path)?;
+        }
+    }
+
     println!(
         "\n{} {}",
         "✓ Report saved to:".bright_green().bold(),
         config.output_file.bright_cyan()
     );
+    if let Some(ref sarif_path) = config.sarif_out {
+        if sarif_path != &config.output_file {
+            println!(
+                "{} {}",
+                "✓ SARIF saved to:".bright_green().bold(),
+                sarif_path.bright_cyan()
+            );
+        }
+    }
 
     Ok(())
 }
@@ -321,7 +326,7 @@ pub async fn run_scan_with_events(
     let _ = passive_tick.await;
 
     for f in &passive_findings {
-        let _ = tx.send(ScanEvent::Finding(f.clone()));
+        let _ = tx.send(ScanEvent::Finding(Box::new(f.clone())));
     }
     let _ = tx.send(ScanEvent::PassiveProgress {
         done: discovered.len(),
@@ -330,6 +335,9 @@ pub async fn run_scan_with_events(
     emit_module_events(&tx, &passive_findings, crate::passive::known_plugin_names());
 
     let mut all_findings = passive_findings;
+    let mut active_module_names: Vec<String> = Vec::new();
+    let mut transport_ran = false;
+    let mut intel_enabled = false;
 
     // ── Phase 3: Active ────────────────────────────────────────────
     if !config.passive_only {
@@ -360,19 +368,20 @@ pub async fn run_scan_with_events(
 
         let active_scanner =
             ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
-        let active_modules: Vec<String> = active_scanner.enabled_module_names();
+        active_module_names = active_scanner.enabled_module_names();
         let active_findings = active_scanner.scan_all(&discovered, &active_pb).await?;
         active_pb.finish();
         let _ = active_tick.await;
 
         for f in &active_findings {
-            let _ = tx.send(ScanEvent::Finding(f.clone()));
+            let _ = tx.send(ScanEvent::Finding(Box::new(f.clone())));
         }
         let _ = tx.send(ScanEvent::ActiveProgress {
             done: discovered.len(),
             total: discovered.len(),
         });
-        let active_module_refs: Vec<&str> = active_modules.iter().map(|s| s.as_str()).collect();
+        let active_module_refs: Vec<&str> =
+            active_module_names.iter().map(|s| s.as_str()).collect();
         emit_module_events(&tx, &active_findings, &active_module_refs);
         all_findings.extend(active_findings);
     }
@@ -380,14 +389,16 @@ pub async fn run_scan_with_events(
     // ── Phase 3.5: Transport + intel ───────────────────────────────
     let hosts = unique_hosts(&discovered);
     if !hosts.is_empty() {
+        transport_ran = true;
         let tls_findings = crate::tls::check_hosts(&hosts).await;
         let intel_cfg = crate::intel::IntelConfig::from_env();
+        intel_enabled = intel_cfg.is_enabled();
         let intel_findings = crate::intel::enrich_hosts(&intel_cfg, &hosts).await;
         for f in tls_findings.iter().chain(intel_findings.iter()) {
-            let _ = tx.send(ScanEvent::Finding(f.clone()));
+            let _ = tx.send(ScanEvent::Finding(Box::new(f.clone())));
         }
         emit_module_events(&tx, &tls_findings, crate::tls::known_plugin_names());
-        if intel_cfg.is_enabled() {
+        if intel_enabled {
             emit_module_events(&tx, &intel_findings, crate::intel::known_plugin_names());
         }
         all_findings.extend(tls_findings);
@@ -401,8 +412,15 @@ pub async fn run_scan_with_events(
     });
 
     let elapsed = start.elapsed();
+    let modules = compute_module_summaries(
+        &all_findings,
+        &active_module_names,
+        transport_ran,
+        intel_enabled,
+    );
     let report = Report::new(
         &config.target_url,
+        modules,
         discovered.clone(),
         all_findings,
         elapsed,
@@ -411,12 +429,20 @@ pub async fn run_scan_with_events(
     let total_findings = report.summary.total_findings;
     let risk_score = report.summary.risk_score;
 
-    if config.output_file.ends_with(".csv") {
+    if config.output_file.ends_with(".sarif") {
+        crate::sarif::write_sarif(&report, &config.output_file)?;
+    } else if config.output_file.ends_with(".csv") {
         report.save_csv(&config.output_file).await?;
     } else if config.output_file.ends_with(".html") {
         report.save_html(&config.output_file).await?;
     } else {
         report.save_json(&config.output_file).await?;
+    }
+
+    if let Some(ref sarif_path) = config.sarif_out {
+        if sarif_path != &config.output_file {
+            crate::sarif::write_sarif(&report, sarif_path)?;
+        }
     }
 
     let _ = tx.send(ScanEvent::Completed {
@@ -496,30 +522,14 @@ fn print_summary(urls: &[DiscoveredUrl], findings: &[Finding], elapsed: std::tim
 /// Print the per-module roll-up below the main scan summary. Format
 /// matches SDD §9.1 — non-quiet modules first (sorted by max severity),
 /// quiet modules last.
-fn print_module_summary(
-    findings: &[Finding],
-    active_modules: &[String],
-    transport_ran: bool,
-    intel_enabled: bool,
-) {
-    let mut known: Vec<&str> = Vec::new();
-    known.extend(crate::passive::known_plugin_names());
-    known.extend(active_modules.iter().map(|s| s.as_str()));
-    if transport_ran {
-        known.extend(crate::tls::known_plugin_names());
-    }
-    if intel_enabled {
-        known.extend(crate::intel::known_plugin_names());
-    }
-
-    let summaries = crate::types::summarize_modules(findings, &known);
+fn print_module_summary_from_modules(summaries: &[ModuleSummary]) {
     if summaries.is_empty() {
         return;
     }
 
     println!("\n{}", "  MODULES".bright_white().bold());
     println!("{}", "─".repeat(60).dimmed());
-    for s in &summaries {
+    for s in summaries {
         let marker = if s.quiet {
             "·".dimmed()
         } else {
@@ -545,6 +555,27 @@ fn print_module_summary(
         );
     }
     println!("{}", "─".repeat(60).dimmed());
+}
+
+/// Compute the module roll-up contract for both:
+/// - CLI `MODULES` printing
+/// - JSON `Report.modules[]` serialization
+fn compute_module_summaries(
+    findings: &[Finding],
+    active_modules: &[String],
+    transport_ran: bool,
+    intel_enabled: bool,
+) -> Vec<ModuleSummary> {
+    let mut known: Vec<&str> = Vec::new();
+    known.extend(crate::passive::known_plugin_names());
+    known.extend(active_modules.iter().map(|s| s.as_str()));
+    if transport_ran {
+        known.extend(crate::tls::known_plugin_names());
+    }
+    if intel_enabled {
+        known.extend(crate::intel::known_plugin_names());
+    }
+    crate::types::summarize_modules(findings, &known)
 }
 
 /// Emit one `ScanEvent::ModuleRan` per known module after a phase finishes.

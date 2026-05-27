@@ -1,0 +1,17 @@
+{
+  "Results": [
+    {
+      "Target": "Cargo.lock",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2024-1234",
+          "PkgName": "openssl",
+          "InstalledVersion": "1.1.1",
+          "Severity": "HIGH",
+          "Title": "OpenSSL vulnerability",
+          "Description": "Example CVE for fixture tests."
+        }
+      ]
+    }
+  ]
+}

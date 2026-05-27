@@ -12,6 +12,14 @@ pub enum Severity {
     Critical,
 }
 
+/// Optional code location for static-analysis findings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeLocation {
+    pub file: String,
+    pub line_start: u32,
+    pub line_end: Option<u32>,
+}
+
 impl std::fmt::Display for Severity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -51,6 +59,14 @@ pub struct Finding {
     pub cwe: Option<u32>,
     pub owasp_category: Option<String>,
     pub plugin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<CodeLocation>,
+    #[serde(default)]
+    pub correlated_with: Vec<String>,
+    #[serde(default)]
+    pub poc_validated: bool,
     pub found_at: DateTime<Utc>,
 }
 
@@ -75,8 +91,22 @@ impl Finding {
             cwe: None,
             owasp_category: None,
             plugin: plugin.into(),
+            source_tool: None,
+            location: None,
+            correlated_with: Vec::new(),
+            poc_validated: false,
             found_at: Utc::now(),
         }
+    }
+
+    pub fn with_source_tool(mut self, tool: impl Into<String>) -> Self {
+        self.source_tool = Some(tool.into());
+        self
+    }
+
+    pub fn with_location(mut self, location: CodeLocation) -> Self {
+        self.location = Some(location);
+        self
     }
 
     pub fn with_parameter(mut self, param: impl Into<String>) -> Self {
