@@ -22,3 +22,4 @@ pub mod tls;
 pub mod tools;
 pub mod tui;
 pub mod types;
+pub mod verify;

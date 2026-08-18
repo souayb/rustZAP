@@ -80,7 +80,9 @@ RUN pip3 install --root-user-action=ignore \
 # official apt repo — all driven by scripts/install-tools.sh so host and
 # container installs stay in lockstep.
 COPY scripts/install-tools.sh /usr/local/bin/install-tools.sh
-RUN chmod +x /usr/local/bin/install-tools.sh \
+# RUN chmod +x /usr/local/bin/install-tools.sh \
+RUN sed -i 's|^#!/bin/bash$|#!/usr/bin/env bash|' /usr/local/bin/install-tools.sh \
+    && chmod +x /usr/local/bin/install-tools.sh \
     && apt-get update \
     && /usr/local/bin/install-tools.sh --yes --skip-update \
     && apt-get clean \

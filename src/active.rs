@@ -112,9 +112,17 @@ impl ActiveScanner {
                 let findings = plugin.scan(&self.client, du).await;
                 if !findings.is_empty() {
                     for f in &findings {
+                        let tag = if f.poc_validated {
+                            "[confirmed]".green().to_string()
+                        } else {
+                            format!("[{}]", f.confidence.to_string().to_lowercase())
+                                .dimmed()
+                                .to_string()
+                        };
                         println!(
-                            "  {} {} — {}",
+                            "  {} {} {} — {}",
                             f.severity.color_str(),
+                            tag,
                             f.title.bright_white().bold(),
                             f.url.dimmed()
                         );
@@ -240,31 +248,51 @@ impl ScanPlugin for XssPlugin {
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         let mut findings = Vec::new();
 
-        let payloads = vec![
-            r#"<script>alert('XSS')</script>"#,
-            r#""><img src=x onerror=alert(1)>"#,
-            r#"javascript:alert(1)"#,
-            r#"'><svg/onload=alert(1)>"#,
+        // A unique per-request marker means a reflection cannot come from
+        // unrelated page text — and the surrounding HTML metacharacters must
+        // survive intact (unencoded) to prove an injectable context.
+        let token = crate::verify::rand_token(8);
+
+        // Each payload embeds the token inside characters that a vulnerable app
+        // would echo raw. We then look for the *raw* breakout marker: an
+        // entity-encoded reflection (`&lt;`) will not match and is not XSS.
+        let breakouts: Vec<(String, String)> = vec![
+            (
+                format!("<rz{tok}>x</rz{tok}>", tok = token),
+                format!("<rz{tok}>x</rz{tok}>", tok = token),
+            ),
+            (
+                format!("\"><svg/onload=rz{tok}()>", tok = token),
+                format!("<svg/onload=rz{tok}()>", tok = token),
+            ),
+            (
+                format!("'><img src=x onerror=rz{tok}()>", tok = token),
+                format!("<img src=x onerror=rz{tok}()>", tok = token),
+            ),
         ];
 
-        for payload in payloads {
+        for (payload, raw_marker) in &breakouts {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 if let Some((_, body)) = get_response_body(client, &url).await {
-                    if body.contains(payload) || body.contains("alert(1)") {
+                    if crate::verify::reflected_raw(&body, raw_marker) {
                         findings.push(
                             Finding::new(
                                 "Reflected Cross-Site Scripting (XSS)",
                                 Severity::High,
                                 &target.url,
-                                "User-supplied input is reflected in the response without encoding, enabling script injection.",
-                                "Encode all user input in HTML context. Implement a Content-Security-Policy.",
+                                "A unique probe injected into this parameter is reflected in the response with its HTML metacharacters unencoded, allowing arbitrary markup/script to execute in the victim's browser.",
+                                "Contextually encode all user input on output. Deploy a strict Content-Security-Policy as defense in depth.",
                                 "active/xss",
                             )
                             .with_parameter(&param)
-                            .with_evidence(format!("Payload '{}' reflected in response", payload))
+                            .with_evidence(format!(
+                                "Probe `{}` reflected unencoded as `{}`",
+                                payload, raw_marker
+                            ))
                             .with_cwe(79)
-                            .with_owasp("A03:2021 – Injection"),
+                            .with_owasp("A03:2021 – Injection")
+                            .confirmed(),
                         );
                         return findings; // one confirmed is enough
                     }
@@ -294,45 +322,63 @@ impl ScanPlugin for SqlInjectionPlugin {
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         let mut findings = Vec::new();
 
-        let error_payloads = vec![
-            (
-                "'",
-                vec![
-                    "You have an error in your SQL syntax",
-                    "ORA-00907",
-                    "Microsoft OLE DB Provider",
-                    "Unclosed quotation mark",
-                    "SQLSTATE",
-                    "pg_query",
-                    "SQLite3::query",
-                    "mysql_num_rows",
-                ],
-            ),
-            ("'--", vec!["error", "syntax"]),
-            ("1 AND 1=2", vec!["error", "syntax"]),
-            ("1' OR '1'='1", vec!["error", "syntax", "warning"]),
+        // Establish a control response. Without it we cannot tell an
+        // injection-triggered DB error from text that is always on the page.
+        let Some(baseline) = crate::verify::Baseline::fetch(client, &target.url).await else {
+            return findings;
+        };
+
+        // Only DB-specific error signatures — never generic words like "error"
+        // or "syntax" that appear on ordinary pages and cause false Criticals.
+        let error_payloads = vec!["'", "\"", "')", "1' OR '1'='1'-- -", "1) OR (1=1-- -"];
+        let db_signatures = [
+            "you have an error in your sql syntax",
+            "warning: mysql_",
+            "mysqli_",
+            "com.mysql.jdbc",
+            "unclosed quotation mark after the character string",
+            "microsoft ole db provider for sql server",
+            "incorrect syntax near",
+            "system.data.sqlclient",
+            "pg_query()",
+            "psqlexception",
+            "unterminated quoted string",
+            "syntax error at or near",
+            "ora-00907",
+            "ora-00933",
+            "ora-01756",
+            "quoted string not properly terminated",
+            "sqlite3::query",
+            "sqlite3.operationalerror",
+            "sqlstate[",
         ];
 
-        for (payload, error_strings) in error_payloads {
+        for payload in error_payloads {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 if let Some((_, body)) = get_response_body(client, &url).await {
                     let body_lower = body.to_lowercase();
-                    for err in &error_strings {
-                        if body_lower.contains(*err) {
+                    for sig in &db_signatures {
+                        // Require the DB error to be NEW vs the baseline — i.e.
+                        // actually provoked by our payload.
+                        if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
                             findings.push(
                                 Finding::new(
-                                    "SQL Injection",
+                                    "SQL Injection (Error-Based)",
                                     Severity::Critical,
                                     &target.url,
-                                    "A SQL injection vulnerability was detected. An attacker could read, modify, or delete database contents.",
+                                    "A malformed SQL payload provoked a database error that is absent from the baseline response, confirming that user input reaches a SQL query unsanitized.",
                                     "Use parameterized queries or prepared statements. Never interpolate user input into SQL.",
                                     "active/sqli",
                                 )
                                 .with_parameter(&param)
-                                .with_evidence(format!("Payload: {} — Error keyword '{}' found in response", payload, err))
+                                .with_evidence(format!(
+                                    "Payload `{}` produced DB error signature `{}` not present in baseline",
+                                    payload, sig
+                                ))
                                 .with_cwe(89)
-                                .with_owasp("A03:2021 – Injection"),
+                                .with_owasp("A03:2021 – Injection")
+                                .confirmed(),
                             );
                             return findings;
                         }
@@ -370,14 +416,21 @@ impl ScanPlugin for PathTraversalPlugin {
             "....//....//etc/passwd",
         ];
 
-        let signatures = ["root:x:0:0", "daemon:x:", "bin:x:", "/bin/bash"];
+        // Require the canonical /etc/passwd shape (root:x:0:0:...:/) rather than
+        // loose fragments, and confirm it is not already on the page.
+        let signatures = ["root:x:0:0:", "daemon:x:1:1:"];
+
+        let Some(baseline) = crate::verify::Baseline::fetch(client, &target.url).await else {
+            return findings;
+        };
 
         for payload in payloads {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 if let Some((_, body)) = get_response_body(client, &url).await {
+                    let body_lower = body.to_lowercase();
                     for sig in &signatures {
-                        if body.contains(sig) {
+                        if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
                             findings.push(
                                 Finding::new(
                                     "Path Traversal — /etc/passwd Readable",
@@ -388,9 +441,10 @@ impl ScanPlugin for PathTraversalPlugin {
                                     "active/path-traversal",
                                 )
                                 .with_parameter(&param)
-                                .with_evidence(format!("Payload: {} — Response contains '{}'", payload, sig))
+                                .with_evidence(format!("Payload: {} — Response contains '{}' (absent from baseline)", payload, sig))
                                 .with_cwe(22)
-                                .with_owasp("A01:2021 – Broken Access Control"),
+                                .with_owasp("A01:2021 – Broken Access Control")
+                                .confirmed(),
                             );
                             return findings;
                         }
@@ -442,7 +496,7 @@ impl ScanPlugin for OpenRedirectPlugin {
                     if (300..=399).contains(&status) {
                         if let Some(loc) = resp.headers().get("location") {
                             let loc_str = loc.to_str().unwrap_or("");
-                            if loc_str.contains("rustzap-canary") || loc_str.starts_with("//") {
+                            if loc_str.contains("rustzap-canary") {
                                 findings.push(
                                     Finding::new(
                                         "Open Redirect",
@@ -455,7 +509,8 @@ impl ScanPlugin for OpenRedirectPlugin {
                                     .with_parameter(&param)
                                     .with_evidence(format!("HTTP {} Location: {}", status, loc_str))
                                     .with_cwe(601)
-                                    .with_owasp("A01:2021 – Broken Access Control"),
+                                    .with_owasp("A01:2021 – Broken Access Control")
+                                    .confirmed(),
                                 );
                                 return findings;
                             }
@@ -487,46 +542,70 @@ impl ScanPlugin for SsrfPlugin {
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         let mut findings = Vec::new();
 
+        let Some(baseline) = crate::verify::Baseline::fetch(client, &target.url).await else {
+            return findings;
+        };
+
         let ssrf_payloads = vec![
             "http://169.254.169.254/latest/meta-data/", // AWS IMDS
             "http://metadata.google.internal/computeMetadata/v1/", // GCP
-            "http://localhost/",
-            "http://127.0.0.1/",
-            "http://[::1]/",
+            "http://100.100.200.200/latest/meta-data/", // Alibaba
         ];
 
+        // Signatures that ONLY appear in the *body* an internal metadata service
+        // returns. We deliberately exclude "localhost"/"127.0.0.1" (the injected
+        // value echoed back) and never use a token that is part of a payload URL
+        // — otherwise a page that merely reflects our input would false-positive.
         let ssrf_indicators = [
             "ami-id",
             "instance-id",
-            "computeMetadata",
+            "instance-action",
             "iam/security-credentials",
-            "localhost",
-            "127.0.0.1",
+            "region-info",
+            "block-device-mapping",
         ];
 
         for payload in ssrf_payloads {
+            let payload_lower = payload.to_lowercase();
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 if let Some((status, body)) = get_response_body(client, &url).await {
-                    if status == 200 {
-                        for indicator in &ssrf_indicators {
-                            if body.contains(indicator) {
-                                findings.push(
-                                    Finding::new(
-                                        "Server-Side Request Forgery (SSRF)",
-                                        Severity::Critical,
-                                        &target.url,
-                                        "The server fetches user-supplied URLs, enabling access to internal services and cloud metadata endpoints.",
-                                        "Validate and sanitize all URL inputs. Implement a server-side allowlist for outbound requests.",
-                                        "active/ssrf",
-                                    )
-                                    .with_parameter(&param)
-                                    .with_evidence(format!("Payload: {} — Response contains '{}'", payload, indicator))
-                                    .with_cwe(918)
-                                    .with_owasp("A10:2021 – Server-Side Request Forgery"),
-                                );
-                                return findings;
-                            }
+                    if status != 200 {
+                        continue;
+                    }
+                    let body_lower = body.to_lowercase();
+                    for indicator in &ssrf_indicators {
+                        // Reflection guard: an indicator that is part of the URL
+                        // we sent is not evidence the server fetched anything.
+                        if payload_lower.contains(indicator) {
+                            continue;
+                        }
+                        // Must be new relative to baseline — proves the content
+                        // came from the fetched metadata endpoint, not the page.
+                        if crate::verify::signature_is_new(
+                            &baseline.body_lower,
+                            &body_lower,
+                            indicator,
+                        ) {
+                            findings.push(
+                                Finding::new(
+                                    "Server-Side Request Forgery (SSRF)",
+                                    Severity::Critical,
+                                    &target.url,
+                                    "The server fetched a user-supplied URL pointing at a cloud metadata endpoint and returned its contents, confirming SSRF with access to internal services.",
+                                    "Validate and sanitize all URL inputs. Enforce a server-side allowlist for outbound requests and block link-local/metadata ranges.",
+                                    "active/ssrf",
+                                )
+                                .with_parameter(&param)
+                                .with_evidence(format!(
+                                    "Payload `{}` returned metadata signature `{}` absent from baseline",
+                                    payload, indicator
+                                ))
+                                .with_cwe(918)
+                                .with_owasp("A10:2021 – Server-Side Request Forgery")
+                                .confirmed(),
+                            );
+                            return findings;
                         }
                     }
                 }
@@ -573,7 +652,7 @@ impl ScanPlugin for XxePlugin {
             .await
         {
             let body = resp.text().await.unwrap_or_default();
-            if body.contains("root:x:0:0") || body.contains("/bin/bash") {
+            if body.contains("root:x:0:0:") {
                 findings.push(
                     Finding::new(
                         "XML External Entity (XXE) Injection",
@@ -583,9 +662,10 @@ impl ScanPlugin for XxePlugin {
                         "Disable external entity processing in your XML parser. Use a JSON API where possible.",
                         "active/xxe",
                     )
-                    .with_evidence("XXE payload successfully read /etc/passwd".to_string())
+                    .with_evidence("XXE payload successfully read /etc/passwd (root:x:0:0: present in response)".to_string())
                     .with_cwe(611)
-                    .with_owasp("A03:2021 – Injection"),
+                    .with_owasp("A03:2021 – Injection")
+                    .confirmed(),
                 );
             }
         }
@@ -612,21 +692,28 @@ impl ScanPlugin for CmdInjectionPlugin {
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         let mut findings = Vec::new();
 
+        // `uid=0(root) gid=0` from `id` is a strong signal; require it to be new
+        // vs baseline so a page that merely prints "uid=" text is not flagged.
         let payloads_and_sigs: Vec<(&str, Vec<&str>)> = vec![
-            ("; id", vec!["uid=", "gid=", "groups="]),
-            ("| id", vec!["uid=", "gid="]),
+            (";id", vec!["uid=", "gid="]),
+            ("|id", vec!["uid=", "gid="]),
             ("`id`", vec!["uid=", "gid="]),
             ("$(id)", vec!["uid=", "gid="]),
-            ("; cat /etc/passwd", vec!["root:x:0:0"]),
-            ("| cat /etc/passwd", vec!["root:x:0:0"]),
+            ("; cat /etc/passwd", vec!["root:x:0:0:"]),
+            ("| cat /etc/passwd", vec!["root:x:0:0:"]),
         ];
+
+        let Some(baseline) = crate::verify::Baseline::fetch(client, &target.url).await else {
+            return findings;
+        };
 
         for (payload, sigs) in payloads_and_sigs {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 if let Some((_, body)) = get_response_body(client, &url).await {
+                    let body_lower = body.to_lowercase();
                     for sig in &sigs {
-                        if body.contains(sig) {
+                        if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
                             findings.push(
                                 Finding::new(
                                     "OS Command Injection",
@@ -637,9 +724,10 @@ impl ScanPlugin for CmdInjectionPlugin {
                                     "active/cmd-injection",
                                 )
                                 .with_parameter(&param)
-                                .with_evidence(format!("Payload '{}' — Response contains '{}'", payload, sig))
+                                .with_evidence(format!("Payload '{}' — Response contains '{}' (absent from baseline)", payload, sig))
                                 .with_cwe(78)
-                                .with_owasp("A03:2021 – Injection"),
+                                .with_owasp("A03:2021 – Injection")
+                                .confirmed(),
                             );
                             return findings;
                         }
@@ -670,33 +758,65 @@ impl ScanPlugin for SstiPlugin {
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
         let mut findings = Vec::new();
 
-        // We inject math expressions that different template engines evaluate
-        let probes: Vec<(&str, &str)> = vec![
-            ("{{7*7}}", "49"),
-            ("${7*7}", "49"),
-            ("<%= 7*7 %>", "49"),
-            ("#{7*7}", "49"),
-            ("*{7*7}", "49"),
+        let Some(baseline) = crate::verify::Baseline::fetch(client, &target.url).await else {
+            return findings;
+        };
+
+        // Use two random 4-digit operands so the product is a distinctive
+        // 7–8 digit number that is astronomically unlikely to already exist on
+        // the page (unlike the classic 7*7=49, which matches prices/IDs/years).
+        let a: u32 = 2000
+            + (crate::verify::rand_token(4)
+                .bytes()
+                .map(|b| b as u32)
+                .sum::<u32>()
+                % 7000);
+        let b: u32 = 2000
+            + (crate::verify::rand_token(4)
+                .bytes()
+                .map(|b| b as u32)
+                .sum::<u32>()
+                % 7000);
+        let expected = (a as u64 * b as u64).to_string();
+        let expr = format!("{}*{}", a, b);
+
+        // Template-engine-specific delimiters wrapping the same arithmetic.
+        let probes: Vec<String> = vec![
+            format!("{{{{{}}}}}", expr), // Jinja2/Twig  {{a*b}}
+            format!("${{{}}}", expr),    // FreeMarker/JSP EL  ${a*b}
+            format!("<%= {} %>", expr),  // ERB
+            format!("#{{{}}}", expr),    // Ruby/Thymeleaf  #{a*b}
+            format!("*{{{}}}", expr),    // Thymeleaf  *{a*b}
         ];
 
-        for (payload, expected) in probes {
+        for payload in &probes {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 if let Some((_, body)) = get_response_body(client, &url).await {
-                    if body.contains(expected) && !body.contains(payload) {
+                    // Confirmed only if: the product appears, the raw expression
+                    // did NOT (so it was evaluated, not echoed), and the product
+                    // was not already in the baseline.
+                    let evaluated = body.contains(&expected)
+                        && !body.contains(payload)
+                        && !baseline.body.contains(&expected);
+                    if evaluated {
                         findings.push(
                             Finding::new(
                                 "Server-Side Template Injection (SSTI)",
                                 Severity::Critical,
                                 &target.url,
-                                "User input is embedded directly into a template, allowing expression evaluation and potentially remote code execution.",
-                                "Never pass user input directly into template strings. Use template sandboxing or a logic-less template engine.",
+                                "A randomized arithmetic expression injected into this parameter was evaluated server-side, proving user input reaches a template engine — a path to remote code execution.",
+                                "Never pass user input into template source. Use a logic-less/sandboxed template engine and pass data as bound variables.",
                                 "active/ssti",
                             )
                             .with_parameter(&param)
-                            .with_evidence(format!("Payload '{}' evaluated to '{}'", payload, expected))
+                            .with_evidence(format!(
+                                "Payload `{}` evaluated to `{}` ({}×{}), absent from baseline",
+                                payload, expected, a, b
+                            ))
                             .with_cwe(94)
-                            .with_owasp("A03:2021 – Injection"),
+                            .with_owasp("A03:2021 – Injection")
+                            .confirmed(),
                         );
                         return findings;
                     }

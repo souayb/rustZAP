@@ -12,6 +12,34 @@ pub enum Severity {
     Critical,
 }
 
+/// How much trust to place in a finding. This is what stops the scanner from
+/// "self-validating": active checks only claim `Confirmed` when a payload's
+/// effect was verified against a baseline (see `crate::verify`). Weaker
+/// heuristics report `Tentative` so triagers know to hand-verify.
+#[derive(
+    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    /// Requires manual verification; emitted on a weak/heuristic signal.
+    Tentative,
+    /// Strong signal but not independently reproduced.
+    #[default]
+    Firm,
+    /// Verified against a baseline differential / unique canary.
+    Confirmed,
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Confidence::Tentative => write!(f, "TENTATIVE"),
+            Confidence::Firm => write!(f, "FIRM"),
+            Confidence::Confirmed => write!(f, "CONFIRMED"),
+        }
+    }
+}
+
 /// Optional code location for static-analysis findings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeLocation {
@@ -67,6 +95,9 @@ pub struct Finding {
     pub correlated_with: Vec<String>,
     #[serde(default)]
     pub poc_validated: bool,
+    /// Trust level for this finding. See `Confidence`.
+    #[serde(default)]
+    pub confidence: Confidence,
     pub found_at: DateTime<Utc>,
 }
 
@@ -95,6 +126,7 @@ impl Finding {
             location: None,
             correlated_with: Vec::new(),
             poc_validated: false,
+            confidence: Confidence::Firm,
             found_at: Utc::now(),
         }
     }
@@ -126,6 +158,26 @@ impl Finding {
 
     pub fn with_owasp(mut self, category: impl Into<String>) -> Self {
         self.owasp_category = Some(category.into());
+        self
+    }
+
+    pub fn with_confidence(mut self, confidence: Confidence) -> Self {
+        self.confidence = confidence;
+        self
+    }
+
+    /// Mark a finding as verified against a baseline / unique canary. Sets both
+    /// the machine flag (`poc_validated`) and `Confidence::Confirmed`.
+    pub fn confirmed(mut self) -> Self {
+        self.poc_validated = true;
+        self.confidence = Confidence::Confirmed;
+        self
+    }
+
+    /// Mark a finding as a heuristic that needs manual verification.
+    pub fn tentative(mut self) -> Self {
+        self.poc_validated = false;
+        self.confidence = Confidence::Tentative;
         self
     }
 }

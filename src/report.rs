@@ -121,13 +121,16 @@ impl Report {
     }
 
     pub async fn save_csv(&self, path: &str) -> Result<()> {
-        let mut csv = String::from("ID,Title,Severity,URL,Parameter,CWE,Plugin\n");
+        let mut csv =
+            String::from("ID,Title,Severity,Confidence,Validated,URL,Parameter,CWE,Plugin\n");
         for f in &self.findings {
             let row = format!(
-                "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"\n",
+                "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"\n",
                 f.id,
                 f.title.replace('"', "\"\""),
                 f.severity,
+                f.confidence,
+                f.poc_validated,
                 f.url.replace('"', "\"\""),
                 f.parameter.as_deref().unwrap_or(""),
                 f.cwe.unwrap_or(0),
@@ -150,7 +153,7 @@ impl Report {
             self.summary.total_findings, self.summary.risk_score
         ));
 
-        html.push_str("<table><tr><th>Severity</th><th>Title</th><th>URL</th><th>Parameter</th><th>Description</th></tr>");
+        html.push_str("<table><tr><th>Severity</th><th>Confidence</th><th>Title</th><th>URL</th><th>Parameter</th><th>Description</th></tr>");
         for f in &self.findings {
             let color = match f.severity {
                 Severity::Critical => "magenta",
@@ -159,10 +162,16 @@ impl Report {
                 Severity::Low => "blue",
                 Severity::Info => "gray",
             };
+            let confidence = if f.poc_validated {
+                format!("{} ✓", f.confidence)
+            } else {
+                f.confidence.to_string()
+            };
             html.push_str(&format!(
-                "<tr><td style='color: {}'><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td style='color: {}'><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 color,
                 f.severity,
+                confidence,
                 f.title,
                 f.url,
                 f.parameter.as_deref().unwrap_or("-"),
@@ -210,6 +219,7 @@ mod tests {
             }),
             correlated_with: vec![],
             poc_validated: false,
+            confidence: crate::types::Confidence::Firm,
             found_at: chrono::Utc::now(),
         };
 

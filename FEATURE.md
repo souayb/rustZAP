@@ -15,6 +15,27 @@ This document tracks **DAST / passive / discovery** ideas and what is still open
 
 Stable `plugin` strings (e.g. `passive/security-txt`, `active/sqli-error`) are part of the JSON contract.
 
+### Evidence & confidence model (anti false-positive)
+
+Active plugins must **prove** a payload caused the observed behavior rather than
+self-validate on a weak substring match. Shared primitives live in `src/verify.rs`:
+
+- **Baseline differential** — `Baseline::fetch` + `signature_is_new`: a DB
+  error / metadata token only counts when it is *absent from the untouched
+  response* and *appears after injection*.
+- **Unique canaries** — `rand_token`: XSS/SSTI probes embed a per-request nonce
+  so a match cannot come from unrelated page text.
+- **Reflection guards** — raw (unencoded) reflection for XSS; indicators that
+  are part of the injected URL are rejected for SSRF.
+- **Content similarity** — `body_similarity`: boolean-blind SQLi compares
+  response *structure* against the baseline and requires a reproduced TRUE/FALSE gap.
+
+Every `Finding` now carries `confidence` (`tentative`/`firm`/`confirmed`) and
+`poc_validated`. Baseline/canary-verified findings are `confirmed`; heuristics
+that need human follow-up (e.g. dispatched OOB payloads) are `tentative`.
+`active/sqli-oob` is inert unless a listener domain is supplied via
+`RUSTZAP_OOB_DOMAIN`, since OOB can only be confirmed by an external callback.
+
 ---
 
 ## Implemented (verified in tree)

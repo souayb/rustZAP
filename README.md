@@ -330,6 +330,14 @@ rustzap plugins
 
 ## Active Scan Plugins
 
+> **Evidence-based, no self-validation.** Active plugins verify that a payload —
+> not the page's normal content — caused the observed behavior before reporting.
+> They fetch an untouched **baseline**, inject **unique canaries**, and only
+> conclude when a DB error / metadata token / evaluated expression is *new
+> relative to the baseline* (or a reflection survives **unencoded**). Every
+> finding carries a `confidence` (`tentative` / `firm` / `confirmed`) and a
+> `poc_validated` flag in JSON, CSV, and HTML output. See `src/verify.rs`.
+
 | Plugin | Vuln | OWASP | CWE |
 |---|---|---|---|
 | `xss` | Reflected XSS | A03:2021 | CWE-79 |
@@ -339,8 +347,8 @@ rustzap plugins
 | `sqli-time` | Time-based blind SQLi — SLEEP/WAITFOR/pg_sleep timing oracle | A03:2021 | CWE-89 |
 | `sqli-union` | UNION-based SQLi — column count probe + canary reflection | A03:2021 | CWE-89 |
 | `sqli-stacked` | Stacked queries — semicolon-separated secondary statement | A03:2021 | CWE-89 |
-| `sqli-oob` | Out-of-band SQLi — DNS/HTTP callback payload (detect only) | A03:2021 | CWE-89 |
-| `sqli-second-order` | Second-order SQLi — store payload, detect unsafe retrieval | A03:2021 | CWE-89 |
+| `sqli-oob` | Out-of-band SQLi — dispatches DNS/HTTP callback payloads. **Inert unless `RUSTZAP_OOB_DOMAIN` names a listener** (interactsh/Collaborator); reported `tentative` until you observe a callback | A03:2021 | CWE-89 |
+| `sqli-second-order` | Second-order SQLi — stores a payload, then confirms via a DB error that surfaces on retrieval (baseline-differential) | A03:2021 | CWE-89 |
 | `sqli-waf-bypass` | WAF bypass SQLi — comment, encoding, case, whitespace tricks | A03:2021 | CWE-89 |
 | `nosql` | NoSQL injection — MongoDB $ne/$gt/$where/$regex operator injection | A03:2021 | CWE-943 |
 | `sqli-fingerprint` | DB fingerprinting via SQLi — identify MySQL/PG/MSSQL/Oracle/SQLite | A05:2021 | CWE-200 |
