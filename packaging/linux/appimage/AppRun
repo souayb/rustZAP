@@ -1,0 +1,9 @@
+#!/bin/sh
+# AppImage entrypoint. Resolves paths relative to itself so it works no
+# matter where the AppImage is mounted, then execs the real binary — a CLI
+# tool needs no splash screen or GUI bootstrap, just PATH/LD_LIBRARY_PATH setup.
+set -e
+HERE="$(dirname "$(readlink -f "${0}")")"
+export PATH="${HERE}/usr/bin:${PATH}"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH:-}"
+exec "${HERE}/usr/bin/rustzap" "$@"

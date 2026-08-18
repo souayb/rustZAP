@@ -50,12 +50,45 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 
 ## Installation
 
+### Prebuilt installers (Linux / Windows / macOS)
+
+Every tagged release publishes native installers for all three OSes, built by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) — see
+[`packaging/README.md`](packaging/README.md) for how they're built and their
+current signing status.
+
+| OS | Formats |
+|---|---|
+| Linux | `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL), `AppImage` (portable) — x86_64 and arm64 |
+| Windows | `.exe` installer (Inno Setup) — x86_64 |
+| macOS | `.dmg` (universal2: Apple Silicon + Intel) |
+
+Download from the [Releases page](https://github.com/souayb/rustZAP/releases),
+verify against the release's `SHA256SUMS`, then install:
+
+```bash
+# Linux
+sudo apt install ./rustzap-<version>-linux-amd64.deb      # Debian/Ubuntu
+sudo dnf install ./rustzap-<version>-linux-x86_64.rpm      # Fedora/RHEL
+chmod +x rustzap-<version>-linux-x86_64.AppImage && ./rustzap-<version>-linux-x86_64.AppImage   # portable
+
+# macOS
+open rustzap-<version>-macos-universal.dmg   # then run Install.command, or drag `rustzap` onto your PATH
+```
+
+```powershell
+# Windows — run the downloaded rustzap-<version>-windows-x64.exe
+```
+
+A Homebrew formula is also generated per release (`packaging/homebrew/`); see
+`packaging/README.md` for its current publishing status.
+
 ### From source
 
 ```bash
 # Requires Rust 1.75+
-git clone https://github.com/you/rustzap
-cd rustzap
+git clone https://github.com/souayb/rustZAP
+cd rustZAP
 cargo build --release
 ./target/release/rustzap --help
 ```

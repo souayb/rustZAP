@@ -1,0 +1,27 @@
+# Homebrew formula template for RustZAP.
+# Filled in by scripts/packaging/generate-homebrew-formula.sh from the tagged
+# release tarball's real sha256 — never hand-edit the placeholder tokens below.
+#
+# Builds from source via cargo rather than downloading a prebuilt binary:
+# it's the standard, lowest-maintenance pattern for a Homebrew Rust CLI and
+# avoids needing per-platform prebuilt-binary URLs to exist before this
+# formula can be published.
+class Rustzap < Formula
+  desc "Web application security scanner inspired by OWASP ZAP"
+  homepage "https://github.com/souayb/rustZAP"
+  url "https://github.com/souayb/rustZAP/archive/refs/tags/v@@VERSION@@.tar.gz"
+  sha256 "@@SHA256@@"
+  license "MIT"
+  head "https://github.com/souayb/rustZAP.git", branch: "main"
+
+  depends_on "rust" => :build
+
+  def install
+    system "cargo", "install", *std_cargo_args
+  end
+
+  test do
+    assert_match "rustzap #{version}", shell_output("#{bin}/rustzap --version")
+    assert_match "plugins", shell_output("#{bin}/rustzap --help")
+  end
+end

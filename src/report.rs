@@ -87,7 +87,7 @@ impl Report {
         Report {
             meta: ReportMeta {
                 scanner: "RustZAP".to_string(),
-                version: "0.1.0".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 target: target.to_string(),
                 scan_date: Utc::now().to_rfc3339(),
                 duration_secs: elapsed.as_secs_f64(),

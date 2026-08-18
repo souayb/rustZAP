@@ -5,6 +5,8 @@ edition = "2021"
 description = "A Rust-based web application security scanner inspired by OWASP ZAP"
 authors = ["RustZAP Contributors"]
 license = "MIT"
+repository = "https://github.com/souayb/rustZAP"
+homepage = "https://github.com/souayb/rustZAP"
 
 [[bin]]
 name = "rustzap"
@@ -75,6 +77,43 @@ x509-parser = "0.16"
 opt-level = 3
 lto = true
 codegen-units = 1
+# Smaller release binaries, and lets Cargo strip via rustc instead of shelling
+# out to the platform `strip` — avoids cargo-deb's cross-platform strip-flag
+# mismatch (macOS `strip` rejects GNU's `--strip-unneeded`).
+strip = true
 
 [dev-dependencies]
 serde_json = "1"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Linux packaging metadata (see .claude/skills/cross-platform-installer and
+# packaging/README.md). Version, description, license, and authors above are
+# the single source of truth — cargo-deb / cargo-generate-rpm read them
+# directly and only the fields below need to be package-format-specific.
+# ─────────────────────────────────────────────────────────────────────────
+
+[package.metadata.deb]
+maintainer = "RustZAP Contributors <noreply@rustzap.dev>"
+copyright = "2026, RustZAP Contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+RustZAP is a web application security scanner inspired by OWASP ZAP: spider, \
+passive analysis, active plugins, an intercepting proxy, a stress tester, and \
+a TUI console — with an optional installer for companion pentest tooling."""
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/rustzap", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/rustzap/README.md", "644"],
+    ["LICENSE", "usr/share/doc/rustzap/LICENSE", "644"],
+    ["packaging/linux/appimage/rustzap.desktop", "usr/share/applications/rustzap.desktop", "644"],
+]
+
+[package.metadata.generate-rpm]
+license = "MIT"
+assets = [
+    { source = "target/release/rustzap", dest = "/usr/bin/rustzap", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/rustzap/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/rustzap/LICENSE", mode = "644", doc = true },
+]

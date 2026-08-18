@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=RustZAP
+GenericName=Web Security Scanner
+Comment=Web application security scanner inspired by OWASP ZAP
+Exec=rustzap %F
+Icon=rustzap
+Categories=Development;Security;Network;
+Terminal=true
+StartupNotify=false

@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "rustzap",
     about = "A fast, fearless web application security scanner",
-    version = "0.1.0"
+    version = env!("CARGO_PKG_VERSION")
 )]
 struct Cli {
     #[command(subcommand)]

@@ -1,0 +1,184 @@
+name: release
+
+# Triggered by a version tag (v0.1.0, v1.2.3, ...). The tag is the single
+# release trigger; the version number itself always comes from Cargo.toml
+# (see scripts/packaging/version.sh) — the "version" job below fails the
+# whole run if the tag and Cargo.toml disagree, so they can never drift.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Validate: one canonical version, tests pass, before any packaging work ──
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -euo pipefail
+          CARGO_VERSION="$(bash scripts/packaging/version.sh)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::tag v${TAG_VERSION} does not match Cargo.toml version ${CARGO_VERSION}"
+              exit 1
+            fi
+          fi
+          echo "version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+      - run: cargo test --workspace
+
+  # ── Linux: .deb + .rpm + AppImage, x86_64 and arm64, on native runners ──
+  linux:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} --bin rustzap
+      - name: Install packaging tools
+        run: |
+          cargo install cargo-deb cargo-generate-rpm --locked
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse libfuse2 || true
+      - run: mkdir -p dist
+      - name: Build .deb
+        run: cargo deb --no-build --target ${{ matrix.target }} -o dist/
+      - name: Build .rpm
+        # cargo-generate-rpm, unlike cargo-deb, does not create -o's directory itself.
+        run: cargo generate-rpm --target ${{ matrix.target }} -o dist/
+      - name: Rename Linux packages to the standard naming scheme
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          A="${{ matrix.arch }}"
+          # cargo-deb uses dpkg arch names (amd64/arm64); normalize ours to match.
+          DEB_ARCH="amd64"; [ "$A" = "aarch64" ] && DEB_ARCH="arm64"
+          mv dist/*.deb "dist/rustzap-${V}-linux-${DEB_ARCH}.deb"
+          mv dist/*.rpm "dist/rustzap-${V}-linux-${A}.rpm"
+      - name: Build AppImage
+        run: bash scripts/packaging/build-appimage.sh ${{ matrix.target }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  # ── Windows: .exe via Inno Setup, x86_64 ──
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo build --release --target x86_64-pc-windows-msvc --bin rustzap
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            /DAppVersion=${{ needs.version.outputs.version }} `
+            packaging\windows\rustzap.iss
+        shell: pwsh
+      # TODO once a real Authenticode certificate is available as a CI secret:
+      #   signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 /f cert.pfx /p %PFX_PASSWORD% dist\*.exe
+      # Never invented here — unsigned until WINDOWS_PFX/WINDOWS_PFX_PASSWORD secrets exist.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+
+  # ── macOS: Universal 2 .dmg (arm64 + x86_64 cross-built on an arm64 runner) ──
+  macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build, sign, and package
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_PROFILE: ${{ secrets.MACOS_NOTARY_PROFILE }}
+        run: |
+          set -euo pipefail
+          # Import the Developer ID cert into a temp keychain when the secret is
+          # present; otherwise build-macos.sh falls back to ad-hoc signing and
+          # says so explicitly (never invents a certificate).
+          if [ -n "${{ secrets.MACOS_CERT_P12_BASE64 }}" ]; then
+            KEYCHAIN="build.keychain"
+            security create-keychain -p actions "$KEYCHAIN"
+            security default-keychain -s "$KEYCHAIN"
+            security unlock-keychain -p actions "$KEYCHAIN"
+            echo "${{ secrets.MACOS_CERT_P12_BASE64 }}" | base64 --decode > cert.p12
+            security import cert.p12 -k "$KEYCHAIN" -P "${{ secrets.MACOS_CERT_P12_PASSWORD }}" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions "$KEYCHAIN"
+            rm -f cert.p12
+          fi
+          bash scripts/packaging/build-macos.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+
+  # ── Collect, checksum, structurally validate, then publish ──
+  publish:
+    needs: [version, linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: bash .claude/skills/cross-platform-installer/scripts/gen-checksums.sh dist
+      - name: Validate every artifact
+        run: |
+          set -euo pipefail
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *SHA256SUMS) continue;; esac
+            bash .claude/skills/cross-platform-installer/scripts/verify-installer.sh "$f" \
+              --expect-version "${{ needs.version.outputs.version }}"
+          done
+      - name: Record build info (reproducibility)
+        run: |
+          cat > dist/build-info.json <<EOF
+          {
+            "version": "${{ needs.version.outputs.version }}",
+            "git_commit": "${{ github.sha }}",
+            "workflow_run": "${{ github.run_id }}"
+          }
+          EOF
+      - name: Generate Homebrew formula
+        run: bash scripts/packaging/generate-homebrew-formula.sh dist/rustzap.rb || \
+          echo "::warning::Homebrew formula generation skipped (tag not yet published to GitHub, or network error) — run scripts/packaging/generate-homebrew-formula.sh manually after this release publishes."
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
