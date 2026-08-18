@@ -1,0 +1,24 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Demo API", "version": "1.0.0" },
+  "paths": {
+    "/users/{id}": {
+      "get": {
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "verbose", "in": "query", "schema": { "type": "boolean" } }
+        ]
+      }
+    },
+    "/health": {
+      "get": {}
+    },
+    "/search": {
+      "get": {
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string" } }
+        ]
+      }
+    }
+  }
+}

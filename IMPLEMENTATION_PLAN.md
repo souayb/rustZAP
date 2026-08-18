@@ -317,26 +317,28 @@ Minimum: SARIF 2.1 `runs[].results[]` from `Finding` with regions from `CodeLoca
 
 ## Phase 3 — OpenAPI/HAR, Nuclei, DAST depth
 
-### 3.1 OpenAPI import (**Planned**)
+### 3.1 OpenAPI import (**Done**)
 
-- New CLI flags on `scan`: `--openapi-path` or `--openapi-url` (fetch once).
-- Parse operations → synthetic `DiscoveredUrl` rows withmethod + path template + parameter names.
-- **Plugin IDs**: discovery-only findings optional `passive/openapi-import` info finding.
+- CLI: `--openapi-path` / `--openapi-url` on `scan`.
+- `src/openapi.rs` → synthetic `DiscoveredUrl` (`UrlSource::OpenApi`) + info finding `passive/openapi-import`.
+- Path templates filled with placeholder `1`; query param names appended so active plugins see `?`.
 
-### 3.2 HAR replay (**Planned**)
+### 3.2 HAR replay (**Done**)
 
-- `--har-path recording.har` → extract unique requests (host filter = target origin); enqueue as spider seeds or direct active targets.
-- Respect **allowlist**: only same-origin as `--target`.
+- CLI: `--har-path recording.har`.
+- `src/har.rs` → same-origin filter vs `--target`; `UrlSource::Har`; dedupe method+URL.
 
-### 3.3 Nuclei (**Planned**)
+### 3.3 Nuclei (**Done**, opt-in)
 
-- Opt-in `--nuclei` or plugin substring `nuclei` spawning `nuclei -u <target>` with `-jsonl` export.
-- Map lines to findings `active/nuclei/<template-id>` capped rate.
+- CLI: `--nuclei` (spawn) or `--nuclei-jsonl` (fixture/CI).
+- `src/nuclei.rs` → findings `active/nuclei/<template-id>`; never default-on.
+- README warns on authorized scope only.
 
 ### 3.4 Phase 3 acceptance checklist
 
-- [ ] Documented Juice-Shop or local lab example for OpenAPI + scan.
-- [ ] Nuclei behind explicit flag; README warns on scope.
+- [x] OpenAPI + HAR + Nuclei parsers covered by unit/fixture tests (`tests/phase3_import.rs`, `tests/fixtures/*`).
+- [x] Nuclei behind explicit flag; README warns on scope.
+- [ ] Optional: Juice-Shop lab walkthrough with a real OpenAPI file (manual).
 
 ---
 

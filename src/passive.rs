@@ -104,6 +104,32 @@ impl PassiveScanner {
     }
 }
 
+/// Run all per-URL passive checks on a captured HTTP response (no network I/O).
+///
+/// Used by golden/integration tests (`tests/passive_golden.rs`) and mirrors
+/// `PassiveScanner::check_url` without fetching the URL.
+pub fn check_response_passive(
+    url: &str,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    findings.extend(check_missing_security_headers(url, headers));
+    findings.extend(check_insecure_cookies(url, headers));
+    findings.extend(check_information_disclosure(url, headers, body));
+    findings.extend(check_content_type(url, headers));
+    findings.extend(check_mixed_content(url, body));
+    findings.extend(check_sensitive_data_exposure(url, body));
+    findings.extend(check_error_messages(url, status, body));
+    findings.extend(check_cache_control(url, headers));
+    findings.extend(check_cors(url, headers));
+    findings.extend(check_csp_policy(url, headers));
+    findings.extend(check_tech_fingerprint(url, headers, body));
+    findings.extend(check_jwt_surface(url, body));
+    findings
+}
+
 /// Check for missing HTTP security headers
 fn check_missing_security_headers(url: &str, headers: &reqwest::header::HeaderMap) -> Vec<Finding> {
     let mut findings = Vec::new();

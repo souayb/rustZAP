@@ -255,6 +255,11 @@ pub async fn run_audit_cli(
             basic_auth: None,
             insecure,
             plugins: plugins.split(',').map(|s| s.trim().to_string()).collect(),
+            openapi_path: None,
+            openapi_url: None,
+            har_path: None,
+            nuclei: false,
+            nuclei_jsonl: None,
         };
         let collected = collect_scan(scan_config).await?;
         findings.extend(collected.findings);

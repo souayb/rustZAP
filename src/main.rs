@@ -1,29 +1,9 @@
-mod active;
-mod analyze;
-mod correlate;
-mod events;
-mod installer;
-mod intel;
-mod passive;
-mod proxy;
-mod report;
-mod sarif;
-mod scanner;
-mod sensitive_paths;
-mod spider;
-mod sqli_advanced;
-mod stress;
-mod tls;
-mod tools;
-mod tui;
-mod types;
-
 use clap::{Parser, Subcommand};
 use colored::*;
+use rustzap::scanner::ScanConfig;
+use rustzap::stress::StressCliArgs;
+use rustzap::{active, analyze, installer, passive, proxy, scanner, spider, stress, tui};
 use tracing_subscriber::EnvFilter;
-
-use crate::scanner::ScanConfig;
-use crate::stress::StressCliArgs;
 
 /// RustZAP - OWASP ZAP-inspired web security scanner written in Rust
 #[derive(Parser)]
@@ -77,6 +57,21 @@ enum Commands {
             default_value = "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain"
         )]
         plugins: String,
+        /// Import OpenAPI 3.x JSON from a local file (expands paths into scan surface)
+        #[arg(long)]
+        openapi_path: Option<String>,
+        /// Fetch OpenAPI 3.x JSON from a URL once
+        #[arg(long)]
+        openapi_url: Option<String>,
+        /// Import same-origin requests from a HAR recording
+        #[arg(long)]
+        har_path: Option<String>,
+        /// Opt-in: run ProjectDiscovery Nuclei against the target (requires `nuclei` on PATH)
+        #[arg(long)]
+        nuclei: bool,
+        /// Opt-in: parse existing Nuclei `-jsonl` output (no spawn)
+        #[arg(long)]
+        nuclei_jsonl: Option<String>,
     },
 
     /// Run spider only
@@ -348,6 +343,11 @@ async fn main() -> anyhow::Result<()> {
             basic_auth,
             insecure,
             plugins,
+            openapi_path,
+            openapi_url,
+            har_path,
+            nuclei,
+            nuclei_jsonl,
         } => {
             let config = ScanConfig {
                 target_url: target,
@@ -364,6 +364,11 @@ async fn main() -> anyhow::Result<()> {
                 basic_auth,
                 insecure,
                 plugins: plugins.split(',').map(|s| s.trim().to_string()).collect(),
+                openapi_path,
+                openapi_url,
+                har_path,
+                nuclei,
+                nuclei_jsonl,
             };
             scanner::run_scan(config).await?;
         }

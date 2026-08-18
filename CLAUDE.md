@@ -37,7 +37,7 @@ Before saying work is complete:
 cargo test
 ```
 
-(There may be few or no tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers and report serialization. See `FEATURE.md` backlog item **D2** (passive golden matrix).)
+(There are **94** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
 
 ### Smoke run (after build)
 
@@ -177,6 +177,7 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 | Full scan | `cargo run -- scan --target URL --plugins xss,sqli -o out.json` |
 | SARIF (Code Scanning) | `cargo run -- scan --target URL -o out.sarif` or `--sarif-out out.sarif` |
 | Analyze / audit | `cargo run -- analyze --repo . --tools semgrep,trivy,gitleaks -o a.json` · `cargo run -- audit --repo . --target URL …` |
+| OpenAPI / HAR / Nuclei | `cargo run -- scan --target URL --openapi-path oas.json` · `--har-path rec.har` · `--nuclei` / `--nuclei-jsonl` (opt-in) |
 | Spider only | `cargo run -- spider --target URL` |
 | TUI | `cargo run -- tui` or bare `cargo run` |
 

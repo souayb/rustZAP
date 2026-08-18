@@ -163,6 +163,11 @@ impl ConfigForm {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
+            openapi_path: None,
+            openapi_url: None,
+            har_path: None,
+            nuclei: false,
+            nuclei_jsonl: None,
         }
     }
 }

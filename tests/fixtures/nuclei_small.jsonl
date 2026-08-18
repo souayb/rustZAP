@@ -1,0 +1,2 @@
+{"template-id":"http-missing-security-headers","info":{"name":"HTTP Missing Security Headers","severity":"info","description":"Missing headers detected"},"matched-at":"https://app.example.com/","matcher-name":"x-frame-options"}
+{"template-id":"cve-2021-44228","info":{"name":"Apache Log4j RCE","severity":"critical","description":"Log4Shell"},"matched-at":"https://app.example.com/api"}

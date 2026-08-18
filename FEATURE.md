@@ -33,44 +33,38 @@ Stable `plugin` strings (e.g. `passive/security-txt`, `active/sqli-error`) are p
 | **C1** | TLS probe | `transport/tls-*` findings — `src/tls.rs`, wired from `scanner.rs` |
 | **C2** | Intel (Shodan) | `src/intel.rs`, env-gated |
 | **D1** | Advanced SQLi plugins | `mod sqli_advanced` in `main.rs`, merged in `ActiveScanner::new` |
-| **E1–E4** | Report `modules`, `analyze`, `audit`, SARIF | Per `IMPLEMENTATION_PLAN.md` Phases 1–2 (`report.rs`, `analyze/`, `correlate.rs`, `sarif.rs`) |
+| **D2** | Passive golden matrix | `tests/passive_golden.rs` + `passive::check_response_passive` harness |
+| **E1–E4** | Report `modules`, `analyze`, `audit`, SARIF | Per `IMPLEMENTATION_PLAN.md` Phases 1–2 |
+| **E5** | OpenAPI / HAR / Nuclei | `--openapi-path`/`--openapi-url`, `--har-path`, `--nuclei` / `--nuclei-jsonl` (opt-in) |
 
-Tier **E** tracks **E5–E7** (OpenAPI/HAR, `serve`, agentic) remain **planned** — see IMPLEMENTATION_PLAN Phases 3–5.
+Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPLEMENTATION_PLAN Phases 4–5.
 
 ---
 
 ## Backlog — TODO
 
-These are **not** done or only partially aligned with older FEATURE wording:
-
-1. **D2 — Passive golden / integration matrix**  
-   Dedicated `tests/passive_golden.rs` (or similar) with shared mock HTTP fixtures / optional snapshot tests. Today passive behavior is covered mainly by unit tests inside `passive.rs`.
-
-2. **E2 gap — IaC static analysis**  
+1. **E2 gap — IaC static analysis**  
    Checkov (or equivalent) parser + `iac/checkov`-style `plugin` prefix — deferred in IMPLEMENTATION_PLAN Phase 2.
 
-3. **E5 — OpenAPI import, HAR replay, Nuclei**  
-   IMPLEMENTATION_PLAN Phase 3.
-
-4. **E6 — `rustzap serve` HTTP worker**  
+2. **E6 — `rustzap serve` HTTP worker**  
    IMPLEMENTATION_PLAN Phase 4.
 
-5. **E7 — Agentic `rustzap agent`**  
+3. **E7 — Agentic `rustzap agent`**  
    IMPLEMENTATION_PLAN Phase 5 (opt-in only).
 
-6. **B2 enhancement (optional)**  
+4. **B2 enhancement (optional)**  
    User-supplied `--wordlist` for sensitive paths beyond the curated `SENSITIVE_PATHS` (still opt-in and rate-limited).
 
-7. **A5 refactor (optional)**  
+5. **A5 refactor (optional)**  
    Extract redirect logic shared with open-redirect checks into something like `src/redirect_helpers.rs` if duplication grows.
 
 ---
 
 ## Suggested priority
 
-1. **D2** if you want CI-grade regression coverage for passive checks.  
-2. **IMPLEMENTATION_PLAN Phase 3** (OpenAPI/HAR/Nuclei) for attack-surface expansion.  
-3. **Phases 4–6** when platform/orchestration needs `serve`, agents, or webhooks.
+1. **Phases 4–6** when platform/orchestration needs `serve`, agents, or webhooks.  
+2. **Checkov** (E2) when IaC scanning is needed in `analyze`/`audit`.  
+3. Optional B2 `--wordlist` / A5 redirect helper cleanup.
 
 ---
 

@@ -10,6 +10,10 @@ license = "MIT"
 name = "rustzap"
 path = "src/main.rs"
 
+[lib]
+name = "rustzap"
+path = "src/lib.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -71,3 +75,6 @@ x509-parser = "0.16"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[dev-dependencies]
+serde_json = "1"

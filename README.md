@@ -166,7 +166,20 @@ rustzap scan --target https://staging.example.com --insecure
 
 # Verbose output
 rustzap scan --target https://example.com -vv
+
+# Expand attack surface from OpenAPI / HAR (lab targets only)
+rustzap scan --target https://lab.example.com \
+  --openapi-path openapi.json --passive-only -o report.json
+rustzap scan --target https://lab.example.com \
+  --har-path recording.har --depth 2 -o report.json
+
+# Opt-in Nuclei (requires `nuclei` on PATH — only against authorized targets)
+rustzap scan --target https://lab.example.com --nuclei --passive-only -o report.json
+# Or parse existing Nuclei JSONL without spawning:
+rustzap scan --target https://lab.example.com --nuclei-jsonl nuclei-out.jsonl --passive-only -o report.json
 ```
+
+> **Warning:** `--nuclei` runs ProjectDiscovery Nuclei templates against the target. Use only on systems you own or have explicit permission to test.
 
 ### Analyze & audit (static tools + optional DAST)
 

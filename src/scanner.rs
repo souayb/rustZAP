@@ -39,6 +39,16 @@ pub struct ScanConfig {
     pub basic_auth: Option<String>,
     pub insecure: bool,
     pub plugins: Vec<String>,
+    /// Local OpenAPI 3.x JSON path (optional).
+    pub openapi_path: Option<String>,
+    /// Fetch OpenAPI JSON from this URL once (optional).
+    pub openapi_url: Option<String>,
+    /// HAR recording path; same-origin requests become scan seeds (optional).
+    pub har_path: Option<String>,
+    /// Opt-in: spawn ProjectDiscovery Nuclei against the target.
+    pub nuclei: bool,
+    /// Opt-in: parse existing Nuclei `-jsonl` output (no spawn).
+    pub nuclei_jsonl: Option<String>,
 }
 
 /// Shared HTTP client factory
@@ -110,8 +120,28 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         config.max_depth,
         config.concurrency,
     );
-    let discovered = spider.crawl(&spider_pb).await?;
+    let mut discovered = spider.crawl(&spider_pb).await?;
     spider_pb.finish();
+
+    // Phase 3: OpenAPI / HAR surface expansion (merged into discovered set).
+    let mut openapi_imported = false;
+    if let Some(ref path) = config.openapi_path {
+        let (urls, info) = crate::openapi::load_openapi_file(path, &config.target_url)?;
+        merge_discovered(&mut discovered, urls);
+        findings.lock().await.push(info);
+        openapi_imported = true;
+    }
+    if let Some(ref oas_url) = config.openapi_url {
+        let (urls, info) =
+            crate::openapi::load_openapi_url(&client, oas_url, &config.target_url).await?;
+        merge_discovered(&mut discovered, urls);
+        findings.lock().await.push(info);
+        openapi_imported = true;
+    }
+    if let Some(ref har_path) = config.har_path {
+        let urls = crate::har::load_har_file(har_path, &config.target_url)?;
+        merge_discovered(&mut discovered, urls);
+    }
 
     let passive_pb =
         ProgressBar::with_draw_target(Some(discovered.len() as u64), ProgressDrawTarget::hidden());
@@ -138,6 +168,18 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         f.extend(af);
     }
 
+    // Opt-in Nuclei (never default-on).
+    let mut nuclei_ran = false;
+    if let Some(ref jsonl) = config.nuclei_jsonl {
+        let nf = crate::nuclei::parse_nuclei_jsonl_file(jsonl)?;
+        findings.lock().await.extend(nf);
+        nuclei_ran = true;
+    } else if config.nuclei {
+        let nf = crate::nuclei::run_nuclei(&config.target_url, true).await?;
+        findings.lock().await.extend(nf);
+        nuclei_ran = true;
+    }
+
     let hosts = unique_hosts(&discovered);
     let mut intel_enabled = false;
     if !hosts.is_empty() {
@@ -156,6 +198,8 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         &active_module_names,
         !hosts.is_empty(),
         intel_enabled,
+        openapi_imported,
+        nuclei_ran,
     );
 
     Ok(ScanCollected {
@@ -163,6 +207,20 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         findings: all_findings,
         modules,
     })
+}
+
+/// Deduping merge of imported URLs into the spider result set.
+fn merge_discovered(into: &mut Vec<DiscoveredUrl>, extra: Vec<DiscoveredUrl>) {
+    let mut seen: std::collections::HashSet<String> = into
+        .iter()
+        .map(|d| format!("{} {}", d.method, d.url))
+        .collect();
+    for du in extra {
+        let key = format!("{} {}", du.method, du.url);
+        if seen.insert(key) {
+            into.push(du);
+        }
+    }
 }
 
 /// Entry point for a full scan
@@ -288,9 +346,52 @@ pub async fn run_scan_with_events(
         }
     });
 
-    let discovered = spider.crawl(&spider_pb).await?;
+    let mut discovered = spider.crawl(&spider_pb).await?;
     spider_pb.finish();
     let _ = spider_tick.await;
+
+    let mut import_findings: Vec<Finding> = Vec::new();
+    let mut openapi_imported = false;
+    if let Some(ref path) = config.openapi_path {
+        match crate::openapi::load_openapi_file(path, &config.target_url) {
+            Ok((urls, info)) => {
+                merge_discovered(&mut discovered, urls);
+                let _ = tx.send(ScanEvent::Finding(Box::new(info.clone())));
+                import_findings.push(info);
+                openapi_imported = true;
+            }
+            Err(e) => {
+                let _ = tx.send(ScanEvent::Log(format!("OpenAPI import failed: {e}")));
+            }
+        }
+    }
+    if let Some(ref oas_url) = config.openapi_url {
+        match crate::openapi::load_openapi_url(&client, oas_url, &config.target_url).await {
+            Ok((urls, info)) => {
+                merge_discovered(&mut discovered, urls);
+                let _ = tx.send(ScanEvent::Finding(Box::new(info.clone())));
+                import_findings.push(info);
+                openapi_imported = true;
+            }
+            Err(e) => {
+                let _ = tx.send(ScanEvent::Log(format!("OpenAPI URL import failed: {e}")));
+            }
+        }
+    }
+    if let Some(ref har_path) = config.har_path {
+        match crate::har::load_har_file(har_path, &config.target_url) {
+            Ok(urls) => {
+                let n = urls.len();
+                merge_discovered(&mut discovered, urls);
+                let _ = tx.send(ScanEvent::Log(format!(
+                    "HAR imported {n} same-origin request(s)"
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(ScanEvent::Log(format!("HAR import failed: {e}")));
+            }
+        }
+    }
 
     let _ = tx.send(ScanEvent::SpiderProgress {
         discovered: discovered.len(),
@@ -334,10 +435,12 @@ pub async fn run_scan_with_events(
     });
     emit_module_events(&tx, &passive_findings, crate::passive::known_plugin_names());
 
-    let mut all_findings = passive_findings;
+    let mut all_findings = import_findings;
+    all_findings.extend(passive_findings);
     let mut active_module_names: Vec<String> = Vec::new();
     let mut transport_ran = false;
     let mut intel_enabled = false;
+    let mut nuclei_ran = false;
 
     // ── Phase 3: Active ────────────────────────────────────────────
     if !config.passive_only {
@@ -386,6 +489,35 @@ pub async fn run_scan_with_events(
         all_findings.extend(active_findings);
     }
 
+    // Opt-in Nuclei
+    if let Some(ref jsonl) = config.nuclei_jsonl {
+        match crate::nuclei::parse_nuclei_jsonl_file(jsonl) {
+            Ok(nf) => {
+                for f in &nf {
+                    let _ = tx.send(ScanEvent::Finding(Box::new(f.clone())));
+                }
+                all_findings.extend(nf);
+                nuclei_ran = true;
+            }
+            Err(e) => {
+                let _ = tx.send(ScanEvent::Log(format!("Nuclei JSONL parse failed: {e}")));
+            }
+        }
+    } else if config.nuclei {
+        match crate::nuclei::run_nuclei(&config.target_url, true).await {
+            Ok(nf) => {
+                for f in &nf {
+                    let _ = tx.send(ScanEvent::Finding(Box::new(f.clone())));
+                }
+                all_findings.extend(nf);
+                nuclei_ran = true;
+            }
+            Err(e) => {
+                let _ = tx.send(ScanEvent::Log(format!("Nuclei failed: {e}")));
+            }
+        }
+    }
+
     // ── Phase 3.5: Transport + intel ───────────────────────────────
     let hosts = unique_hosts(&discovered);
     if !hosts.is_empty() {
@@ -417,6 +549,8 @@ pub async fn run_scan_with_events(
         &active_module_names,
         transport_ran,
         intel_enabled,
+        openapi_imported,
+        nuclei_ran,
     );
     let report = Report::new(
         &config.target_url,
@@ -565,6 +699,8 @@ fn compute_module_summaries(
     active_modules: &[String],
     transport_ran: bool,
     intel_enabled: bool,
+    openapi_imported: bool,
+    nuclei_ran: bool,
 ) -> Vec<ModuleSummary> {
     let mut known: Vec<&str> = Vec::new();
     known.extend(crate::passive::known_plugin_names());
@@ -574,6 +710,13 @@ fn compute_module_summaries(
     }
     if intel_enabled {
         known.extend(crate::intel::known_plugin_names());
+    }
+    if openapi_imported {
+        known.push("passive/openapi-import");
+    }
+    if nuclei_ran {
+        // Quiet placeholder; concrete active/nuclei/<id> still appear via findings.
+        known.push("active/nuclei");
     }
     crate::types::summarize_modules(findings, &known)
 }
