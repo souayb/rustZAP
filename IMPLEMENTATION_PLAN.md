@@ -20,12 +20,13 @@ This document turns the platform roadmap into **actionable specs**: file layout,
 4. [Reference open-source integrations](#4-reference-open-source-integrations)
 5. [Phase 1 — JSON report modules, analyze CLI, Semgrep](#phase-1--json-report-modules-analyze-cli-semgrep)
 6. [Phase 2 — Multi-tool audit, correlation, SARIF](#phase-2--multi-tool-audit-correlation-sarif)
-7. [Phase 3 — OpenAPI/HAR, Nuclei, DAST depth](#phase-3--openapihar-nuclei-dast-depth)
-8. [Phase 4 — HTTP API worker mode](#phase-4--http-api-worker-mode)
-9. [Phase 5 — Agentic security](#phase-5--agentic-security)
-10. [Phase 6 — Platform and long tail](#phase-6--platform-and-long-tail)
-11. [Testing strategy](#11-testing-strategy)
-12. [Documentation maintenance](#12-documentation-maintenance)
+7. [Phase 2.5 — Full-repo static depth](#phase-25--full-repo-static-depth)
+8. [Phase 3 — OpenAPI/HAR, Nuclei, DAST depth](#phase-3--openapihar-nuclei-dast-depth)
+9. [Phase 4 — HTTP API worker mode](#phase-4--http-api-worker-mode)
+10. [Phase 5 — Agentic security](#phase-5--agentic-security)
+11. [Phase 6 — Platform and long tail](#phase-6--platform-and-long-tail)
+12. [Testing strategy](#11-testing-strategy)
+13. [Documentation maintenance](#12-documentation-maintenance)
 
 ---
 
@@ -100,7 +101,7 @@ CLI entry: `src/main.rs` subcommands (`scan`, `spider`, `proxy`, `passive`, `plu
            │                               │
            ▼                               ▼
    ┌───────────────────────────────────────────────────────────────────────┐
-   │ report.rs — JSON + optional SARIF; modules[], correlations[], coverage  │
+   │ report.rs — JSON + optional SARIF; modules[], correlations[], static{}  │
    └───────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -112,6 +113,9 @@ CLI entry: `src/main.rs` subcommands (`scan`, `spider`, `proxy`, `passive`, `plu
 | `src/analyze/semgrep.rs` | Parse Semgrep JSON → `Vec<Finding>` |
 | `src/analyze/trivy.rs` | Parse Trivy JSON → `Vec<Finding>` |
 | `src/analyze/gitleaks.rs` | Parse Gitleaks JSON → `Vec<Finding>` |
+| `src/analyze/inventory.rs` | Repo walk: languages, frameworks, entrypoints (Phase 2.5) |
+| `src/analyze/native/` | Built-in JS secrets/URLs, DOM sinks, forms, params (Phase 2.5) |
+| `src/analyze/static_report.rs` | Aggregate `Report.static` (risk, detection_checks, attack_plan) |
 | `src/analyze/checkov.rs` | Parse Checkov JSON → `Vec<Finding>` (optional; noisy) |
 | `src/normalize/mod.rs` | Shared helpers: severity mapping, plugin id rules |
 | `src/correlate.rs` | Rule-based join of static + dynamic findings (Phase 2) |
@@ -190,6 +194,7 @@ rustzap analyze --repo <PATH> [--semgrep-json <file.json>] --output <file.json>
 - Default `--repo` = `.`
 - For Phase 1, `rustzap analyze` is **Semgrep-first only**.
 - If `--semgrep-json` is provided, RustZAP parses it (no Semgrep runtime dependency).
+- **Consent:** `analyze` and `audit` must not walk a local repo silently. A TTY prints an ask-before-access prompt; CI / non-TTY **must** pass `--yes` (`-y`). DAST-only `scan` is unchanged.
 
 **Semgrep invocation**
 
@@ -259,14 +264,15 @@ Rules:
 
 ```text
 rustzap audit [--repo DIR] [--target URL] [--tools semgrep,trivy,gitleaks]
-              [--correlate] [--output unified.json] [--sarif-out …]
+              [--correlate] [--output unified.json] [--sarif-out …] [--yes]
 ```
 
 Execution model (implemented in `analyze/mod.rs`):
 
-1. If `--target`: in-process `scanner::collect_scan`.
-2. Static tools on `--repo` via `run_static_analysis` (fixture paths or subprocess).
-3. Merge findings, build `modules[]`, optional `correlate_findings`, JSON + optional SARIF.
+1. Confirm repo access (TTY prompt, or `--yes` in non-interactive / CI).
+2. If `--target`: in-process `scanner::collect_scan`.
+3. Static tools on `--repo` via `run_static_analysis` (fixture paths or subprocess).
+4. Merge findings, build `modules[]`, optional `correlate_findings`, JSON + optional SARIF.
 
 ### 2.2 Parsers (**Done** for Semgrep, Trivy, Gitleaks)
 
@@ -312,6 +318,105 @@ Minimum: SARIF 2.1 `runs[].results[]` from `Finding` with regions from `CodeLoca
 - [x] `audit` produces one JSON with mixed `plugin` prefixes (`audit_merges_static_fixtures_without_dast` test).
 - [x] Correlation rules covered by unit tests (`correlate::tests`: SQLi path + Trivy/Semgrep/web).
 - [ ] SARIF validates in GitHub’s upload (manual: README notes + `upload-sarif` workflow on your repo).
+
+---
+
+## Phase 2.5 — Full-repo static depth
+
+**Status: Partial (P0+P1 done)** — native analyzers inspired by HacksGuard (risk score, `detection_checks`, parallel modules) and [Argus](https://github.com/jasonxtn/Argus) (JS secrets / DOM sinks / cookies / storage / postMessage / forms / params). No extra subprocesses; Semgrep/Trivy/Gitleaks remain optional siblings. Checkov / `iac/*` is still deferred.
+
+### 2.5.1 Architecture
+
+```text
+rustzap analyze --repo . --tools semgrep,trivy,gitleaks,native
+        │
+        ▼
+inventory (languages, frameworks, entrypoints)
+        ▼
+native analyzers in parallel (tokio spawn_blocking):
+  js_surface | dom_sinks | forms | params
+        ▼
+aggregator (deterministic sort: plugin, file/url, line) → static{ … }
+```
+
+Walk skips `node_modules`, `target`, `.git`, `vendor`, `dist`, `build`, `__pycache__`, and other common generated trees, plus patterns from `.gitignore` and `.rustzapignore` (nested ignore files included). File cap: 4000. JS files over 512KB / `*.min.*` are skipped. Local fixture/repo analysis only — no network.
+
+### 2.5.2 Report schema (`Report.static`, additive)
+
+Omitted (`skip_serializing_if`) when `native` did not run so existing DAST/analyze reports stay compatible.
+
+```json
+"static": {
+  "inventory": { "languages": [], "frameworks": [], "entrypoints": [] },
+  "risk_score": 0,
+  "risk_breakdown": {
+    "secrets": 0, "sinks": 0, "config": 0, "sca": 0, "iac": 0
+  },
+  "detection_checks": [
+    { "id": "js-dom-sinks", "triggered": true, "severity": "medium", "count": 12 }
+  ],
+  "attack_plan": [
+    { "url": "/login", "method": "POST", "params": ["user","pass"], "reason": "form+password" }
+  ]
+}
+```
+
+`risk_breakdown` holds weighted category scores (secrets/sinks high; config from forms+params; sca/iac from `sca/*` and `iac/*` plugins if present). `risk_score` is the sum capped at 100.
+
+### 2.5.3 Native modules (Argus mapping)
+
+| Argus-style idea | RustZAP `plugin` | Check id | P0/P1 |
+|------------------|------------------|----------|-------|
+| Repo inventory | `sast/inventory` | `inventory` | Done |
+| JS secret patterns | `sast/js-secrets` | `js-secrets` | Done |
+| JS URLs / source maps | `sast/js-urls` | `js-urls` | Done |
+| DOM sinks (+ `dangerouslySetInnerHTML`) | `sast/dom-sinks` | `js-dom-sinks` | Done |
+| Cookies (`document.cookie` assign/access) | `sast/js-cookies` | `js-cookies` | Done (P1) |
+| Web storage (`localStorage` / `sessionStorage`) | `sast/js-storage` | `js-storage` | Done (P1) |
+| `postMessage(` | `sast/js-postmessage` | `js-postmessage` | Done (P1) |
+| HTML / template forms | `sast/forms` | `forms` | Done |
+| Parameter mining | `sast/params` | `params` | Done |
+| Parallel analyzer threads | `tokio::join!` + `spawn_blocking` | — | Done (P1) |
+| `.gitignore`-aware walk | `.gitignore` + `.rustzapignore` | — | Done (P1) |
+
+Findings use `source_tool: "rustzap-native"`. Secret evidence is redacted.
+
+### 2.5.4 CLI
+
+```text
+rustzap analyze --repo <PATH> --tools native
+rustzap analyze --repo <PATH> --tools semgrep,trivy,gitleaks,native --yes   # CI
+rustzap audit   --repo <PATH> --tools native[,semgrep,…] --yes
+```
+
+`AnalyzeTool::Native` alias: `native`. When selected, inventory + JS/HTML/param analyzers run **even without Semgrep**. Default `--tools` for `analyze` remains `semgrep` (native is opt-in).
+
+**Files**
+
+| Path | Role |
+|------|------|
+| `src/analyze/inventory.rs` | Walk + language/framework/entrypoint detection |
+| `src/analyze/gitignore.rs` | `.gitignore` / `.rustzapignore` glob matching |
+| `src/analyze/native/js_surface.rs` | Secrets, URLs, sourceMappingURL |
+| `src/analyze/native/dom_sinks.rs` | DOM XSS + cookie / storage / postMessage sinks |
+| `src/analyze/native/forms.rs` | `<form>` extract → `attack_plan` |
+| `src/analyze/native/params.rs` | `req.query` / Flask / `@RequestParam` / … |
+| `src/analyze/static_report.rs` | `StaticAnalysis` aggregator |
+| `tests/fixtures/native_app/` | Tiny HTML + JS + Flask/Express fixture |
+
+### 2.5.5 Phase 2.5 acceptance checklist
+
+- [x] Repo inventory (`sast/inventory`) with languages / frameworks / entrypoints.
+- [x] Native JS surface: secrets (redacted) + URLs + source maps.
+- [x] DOM sinks including `dangerouslySetInnerHTML`.
+- [x] Cookie / `localStorage` / `sessionStorage` / `postMessage` sinks (`sast/js-cookies`, `sast/js-storage`, `sast/js-postmessage`).
+- [x] Form + param extractors populate `attack_plan`.
+- [x] JSON `static{}` with `risk_breakdown`, `detection_checks`, `attack_plan`; omitted when native is off.
+- [x] `rustzap analyze --tools native` (no Semgrep required); mixable with semgrep/trivy/gitleaks.
+- [x] Fixture + unit tests; `cargo fmt`, `clippy -D warnings`, `cargo test`.
+- [x] Parallel native analyzers (P1).
+- [x] Gitignore-aware walk (P1; `.gitignore` + `.rustzapignore`; skip-list still covers generated trees).
+- [ ] Checkov / `iac/*` feeding live `risk_breakdown.iac` (still deferred with Phase 2).
 
 ---
 
@@ -418,6 +523,7 @@ When crawl detects LLM-like routes (`/v1/chat/completions`, etc.), optional subt
 | Layer | Approach |
 |-------|----------|
 | Parsers | Fixture JSON → unit tests (`tests/fixtures/`). |
+| Native static (2.5) | `tests/fixtures/native_app/` + unit tests in `analyze/native/*` and `tests/native_analyze.rs`. |
 | Correlation | Synthetic `Finding` vectors. |
 | Report | Snapshot or insta (see `FEATURE.md` backlog **D2** passive golden matrix). |
 | HTTP API | `axum::Router` tests with `tower::ServiceExt`. |

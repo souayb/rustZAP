@@ -44,7 +44,7 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | [CLAUDE.md](CLAUDE.md) | Contributor / AI assistant guardrails |
 | [CONTRIBUTION.md](CONTRIBUTION.md) | PR workflow + dev expectations |
 
-> **Note:** `rustzap analyze`, `rustzap audit`, JSON `"modules"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2. Later phases (`serve`, `agent`, OpenAPI/Nuclei) remain planned.
+> **Note:** `rustzap analyze` (including `--tools native`), `rustzap audit`, JSON `"modules"` / `"static"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2.5. OpenAPI/HAR/Nuclei are Phase 3. Later phases (`serve`, `agent`) remain planned.
 
 ---
 
@@ -214,30 +214,66 @@ rustzap scan --target https://lab.example.com --nuclei-jsonl nuclei-out.jsonl --
 
 > **Warning:** `--nuclei` runs ProjectDiscovery Nuclei templates against the target. Use only on systems you own or have explicit permission to test.
 
-### Analyze & audit (static tools + optional DAST)
+### Analyze a local repository
+
+Only analyze repositories you **own** or have **permission** to scan. Before walking or reading files, `analyze` and `audit` ask for consent. DAST-only `rustzap scan` of URLs does **not** use this prompt (different command). The TUI does not run analyze/audit yet — use the CLI.
+
+**Interactive** (stdin is a terminal):
 
 ```bash
-# Static analysis: Semgrep, Trivy (fs), Gitleaks (default: semgrep only)
-rustzap analyze --repo . --tools semgrep,trivy,gitleaks --output analyze-report.json
+rustzap analyze --repo . --tools native
+```
 
-# CI-friendly: parse existing tool JSON (no subprocess)
+RustZAP then prints the absolute path and waits:
+
+```
+RustZAP will read files under `/abs/path` for static analysis
+(inventory, secrets/sinks heuristics, and any selected tools).
+Only analyze repositories you own or have permission to scan.
+Proceed? [y/N]:
+```
+
+Type `y` or `yes` to continue. Empty, `n`, or `no` aborts with `Repo access declined`.
+
+**CI / non-interactive** — stdin is not a TTY, so you **must** pass `--yes` (`-y`):
+
+```bash
+rustzap analyze --repo . --tools native --yes -o native-report.json
+```
+
+Mix tools (Semgrep, Trivy, Gitleaks, plus the built-in native pass):
+
+```bash
+rustzap analyze --repo . --tools semgrep,trivy,gitleaks,native --yes
+```
+
+Other analyze examples (still require `--yes` in CI):
+
+```bash
+# Default tool is semgrep only; add --yes in pipelines
+rustzap analyze --repo . --tools semgrep,trivy,gitleaks --yes --output analyze-report.json
+
+# Parse existing tool JSON (no subprocess)
 rustzap analyze --repo . \
   --semgrep-json tests/fixtures/semgrep_small.json \
   --trivy-json tests/fixtures/trivy_small.json \
   --gitleaks-json tests/fixtures/gitleaks_small.json \
-  --output analyze-report.json
+  --yes --output analyze-report.json
 
 # Correlate SAST SQL signals with DAST SQLi + emit SARIF
-rustzap analyze --repo . --semgrep-json semgrep.json --correlate \
+rustzap analyze --repo . --semgrep-json semgrep.json --correlate --yes \
   --output analyze-report.json --sarif-out analyze.sarif
+```
 
-# Unified audit: static tools + optional live scan against --target
+**Audit** also walks `--repo` for static tools (and optionally spiders `--target`). Same consent rules:
+
+```bash
 rustzap audit --repo . --target https://lab.example.com \
-  --tools semgrep,trivy,gitleaks --passive-only --depth 2 \
+  --tools native --yes --passive-only --depth 2 \
   --output audit-report.json --sarif-out audit.sarif
 ```
 
-Scan and analyze/audit JSON reports include a **`modules`** array (per-plugin roll-up) and optional **`correlations`** when `--correlate` is set.
+Scan and analyze/audit JSON reports include a **`modules`** array (per-plugin roll-up) and optional **`correlations`** when `--correlate` is set. With `--tools native`, reports also include a **`static`** object (`inventory`, `risk_score`, `risk_breakdown`, `detection_checks`, `attack_plan`). That field is omitted when native is not selected. The native walk respects `.gitignore` and `.rustzapignore` (and always skips `node_modules`, `target`, `.git`, `vendor`, `dist`).
 
 **GitHub Code Scanning:** build SARIF with `rustzap … --sarif-out rustzap.sarif` (or `scan --output rustzap.sarif`), upload the artifact with `github/codeql-action/upload-sarif` against your default branch or PR; confirm the run appears under the repository **Security** tab (manual check).
 
@@ -272,7 +308,7 @@ rustzap ui         # alias
 rustzap console    # alias
 ```
 
-Running `rustzap` with no arguments launches the console immediately — useful as a daily-driver entry point. On launch the TUI auto-loads `report.json` or `rustzap-report.json` if either exists, so you can review prior scans without re-running.
+Running `rustzap` with no arguments launches the console immediately — useful as a daily-driver entry point. On launch the TUI auto-loads `report.json` or `rustzap-report.json` if either exists, so you can review prior scans without re-running. Static **analyze** / **audit** of a local repo is CLI-only (`rustzap analyze` / `rustzap audit`); the TUI does not walk a repository.
 
 #### Tabs
 
@@ -681,7 +717,8 @@ rustzap/
 │   ├── intel.rs             # C2 — env-gated Shodan / external intel hook
 │   ├── proxy.rs             # Intercepting HTTP proxy (hyper)
 │   ├── stress.rs            # Load/stress tester (5 modes, percentiles, timeline)
-│   ├── report.rs            # JSON / CSV / HTML report generation
+│   ├── report.rs            # JSON / CSV / HTML — modules[], correlations[], static{}
+│   ├── analyze/             # analyze/audit: Semgrep/Trivy/Gitleaks parsers + native inventory/JS/forms
 │   ├── events.rs            # ScanEvent / ScanPhase — telemetry for the TUI
 │   ├── tools.rs             # External tool detection + streaming runner (Semgrep, Trivy, …)
 │   ├── installer.rs         # OS-aware companion-tool installer (`rustzap install`)

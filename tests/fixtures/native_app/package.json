@@ -1,0 +1,7 @@
+{
+  "name": "native-app-fixture",
+  "private": true,
+  "dependencies": {
+    "express": "4.18.2"
+  }
+}

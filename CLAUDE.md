@@ -15,6 +15,7 @@ Use this file so changes to **RustZAP** are correct, safe, and shippable. When i
 ## Legal and safety (non-negotiable)
 
 - **Only scan targets you own or have explicit written permission to test.** Unauthorized scanning is illegal.
+- `analyze` / `audit` must **ask before reading a local repo** (TTY prompt). Non-TTY / CI requires `--yes`. Do not walk the filesystem silently.
 - Do not add **default-on** intrusive behavior (aggressive path brute force, OOB callbacks to third parties, etc.) without **explicit CLI flags** and README warnings.
 - Destructive or high-rate tests belong behind opt-in flags and local integration tests — never hard-coded against real domains.
 
@@ -37,7 +38,7 @@ Before saying work is complete:
 cargo test
 ```
 
-(There are **94** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
+(There are **153** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
 
 ### Smoke run (after build)
 
@@ -67,8 +68,9 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 | `src/tui.rs` | Ratatui UI; keeps plugin defaults in sync with CLI where applicable |
 | `src/tools.rs` | External tool detection + execution |
 | `src/installer.rs` | OS-aware companion tool installs |
+| `src/analyze/` | `analyze`/`audit`: Semgrep/Trivy/Gitleaks parsers + **native** inventory/JS/forms (`inventory.rs`, `gitignore.rs`, `native/`, `static_report.rs`) |
 | `FEATURE.md` | Implemented passive/active items + backlog; platform detail in `IMPLEMENTATION_PLAN.md` |
-| `IMPLEMENTATION_PLAN.md` | **Detailed specs** for analyze/audit, JSON `modules`, SARIF, `serve`, agentic mode |
+| `IMPLEMENTATION_PLAN.md` | **Detailed specs** for analyze/audit, JSON `modules`/`static`, SARIF, `serve`, agentic mode |
 | `SOFTWARE_DESIGN_DOCUMENT.md` | Platform / SDD context (orchestration, UFF, workers) |
 
 ---
@@ -140,7 +142,7 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 
 - `Finding::new` / builders live in `src/types.rs`.
 - Report schema is consumed by the broader DevSecOps design — avoid renaming JSON fields without a versioning/migration story.
-- `Report::new` sorts findings by severity; risk score is derived in `report.rs`.
+- `Report::new` sorts findings by severity; risk score is derived in `report.rs`. Analyze `--tools native` adds optional JSON `"static"` (`inventory`, `risk_breakdown`, `detection_checks`, `attack_plan`) via `Report::with_static` — omitted when native did not run.
 
 ---
 
@@ -176,7 +178,7 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 | Passive-only scan | `cargo run -- scan --target URL --passive-only -o out.json` |
 | Full scan | `cargo run -- scan --target URL --plugins xss,sqli -o out.json` |
 | SARIF (Code Scanning) | `cargo run -- scan --target URL -o out.sarif` or `--sarif-out out.sarif` |
-| Analyze / audit | `cargo run -- analyze --repo . --tools semgrep,trivy,gitleaks -o a.json` · `cargo run -- audit --repo . --target URL …` |
+| Analyze / audit | `cargo run -- analyze --repo . --tools semgrep,trivy,gitleaks,native --yes -o a.json` · `cargo run -- audit --repo . --target URL --yes …` (consent: TTY prompt, or `--yes` in CI) |
 | OpenAPI / HAR / Nuclei | `cargo run -- scan --target URL --openapi-path oas.json` · `--har-path rec.har` · `--nuclei` / `--nuclei-jsonl` (opt-in) |
 | Spider only | `cargo run -- spider --target URL` |
 | TUI | `cargo run -- tui` or bare `cargo run` |

@@ -111,7 +111,7 @@ enum Commands {
         #[arg(short, long, default_value = ".")]
         repo: String,
 
-        /// Tools to run: semgrep,trivy,gitleaks
+        /// Tools to run: semgrep,trivy,gitleaks,native
         #[arg(long, default_value = "semgrep")]
         tools: String,
 
@@ -138,6 +138,10 @@ enum Commands {
         /// Optional SARIF export path
         #[arg(long)]
         sarif_out: Option<String>,
+
+        /// Assume yes — skip the interactive repo-access prompt (required in CI / non-TTY)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Unified audit: static analysis + optional DAST scan
@@ -149,6 +153,7 @@ enum Commands {
         #[arg(short, long)]
         target: Option<String>,
 
+        /// Tools to run: semgrep,trivy,gitleaks,native
         #[arg(long, default_value = "semgrep,trivy,gitleaks")]
         tools: String,
 
@@ -190,6 +195,10 @@ enum Commands {
             default_value = "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain"
         )]
         plugins: String,
+
+        /// Assume yes — skip the interactive repo-access prompt (required in CI / non-TTY)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Stress test / load test an API endpoint
@@ -406,6 +415,7 @@ async fn main() -> anyhow::Result<()> {
             correlate,
             output,
             sarif_out,
+            yes,
         } => {
             analyze::run_analyze_cli(
                 repo,
@@ -416,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
                 correlate,
                 output,
                 sarif_out,
+                yes,
             )
             .await?;
         }
@@ -436,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
             timeout,
             insecure,
             plugins,
+            yes,
         } => {
             analyze::run_audit_cli(
                 repo,
@@ -453,6 +465,7 @@ async fn main() -> anyhow::Result<()> {
                 plugins,
                 timeout,
                 insecure,
+                yes,
             )
             .await?;
         }

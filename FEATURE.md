@@ -1,6 +1,6 @@
 # RustZAP — Module roadmap and backlog
 
-This document tracks **DAST / passive / discovery** ideas and what is still open. **Shipped behavior** for static analysis, `audit`, JSON `modules`, SARIF, and correlation lives in [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) (Phases 1–2 done there).
+This document tracks **DAST / passive / discovery** ideas and what is still open. **Shipped behavior** for static analysis, `audit`, JSON `modules` / `static`, SARIF, correlation, and native full-repo analyzers lives in [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) (Phases 1–2.5).
 
 ## How modules map to the codebase
 
@@ -12,6 +12,7 @@ This document tracks **DAST / passive / discovery** ideas and what is still open
 | **TLS / transport** | `src/tls.rs` | Per unique host during scan |
 | **Sensitive paths** | `src/sensitive_paths.rs` — opt-in plugin | When `--plugins` includes `sensitive-paths` |
 | **External worker** | `src/tools.rs`, `src/installer.rs` | Optional shell-out to companion tools |
+| **Native static** | `src/analyze/inventory.rs`, `src/analyze/native/` | `rustzap analyze --tools native` (Phase 2.5). `analyze`/`audit` require repo consent (interactive prompt, or `--yes` in CI) |
 
 Stable `plugin` strings (e.g. `passive/security-txt`, `active/sqli-error`) are part of the JSON contract.
 
@@ -55,8 +56,10 @@ that need human follow-up (e.g. dispatched OOB payloads) are `tentative`.
 | **C2** | Intel (Shodan) | `src/intel.rs`, env-gated |
 | **D1** | Advanced SQLi plugins | `mod sqli_advanced` in `main.rs`, merged in `ActiveScanner::new` |
 | **D2** | Passive golden matrix | `tests/passive_golden.rs` + `passive::check_response_passive` harness |
-| **E1–E4** | Report `modules`, `analyze`, `audit`, SARIF | Per `IMPLEMENTATION_PLAN.md` Phases 1–2 |
+| **E1–E4** | Report `modules`, `analyze`, `audit`, SARIF | Per `IMPLEMENTATION_PLAN.md` Phases 1–2. Repo walk is gated: TTY prompt, or `--yes` when stdin is not a TTY |
 | **E5** | OpenAPI / HAR / Nuclei | `--openapi-path`/`--openapi-url`, `--har-path`, `--nuclei` / `--nuclei-jsonl` (opt-in) |
+| **E8** | Repo inventory | `sast/inventory` — languages, frameworks, entrypoints (`src/analyze/inventory.rs`) |
+| **E9** | Native JS / DOM / forms / params | `sast/js-secrets`, `sast/js-urls`, `sast/dom-sinks`, `sast/js-cookies`, `sast/js-storage`, `sast/js-postmessage`, `sast/forms`, `sast/params` + JSON `static{ risk_breakdown, detection_checks, attack_plan }` — Phase 2.5 P0+P1 (parallel analyzers, `.gitignore` / `.rustzapignore` walk) |
 
 Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPLEMENTATION_PLAN Phases 4–5.
 
@@ -65,7 +68,7 @@ Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPL
 ## Backlog — TODO
 
 1. **E2 gap — IaC static analysis**  
-   Checkov (or equivalent) parser + `iac/checkov`-style `plugin` prefix — deferred in IMPLEMENTATION_PLAN Phase 2.
+   Checkov (or equivalent) parser + `iac/checkov`-style `plugin` prefix — deferred in IMPLEMENTATION_PLAN Phase 2 / 2.5 (`risk_breakdown.iac`).
 
 2. **E6 — `rustzap serve` HTTP worker**  
    IMPLEMENTATION_PLAN Phase 4.
@@ -98,4 +101,4 @@ Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPL
 
 ## Reference: Argus naming (informative)
 
-Not a port of [Argus](https://github.com/jasonxtn/Argus). Use it for naming inspiration; implementations follow this repo’s `ScanPlugin`, passive helpers, and report schema.
+Not a port of [Argus](https://github.com/jasonxtn/Argus). Use it for naming inspiration; implementations follow this repo’s `ScanPlugin`, passive helpers, and report schema. Full-repo JS/HTML surface mapping is **Phase 2.5** (`sast/js-secrets`, `sast/dom-sinks`, `sast/js-cookies`, `sast/js-storage`, `sast/js-postmessage`, `sast/forms`, `sast/params`) — see [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md).

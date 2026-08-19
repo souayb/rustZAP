@@ -23,8 +23,61 @@ pub struct Report {
     pub modules: Vec<ModuleSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub correlations: Vec<Correlation>,
+    /// Full-repo static analysis roll-up (Phase 2.5). Omitted on DAST-only reports.
+    #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
+    pub static_analysis: Option<StaticAnalysis>,
     pub urls: Vec<DiscoveredUrl>,
     pub findings: Vec<Finding>,
+}
+
+/// Repo inventory + weighted risk from native (and sibling) static tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StaticAnalysis {
+    #[serde(default)]
+    pub inventory: Inventory,
+    pub risk_score: u8,
+    pub risk_breakdown: RiskBreakdown,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detection_checks: Vec<DetectionCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attack_plan: Vec<AttackPlanEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Inventory {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frameworks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entrypoints: Vec<String>,
+}
+
+/// Weighted contributions (0–category cap) that sum into `risk_score`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RiskBreakdown {
+    pub secrets: u32,
+    pub sinks: u32,
+    pub config: u32,
+    pub sca: u32,
+    pub iac: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetectionCheck {
+    pub id: String,
+    pub triggered: bool,
+    pub severity: Severity,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttackPlanEntry {
+    pub url: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<String>,
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -104,6 +157,7 @@ impl Report {
             },
             modules,
             correlations: Vec::new(),
+            static_analysis: None,
             urls,
             findings,
         }
@@ -111,6 +165,11 @@ impl Report {
 
     pub fn with_correlations(mut self, correlations: Vec<Correlation>) -> Self {
         self.correlations = correlations;
+        self
+    }
+
+    pub fn with_static(mut self, static_analysis: StaticAnalysis) -> Self {
+        self.static_analysis = Some(static_analysis);
         self
     }
 
@@ -280,5 +339,65 @@ mod tests {
         let json = serde_json::to_string(&report).expect("json");
         assert!(json.contains("\"correlations\""));
         assert!(json.contains("corr-1"));
+    }
+
+    #[test]
+    fn report_omits_static_when_unset() {
+        let report = Report::new(
+            "target",
+            vec![],
+            vec![],
+            vec![],
+            std::time::Duration::from_secs(0),
+        );
+        let json = serde_json::to_string(&report).expect("json");
+        assert!(
+            !json.contains("\"static\""),
+            "DAST-only reports must stay additive: {json}"
+        );
+    }
+
+    #[test]
+    fn report_serializes_static_block() {
+        let report = Report::new(
+            "target",
+            vec![],
+            vec![],
+            vec![],
+            std::time::Duration::from_secs(0),
+        )
+        .with_static(StaticAnalysis {
+            inventory: Inventory {
+                languages: vec!["JavaScript".to_string()],
+                frameworks: vec!["express".to_string()],
+                entrypoints: vec!["server.js".to_string()],
+            },
+            risk_score: 12,
+            risk_breakdown: RiskBreakdown {
+                secrets: 12,
+                sinks: 0,
+                config: 0,
+                sca: 0,
+                iac: 0,
+            },
+            detection_checks: vec![DetectionCheck {
+                id: "js-secrets".to_string(),
+                triggered: true,
+                severity: Severity::High,
+                count: 1,
+            }],
+            attack_plan: vec![AttackPlanEntry {
+                url: "/login".to_string(),
+                method: "POST".to_string(),
+                params: vec!["user".to_string(), "pass".to_string()],
+                reason: "form+password".to_string(),
+            }],
+        });
+        let json = serde_json::to_string(&report).expect("json");
+        assert!(json.contains("\"static\""));
+        assert!(json.contains("js-secrets"));
+        assert!(json.contains("/login"));
+        let decoded: Report = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(decoded.static_analysis.unwrap().risk_score, 12);
     }
 }

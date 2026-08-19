@@ -1,0 +1,2 @@
+# Fixture-only ignore: native walk must skip ignored_dir/.
+ignored_dir/
