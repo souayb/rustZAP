@@ -554,6 +554,7 @@ available to both the native brain and MCP clients:
 | `http_probe` | recon | One bounded HTTP request; returns a `capture_id` |
 | `list_captures` | recon | List captured HTTP transactions available to replay |
 | `replay_request` | recon | Re-send a captured request with mutations (method/url/body/headers) + diff |
+| `spawn_subtask` | recon | Delegate a focused plan of recon calls to a bounded sub-agent; findings merge up |
 | `ai_redteam` | **exploit** | OWASP LLM Top-10 battery against an in-scope chat endpoint (gated by approval) |
 
 ### Capture / replay
@@ -565,6 +566,25 @@ dumps. At the end of a run they are written next to the report — e.g.
 replayable. `replay_request` bases a new request on a `capture_id`, applies
 mutations, carries session headers forward, and returns a diff (status change,
 body-length delta) versus the original.
+
+### Sub-tasking
+
+`spawn_subtask` lets the brain delegate a focused plan of recon calls to a
+bounded sub-agent that shares the parent scope, request budget, capture store,
+and trace — its findings merge back into the report. To keep the safety model
+intact, sub-tasks are **recon-only and cannot nest**: any intrusive (exploit)
+action still has to go through the top-level, approval-gated loop. A step naming
+a non-recon or nested tool is rejected without a request being sent.
+
+```json
+{ "tool": "spawn_subtask", "args": {
+    "goal": "map and scan the /api subtree",
+    "steps": [
+      { "tool": "get_attack_plan", "args": { "path": "." } },
+      { "tool": "scan_target", "args": { "target": "http://localhost:3000/api" } }
+    ]
+} }
+```
 
 ### Safety layers
 

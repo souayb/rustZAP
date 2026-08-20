@@ -35,6 +35,8 @@ const REPLAY_SKIP_HEADERS: &[&str] = &[
 
 const HTTP_PROBE_TIMEOUT_SECS: u64 = 10;
 const HTTP_PROBE_MAX_BODY: usize = 64 * 1024;
+/// Upper bound on the number of steps a single sub-task may run.
+const SUBTASK_MAX_STEPS: usize = 20;
 
 /// Shared execution context for all tools.
 pub struct ToolCtx {
@@ -280,6 +282,30 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "spawn_subtask",
+            description: "Delegate a focused plan of recon-class tool calls to a bounded sub-agent; its findings merge into the report. `steps` is an array of {tool, args}. Recon-only and non-nesting; shares the parent scope, budget, and trace.",
+            action_class: ActionClass::Recon,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "What this subtask investigates"},
+                    "steps": {
+                        "type": "array",
+                        "description": "Ordered recon tool calls to run",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": {"type": "string"},
+                                "args": {"type": "object"}
+                            },
+                            "required": ["tool"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+        },
+        ToolSpec {
             name: "list_captures",
             description: "List captured HTTP transactions from this run (id, method, url, status) — the traffic available to replay.",
             action_class: ActionClass::Recon,
@@ -325,6 +351,7 @@ pub async fn execute(name: &str, args: &Value, ctx: &ToolCtx) -> Result<ToolOutp
         "list_captures" => Ok(list_captures_tool(ctx)),
         "replay_request" => replay_request(args, ctx).await,
         "ai_redteam" => ai_redteam(args, ctx).await,
+        "spawn_subtask" => spawn_subtask(args, ctx).await,
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -693,6 +720,94 @@ async fn ai_redteam(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     })
 }
 
+/// Run a delegated plan of recon-class tool calls as a bounded sub-agent, then
+/// merge its findings back into the parent report. The sub-agent shares the
+/// parent `ToolCtx` — so scope, request budget, capture store, and trace are all
+/// unified. Safety invariant: sub-tasks may call **only recon-class** tools and
+/// **cannot nest**, so any intrusive action still flows through the top-level,
+/// approval-gated loop.
+async fn spawn_subtask(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+    let goal = args
+        .get("goal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(subtask)");
+    let steps = args
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "spawn_subtask requires 'steps': an array of {{tool, args}} recon calls"
+            )
+        })?;
+    if steps.len() > SUBTASK_MAX_STEPS {
+        bail!(
+            "subtask plan too large: {} steps (max {SUBTASK_MAX_STEPS})",
+            steps.len()
+        );
+    }
+    ctx.trace
+        .note("subtask", format!("{goal}: {} step(s)", steps.len()));
+
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut discovered: Vec<DiscoveredUrl> = Vec::new();
+    let mut static_analysis: Option<StaticAnalysis> = None;
+    let mut attack_plan: Vec<AttackPlanEntry> = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
+
+    for (i, step) in steps.iter().enumerate() {
+        let tool = step
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let sargs = step.get("args").cloned().unwrap_or_else(|| json!({}));
+
+        if tool == "spawn_subtask" {
+            results
+                .push(json!({"step": i, "tool": tool, "error": "nested subtasks are not allowed"}));
+            continue;
+        }
+        if action_class_of(tool) != ActionClass::Recon {
+            results.push(json!({"step": i, "tool": tool, "error": "sub-tasks may only call recon-class tools"}));
+            continue;
+        }
+
+        // Box the recursive call to break the async cycle (execute → spawn_subtask).
+        match Box::pin(execute(tool, &sargs, ctx)).await {
+            Ok(out) => {
+                let (nf, nd) = (out.findings.len(), out.discovered.len());
+                findings.extend(out.findings);
+                discovered.extend(out.discovered);
+                if out.static_analysis.is_some() {
+                    static_analysis = out.static_analysis;
+                }
+                if !out.attack_plan.is_empty() {
+                    attack_plan = out.attack_plan;
+                }
+                results.push(
+                    json!({"step": i, "tool": tool, "ok": true, "findings": nf, "discovered": nd}),
+                );
+            }
+            Err(e) => {
+                results.push(json!({"step": i, "tool": tool, "error": e.to_string()}));
+            }
+        }
+    }
+
+    let value = json!({
+        "goal": goal,
+        "steps_run": steps.len(),
+        "findings_count": findings.len(),
+        "results": results,
+    });
+    Ok(ToolOutput {
+        value,
+        findings,
+        discovered,
+        attack_plan,
+        static_analysis,
+    })
+}
+
 /// Compact, brain-friendly summary of a finding set.
 pub fn summarize_findings(findings: &[Finding]) -> Value {
     let mut by_sev = std::collections::BTreeMap::<String, usize>::new();
@@ -937,6 +1052,73 @@ mod tests {
     #[tokio::test]
     async fn ai_redteam_is_exploit_class() {
         assert_eq!(action_class_of("ai_redteam"), ActionClass::Exploit);
+    }
+
+    #[tokio::test]
+    async fn subtask_runs_recon_steps_and_merges_findings() {
+        let ctx = ctx_for("allowed_hosts: []\n");
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_app");
+        let out = execute(
+            "spawn_subtask",
+            &json!({
+                "goal": "static recon of the fixture",
+                "steps": [
+                    { "tool": "analyze_repo", "args": { "path": root.to_string_lossy(), "tools": "native" } },
+                    { "tool": "list_plugins", "args": {} }
+                ]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.value["steps_run"].as_u64().unwrap(), 2);
+        // analyze_repo produced findings, which bubble up to the parent report.
+        assert!(!out.findings.is_empty(), "subtask findings should merge up");
+        assert!(
+            out.static_analysis.is_some(),
+            "static analysis carried through"
+        );
+        assert!(out.value["results"][0]["ok"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn subtask_refuses_non_recon_and_nested_steps() {
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let out = execute(
+            "spawn_subtask",
+            &json!({
+                "steps": [
+                    { "tool": "ai_redteam", "args": { "endpoint": "http://127.0.0.1/v1" } },
+                    { "tool": "spawn_subtask", "args": { "steps": [] } }
+                ]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // Both steps are rejected before any request is made → no findings.
+        assert!(out.findings.is_empty());
+        assert!(out.value["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("recon-class"));
+        assert!(out.value["results"][1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("nested"));
+    }
+
+    #[tokio::test]
+    async fn subtask_caps_plan_size() {
+        let ctx = ctx_for("allowed_hosts: []\n");
+        let steps: Vec<Value> = (0..SUBTASK_MAX_STEPS + 1)
+            .map(|_| json!({ "tool": "list_plugins", "args": {} }))
+            .collect();
+        let res = execute("spawn_subtask", &json!({ "steps": steps }), &ctx).await;
+        assert!(res.err().unwrap().to_string().contains("too large"));
     }
 
     #[tokio::test]
