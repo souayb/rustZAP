@@ -326,6 +326,62 @@ mod tests {
         ));
     }
 
+    /// Live round-trip against a local OpenAI-compatible server (Ollama by
+    /// default) — the one path the offline suite can't cover. Ignored by default
+    /// AND guarded by an env flag, so it never runs (or fails) unless you opt in:
+    ///
+    /// ```text
+    /// # start Ollama and pull a small model first, e.g.:
+    /// #   ollama pull qwen2.5-coder
+    /// RUSTZAP_OLLAMA_SMOKE=1 \
+    ///   cargo test --lib agent::brain::tests::llm_brain_live_smoke -- --ignored --nocapture
+    /// ```
+    ///
+    /// Override the endpoint/model with `RUSTZAP_OLLAMA_BASE_URL` /
+    /// `RUSTZAP_OLLAMA_MODEL`. Asserts only that the request→response→parse path
+    /// yields a valid `AgentAction` (either a tool call or a finish is fine).
+    #[tokio::test]
+    #[ignore = "live LLM server required; opt in with RUSTZAP_OLLAMA_SMOKE=1 -- --ignored"]
+    async fn llm_brain_live_smoke() {
+        if std::env::var("RUSTZAP_OLLAMA_SMOKE").is_err() {
+            eprintln!(
+                "skipping live smoke: set RUSTZAP_OLLAMA_SMOKE=1 (and run with --ignored) to exercise it"
+            );
+            return;
+        }
+        let base = std::env::var("RUSTZAP_OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| crate::agent::DEFAULT_LLM_BASE_URL.to_string());
+        let model =
+            std::env::var("RUSTZAP_OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5-coder".to_string());
+        eprintln!("live smoke → {base} model={model}");
+
+        // json_mode on: nudge the model toward a single JSON action object.
+        let mut brain = LlmBrain::new(&base, &model, None, true);
+        let state = AgentState {
+            goal: "Reply with a finish action; you have no work to do.".into(),
+            target: Some("http://localhost:3000".into()),
+            repo: None,
+            turn: 0,
+            transcript: vec![],
+            findings_count: 0,
+            attack_plan: vec![],
+        };
+
+        let action = brain
+            .next_action(&state)
+            .await
+            .expect("live LLM round-trip (request/response/parse) should succeed");
+        match action {
+            AgentAction::CallTool { tool, .. } => {
+                assert!(!tool.trim().is_empty(), "tool name must be non-empty");
+                eprintln!("live smoke ok → CallTool({tool})");
+            }
+            AgentAction::Finish { summary } => {
+                eprintln!("live smoke ok → Finish({summary:?})");
+            }
+        }
+    }
+
     #[test]
     fn parse_action_handles_tool_and_finish_and_prose() {
         assert!(matches!(

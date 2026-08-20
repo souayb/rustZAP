@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
+use crate::agent::redteam;
 use crate::agent::scope::{ActionClass, ScopeConfig};
 use crate::agent::trace::Trace;
 use crate::analyze::{self, StaticInputs};
@@ -264,6 +265,21 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "ai_redteam",
+            description: "Run the OWASP LLM Top-10 red-team battery (prompt injection, insecure output handling, system-prompt leakage, excessive agency) against an in-scope OpenAI-compatible chat endpoint. Intrusive — requires approval.",
+            action_class: ActionClass::Exploit,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "endpoint": {"type": "string", "description": "In-scope chat-completions URL of the app under test"},
+                    "model": {"type": "string", "description": "Model id to request (default gpt-4o-mini)"},
+                    "api_key_env": {"type": "string", "description": "Env var holding a bearer token for the target, if it needs one"},
+                    "system_marker": {"type": "string", "description": "A phrase known to be in the target's system prompt; enables leak detection"}
+                },
+                "required": ["endpoint"]
+            }),
+        },
+        ToolSpec {
             name: "list_captures",
             description: "List captured HTTP transactions from this run (id, method, url, status) — the traffic available to replay.",
             action_class: ActionClass::Recon,
@@ -308,6 +324,7 @@ pub async fn execute(name: &str, args: &Value, ctx: &ToolCtx) -> Result<ToolOutp
         "http_probe" => http_probe(args, ctx).await,
         "list_captures" => Ok(list_captures_tool(ctx)),
         "replay_request" => replay_request(args, ctx).await,
+        "ai_redteam" => ai_redteam(args, ctx).await,
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -603,6 +620,79 @@ async fn replay_request(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     Ok(ToolOutput::value_only(value))
 }
 
+async fn ai_redteam(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+    let endpoint = arg_str(args, "endpoint")?;
+    let model = args
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-4o-mini");
+    let marker = args.get("system_marker").and_then(|v| v.as_str());
+    let api_key = args
+        .get("api_key_env")
+        .and_then(|v| v.as_str())
+        .and_then(|env| std::env::var(env).ok())
+        .filter(|k| !k.is_empty());
+
+    // Per-run unique canary the injection probes ask the model to echo.
+    let canary = format!(
+        "RZ-CANARY-{}",
+        crate::types::uuid_v4().split('-').next().unwrap_or("token")
+    );
+    let probes = redteam::probes(&canary, marker);
+
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
+    for p in &probes {
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": p.prompt}],
+            "temperature": 0,
+        })
+        .to_string();
+        let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+        if let Some(k) = &api_key {
+            headers.push(("authorization".to_string(), format!("Bearer {k}")));
+        }
+        match ctx
+            .send_and_capture("POST", &endpoint, Some(body), &headers)
+            .await
+        {
+            Ok((txn, _)) => {
+                let raw = txn
+                    .response
+                    .as_ref()
+                    .map(|r| r.body.as_str())
+                    .unwrap_or_default();
+                let text = redteam::extract_text(raw);
+                let hit = redteam::is_susceptible(p, &canary, marker, &text);
+                if hit {
+                    findings.push(redteam::to_finding(p, &endpoint, &text));
+                }
+                results.push(json!({
+                    "probe": p.id,
+                    "owasp": p.owasp,
+                    "susceptible": hit,
+                }));
+            }
+            Err(e) => {
+                results.push(json!({"probe": p.id, "owasp": p.owasp, "error": e.to_string()}))
+            }
+        }
+    }
+
+    let value = json!({
+        "endpoint": endpoint,
+        "probes_run": probes.len(),
+        "susceptible_count": findings.len(),
+        "results": results,
+    });
+    Ok(ToolOutput {
+        value,
+        findings,
+        ..Default::default()
+    })
+}
+
 /// Compact, brain-friendly summary of a finding set.
 pub fn summarize_findings(findings: &[Finding]) -> Value {
     let mut by_sev = std::collections::BTreeMap::<String, usize>::new();
@@ -796,6 +886,57 @@ mod tests {
 
         // Both requests are now captured and drainable for the report dump.
         assert_eq!(ctx.take_captures().len(), 2);
+    }
+
+    /// LLM echo server: returns an OpenAI-shaped reply whose content is the
+    /// request body, so any canary in the probe prompt is reflected back.
+    async fn spawn_llm_echo_server() -> std::net::SocketAddr {
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Request, Response, Server};
+        let make = make_service_fn(|_| async {
+            Ok::<_, std::convert::Infallible>(service_fn(|req: Request<Body>| async move {
+                let bytes = hyper::body::to_bytes(req.into_body())
+                    .await
+                    .unwrap_or_default();
+                let content = String::from_utf8_lossy(&bytes).to_string();
+                let reply = json!({"choices": [{"message": {"content": content}}]}).to_string();
+                Ok::<_, std::convert::Infallible>(Response::new(Body::from(reply)))
+            }))
+        });
+        let addr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind(&addr).serve(make);
+        let local = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+        local
+    }
+
+    #[tokio::test]
+    async fn ai_redteam_flags_reflected_canary() {
+        let addr = spawn_llm_echo_server().await;
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+
+        let out = execute("ai_redteam", &json!({ "endpoint": endpoint }), &ctx)
+            .await
+            .unwrap();
+
+        // The echo reflects the canary → the injection/output probes are flagged.
+        assert!(out.value["probes_run"].as_u64().unwrap() >= 6);
+        assert!(out.value["susceptible_count"].as_u64().unwrap() >= 1);
+        assert!(out.findings.iter().any(|f| f
+            .owasp_category
+            .as_deref()
+            .unwrap_or("")
+            .contains("LLM01")));
+        // All probe requests were captured for audit/replay.
+        assert!(ctx.take_captures().len() >= 6);
+    }
+
+    #[tokio::test]
+    async fn ai_redteam_is_exploit_class() {
+        assert_eq!(action_class_of("ai_redteam"), ActionClass::Exploit);
     }
 
     #[tokio::test]

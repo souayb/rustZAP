@@ -7,6 +7,7 @@
 
 pub mod brain;
 pub mod privacy;
+pub mod redteam;
 pub mod scope;
 pub mod shield;
 pub mod tools;

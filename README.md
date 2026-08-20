@@ -29,6 +29,7 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | 🖥️ **Interactive TUI** | Six-tab Ratatui console — DAST scans, local repo **analyze**, findings, tools, logs |
 | 🧰 **Unified Tool Console** | Detects & runs Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Falco, Hashcat, John, Hydra and more from the TUI |
 | 🚀 **Stress Tester** | 5-mode load tester with percentile latency, timeline, and JSON report |
+| 🤖 **Agentic Tester** | Scope-gated agent (`rustzap agent`) + MCP server (`rustzap mcp`) over one tool registry — LLM or scripted brain, autonomy modes, HTTP capture/replay, privacy tokenization, prompt-injection shield, OWASP LLM Top-10 red-team |
 | 📋 **Roadmap** | [FEATURE.md](FEATURE.md) (DAST status + backlog) · [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) (analyze/audit/agent/API) |
 
 ---
@@ -44,7 +45,7 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | [CLAUDE.md](CLAUDE.md) | Contributor / AI assistant guardrails |
 | [CONTRIBUTION.md](CONTRIBUTION.md) | PR workflow + dev expectations |
 
-> **Note:** `rustzap analyze` (including `--tools native`), `rustzap audit`, JSON `"modules"` / `"static"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2.5. OpenAPI/HAR/Nuclei are Phase 3. Later phases (`serve`, `agent`) remain planned.
+> **Note:** `rustzap analyze` (including `--tools native`), `rustzap audit`, JSON `"modules"` / `"static"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2.5. OpenAPI/HAR/Nuclei are Phase 3. The **agentic tester** (`rustzap agent` + `rustzap mcp`) is implemented — see [Agentic Tester](#agentic-tester-agent--mcp) below. The hosted `serve` viewer remains planned.
 
 ---
 
@@ -436,6 +437,189 @@ rustzap passive --input https://example.com --output passive-report.json
 ```bash
 rustzap plugins
 ```
+
+---
+
+## Agentic Tester (`agent` + `mcp`)
+
+RustZAP can drive its own scanners, static analysis, and evidence primitives from
+an **agentic loop** — an LLM (or deterministic scripted) brain that plans and
+calls tools under strict, config-selected guardrails. The same capabilities are
+exposed two ways over **one shared tool registry**:
+
+- **`rustzap agent`** — the native loop. A brain observes findings + the
+  attack-plan frontier, calls tools, and RustZAP assembles a `Report`.
+- **`rustzap mcp`** — an [MCP](https://modelcontextprotocol.io/) server over
+  stdio, so an external brain (Claude Code, Cursor, …) drives the same tools.
+
+> ⚠️ Network-touching tools **refuse to run without a scope file**. Only ever
+> point the agent at hosts you own or have explicit written permission to test.
+
+### The scope file (mandatory)
+
+The scope file (YAML or JSON) is the guardrail: it declares what is in bounds,
+the autonomy mode, which action classes need human approval, and the resource
+budget. Loading is strict — a missing or malformed scope is a hard error, never
+a default.
+
+```yaml
+# scope.yaml
+allowed_schemes: [http, https]
+allowed_hosts:                 # exact, or "*.example.com" suffix wildcard
+  - localhost
+  - 127.0.0.1
+  - "*.juice-shop.local"
+forbidden_paths:               # regex; a matching URL path is out of bounds
+  - "^/admin/delete"
+max_requests_per_min: 120
+
+autonomy: assisted             # assisted | semi | auto
+approval_for: [exploit, rce, exfil]   # classes that gate in `semi` mode
+
+budget:
+  max_requests: 500            # 0 = unlimited
+  max_turns: 40
+  max_tokens: 0
+
+privacy: false                 # opt-in tokenization (see below)
+
+model:                         # LLM brain (all fields optional / CLI-overridable)
+  base_url: http://localhost:11434/v1   # default: local Ollama
+  model: qwen2.5-coder
+  api_key_env: LLM_API_KEY     # omit for keyless local servers
+  json_mode: false             # force response_format for open-source models
+```
+
+**Autonomy modes** decide what runs without a human in the loop:
+
+| Mode | Behavior |
+|------|----------|
+| `assisted` *(default, safest)* | Read-only recon (spider/scan/analyze/verify) runs freely; **every** intrusive action needs approval |
+| `semi` | Runs autonomously; only the classes in `approval_for` (e.g. `exploit`, `rce`, `exfil`) need approval |
+| `auto` | Runs the whole loop with no prompts — scope + budget are the only guardrails |
+
+Approval is a TTY prompt. In CI / headless (`-n` / `--non-interactive`, or no
+TTY) gated actions are **auto-denied**, never blocked waiting on input.
+
+### Running the native agent
+
+```bash
+# Deterministic scripted brain — no live LLM, ideal for CI and demos
+rustzap agent --scope scope.yaml --repo . --script steps.json -n \
+  -o agent-report.json
+
+# LLM brain against a local keyless server (Ollama default base URL)
+rustzap agent --scope scope.yaml --target http://localhost:3000 \
+  --model qwen2.5-coder
+
+# LLM brain against a hosted OpenAI-compatible endpoint
+LLM_API_KEY=sk-... rustzap agent --scope scope.yaml \
+  --target http://localhost:3000 \
+  --base-url https://api.openai.com/v1 --model gpt-4o-mini \
+  --api-key-env LLM_API_KEY --json-mode
+
+# Override the scope's autonomy for one run, and turn on privacy tokenization
+rustzap agent --scope scope.yaml --target http://localhost:3000 \
+  --autonomy semi --privacy
+```
+
+CLI flags override the scope file (`--model`, `--base-url`, `--api-key-env`,
+`--json-mode`, `--autonomy`, `--privacy`). The brain speaks a portable
+one-JSON-action-per-turn protocol, so any OpenAI-compatible gateway works
+(OpenAI, OpenRouter/Together/Groq, Anthropic/Gemini compat, or local Ollama /
+vLLM / LM Studio / llama.cpp).
+
+A scripted-brain step file is just a list of actions:
+
+```json
+[
+  { "tool": "analyze_repo", "args": { "path": ".", "tools": "native" } },
+  { "tool": "get_attack_plan", "args": { "path": "." } },
+  { "finish": "static pass complete" }
+]
+```
+
+### Tool registry
+
+Every tool wraps existing RustZAP logic (no scanning code is duplicated) and is
+available to both the native brain and MCP clients:
+
+| Tool | Class | What it does |
+|------|-------|--------------|
+| `scan_target` | recon | DAST (spider + passive + active plugins) against an in-scope URL |
+| `analyze_repo` | recon | Static analysis (native, or semgrep/trivy/gitleaks/checkov) over a repo |
+| `get_attack_plan` | recon | The native attack-plan frontier (endpoints + params + reason) |
+| `list_plugins` | recon | List available active scan plugins |
+| `run_plugin` | recon | Run one active plugin against one in-scope URL |
+| `http_probe` | recon | One bounded HTTP request; returns a `capture_id` |
+| `list_captures` | recon | List captured HTTP transactions available to replay |
+| `replay_request` | recon | Re-send a captured request with mutations (method/url/body/headers) + diff |
+| `ai_redteam` | **exploit** | OWASP LLM Top-10 battery against an in-scope chat endpoint (gated by approval) |
+
+### Capture / replay
+
+Every `http_probe` / `replay_request` (and every `ai_redteam` probe) is captured
+as an HTTP transaction in the same JSON shape the [proxy](#intercepting-proxy)
+dumps. At the end of a run they are written next to the report — e.g.
+`agent-report.json` → `agent-report.captures.json` — so traffic is auditable and
+replayable. `replay_request` bases a new request on a `capture_id`, applies
+mutations, carries session headers forward, and returns a diff (status change,
+body-length delta) versus the original.
+
+### Safety layers
+
+- **Prompt-injection shield** — tool output (HTTP bodies, headers, page content)
+  is attacker-controlled, so before it reaches the brain RustZAP neutralizes
+  known injection directives (`ignore previous instructions`, scope manipulation,
+  "conceal from the user", …) and frames observations as untrusted data. Hits are
+  logged to the trace as `injection_shield`. The human report keeps raw evidence.
+- **Privacy tokenization** (`--privacy` / `privacy: true`) — real hosts, secrets,
+  emails, and IPs are replaced with stable placeholders (`RZ_HOST_1`,
+  `RZ_SECRET_1`, …) before any text reaches the LLM, and restored locally before
+  the tool executes. The model reasons over structure without ever seeing the
+  real target or leaked credentials. Off by default; a no-op when disabled.
+- **Append-only trace** (`--trace`, default `agent-trace.jsonl`) — every tool
+  call, approval decision, scope rejection, shield hit, and capture is one JSON
+  line, with sensitive headers redacted.
+
+### AI red-team (OWASP LLM Top-10)
+
+The `ai_redteam` tool probes an in-scope, OpenAI-compatible chat endpoint (the
+*application under test*) for LLM-specific weaknesses. It is classed **exploit**
+(intrusive) so it is gated by the approval matrix.
+
+| Probe | OWASP | Detection |
+|-------|-------|-----------|
+| Direct prompt injection · role-override jailbreak | LLM01 | reflected unique canary (confirmed) |
+| Insecure output handling (active-content emission) | LLM02 | reflected canary in `<script>` (confirmed) |
+| Sensitive info · system-prompt leakage | LLM06 / LLM07 | operator-supplied `system_marker` leaks into the reply |
+| Excessive agency (unsafe action compliance) | LLM08 | no refusal to a privileged instruction (heuristic) |
+
+Leak probes only fire when you supply `system_marker` (a phrase you know is in
+the target's system prompt), so there are no false positives when it is omitted.
+Findings land in the report with OWASP + CWE metadata under plugin
+`agent/ai-redteam`.
+
+### MCP server
+
+Expose the whole registry to an external agent over stdio:
+
+```bash
+rustzap mcp --scope scope.yaml         # scope enables the network tools
+rustzap mcp                            # no scope → only local analysis tools
+```
+
+Wire it into an MCP client (e.g. Claude Code / Cursor) by pointing the client at
+the `rustzap mcp` command; the server advertises the tools above via
+`tools/list` and executes them under the same scope guardrails.
+
+### Outputs
+
+| File | Contents |
+|------|----------|
+| `--output` (default `agent-report.json`) | Findings `Report` (JSON; `--sarif-out` also emits SARIF) |
+| `--trace` (default `agent-trace.jsonl`) | Append-only audit trail of the run |
+| `<output>.captures.json` | Captured HTTP transactions (when any traffic was sent) |
 
 ---
 
