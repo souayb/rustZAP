@@ -23,11 +23,44 @@ RustZAP is a tool that can probe and stress-test web applications. **Only use it
 ```bash
 git clone <your-fork-or-upstream-url>
 cd rustzap
+./scripts/install-hooks.sh    # Windows: scripts\install-hooks.cmd
 cargo build
 cargo run -- --help
 ```
 
 Optional: use `rustup` to pin a stable toolchain if your distro ships an older compiler.
+
+### Git hooks (Linux, macOS, Windows)
+
+Install **once** after clone so `git commit` / `git push` run the same checks CI uses. This sets **local** `core.hooksPath` only (it does not change your global Git config).
+
+```bash
+# Linux, macOS, or Git Bash
+./scripts/install-hooks.sh
+```
+
+```powershell
+# Windows PowerShell
+.\scripts\install-hooks.ps1
+```
+
+```bat
+REM Windows cmd (no PowerShell execution-policy issues)
+scripts\install-hooks.cmd
+```
+
+On Windows, install [Git for Windows](https://gitforwindows.org/) so hooks run under bash, plus [rustup](https://rustup.rs/) (`rustup component add rustfmt clippy`).
+
+| Hook | When | Checks |
+|------|------|--------|
+| `pre-commit` | every commit | `cargo fmt --all -- --check`; reject generated reports/secrets; whitespace / conflict markers |
+| `pre-push` | every push | `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` |
+
+CI (`.github/workflows/ci.yml`) runs `scripts/dev-check.sh ci` on **Ubuntu, macOS, and Windows**.
+
+Do not commit scanner output (`report.json`, `rustzap-report.json`, `analyze-report.json`, `*.sarif`, files under `reports/`). Those are produced by the app; write them under `reports/` (gitignored) or outside the repo.
+
+Bypass (local only, not for PRs): `git commit --no-verify` / `git push --no-verify`, or `RUSTZAP_SKIP_HOOKS=1`. Uninstall: `./scripts/install-hooks.sh --uninstall`.
 
 ---
 
@@ -70,6 +103,7 @@ Use **your own lab targets** for aggressive `--plugins` runs.
 - Match existing patterns in the file you edit (imports, error handling with `anyhow`, logging with `tracing`).
 - Prefer **small, focused pull requests** over large mixed refactor-and-feature PRs.
 - Do not commit **secrets** (API keys, `.env` with real credentials, personal tokens).
+- Do not commit **generated reports** (`*-report.json`, `*.sarif`, `reports/*` except `.gitkeep`).
 - Preserve stable **`plugin` strings** on `Finding` values (e.g. `passive/cors`, `active/sqli`) unless you are intentionally making a breaking change and updating downstream docs.
 
 ### Adding a feature

@@ -149,8 +149,8 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 ## Git and commits
 
 - **Do not create git commits** unless the user explicitly asks.
-- Do not change **git config**, use **force push** to main, or **destructive** git operations unless explicitly requested.
-- Follow repository hook rules; if a commit fails hooks, fix the issue and create a **new** commit (do not amend pushed commits).
+- Do not change **git config** (except repo-local `core.hooksPath` via `scripts/install-hooks.sh`), use **force push** to main, or **destructive** git operations unless explicitly requested.
+- Follow repository hook rules (`.githooks/` + `scripts/dev-check.sh`); if a commit fails hooks, fix the issue and create a **new** commit (do not amend pushed commits).
 
 ---
 
@@ -165,6 +165,7 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 - [ ] `cargo fmt`, `cargo clippy -D warnings`, `cargo build` succeed
 - [ ] `cargo test` succeeds (or new tests added if behavior changed)
 - [ ] Plugin list / README / `FEATURE.md` aligned with actual registration in code
+- [ ] No generated reports committed (`*-report.json`, `reports/*` except `.gitkeep`)
 - [ ] No unauthorized-scan assumptions; intrusive features are opt-in
 - [ ] Stable `plugin` strings preserved or documented for breaking changes
 
