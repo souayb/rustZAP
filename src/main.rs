@@ -107,13 +107,17 @@ enum Commands {
 
     /// Run static analysis on a local repository
     Analyze {
-        /// Path to a local repository to analyze
-        #[arg(short, long, default_value = ".")]
-        repo: String,
+        /// Repository path (overrides --repo)
+        #[arg(value_name = "REPO")]
+        path: Option<String>,
 
-        /// Tools to run: semgrep,trivy,gitleaks,native
-        #[arg(long, default_value = "semgrep")]
-        tools: String,
+        /// Path to a local repository (used when REPO is omitted)
+        #[arg(short, long)]
+        repo: Option<String>,
+
+        /// Tools to run: semgrep,trivy,gitleaks,native,checkov [default: semgrep]
+        #[arg(long)]
+        tools: Option<String>,
 
         /// Optional Semgrep JSON input file (skip running Semgrep)
         #[arg(long)]
@@ -126,6 +130,10 @@ enum Commands {
         /// Optional Gitleaks JSON input file (skip running Gitleaks)
         #[arg(long)]
         gitleaks_json: Option<String>,
+
+        /// Optional Checkov JSON input file (skip running Checkov)
+        #[arg(long)]
+        checkov_json: Option<String>,
 
         /// Correlate static + dynamic findings when both are present
         #[arg(long)]
@@ -146,16 +154,21 @@ enum Commands {
 
     /// Unified audit: static analysis + optional DAST scan
     Audit {
-        #[arg(short, long, default_value = ".")]
-        repo: String,
+        /// Repository path (overrides --repo)
+        #[arg(value_name = "REPO")]
+        path: Option<String>,
+
+        /// Path to a local repository (used when REPO is omitted)
+        #[arg(short, long)]
+        repo: Option<String>,
 
         /// Optional live target URL for DAST (spider + passive + active)
         #[arg(short, long)]
         target: Option<String>,
 
-        /// Tools to run: semgrep,trivy,gitleaks,native
-        #[arg(long, default_value = "semgrep,trivy,gitleaks")]
-        tools: String,
+        /// Tools to run: semgrep,trivy,gitleaks,native,checkov [default: semgrep,trivy,gitleaks]
+        #[arg(long)]
+        tools: Option<String>,
 
         #[arg(long)]
         semgrep_json: Option<String>,
@@ -165,6 +178,9 @@ enum Commands {
 
         #[arg(long)]
         gitleaks_json: Option<String>,
+
+        #[arg(long)]
+        checkov_json: Option<String>,
 
         #[arg(long)]
         correlate: bool,
@@ -407,37 +423,46 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Analyze {
+            path,
             repo,
             tools,
             semgrep_json,
             trivy_json,
             gitleaks_json,
+            checkov_json,
             correlate,
             output,
             sarif_out,
             yes,
         } => {
+            let tools_explicit = tools.is_some();
+            let tools = tools.unwrap_or_else(|| analyze::DEFAULT_ANALYZE_TOOLS.to_string());
+            let repo = analyze::resolve_repo_path(path, repo, yes)?;
             analyze::run_analyze_cli(
                 repo,
                 tools,
                 semgrep_json,
                 trivy_json,
                 gitleaks_json,
+                checkov_json,
                 correlate,
                 output,
                 sarif_out,
                 yes,
+                tools_explicit,
             )
             .await?;
         }
 
         Commands::Audit {
+            path,
             repo,
             target,
             tools,
             semgrep_json,
             trivy_json,
             gitleaks_json,
+            checkov_json,
             correlate,
             output,
             sarif_out,
@@ -449,6 +474,9 @@ async fn main() -> anyhow::Result<()> {
             plugins,
             yes,
         } => {
+            let tools_explicit = tools.is_some();
+            let tools = tools.unwrap_or_else(|| analyze::DEFAULT_AUDIT_TOOLS.to_string());
+            let repo = analyze::resolve_repo_path(path, repo, yes)?;
             analyze::run_audit_cli(
                 repo,
                 target,
@@ -456,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
                 semgrep_json,
                 trivy_json,
                 gitleaks_json,
+                checkov_json,
                 correlate,
                 output,
                 sarif_out,
@@ -466,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
                 timeout,
                 insecure,
                 yes,
+                tools_explicit,
             )
             .await?;
         }

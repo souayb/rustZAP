@@ -116,7 +116,7 @@ CLI entry: `src/main.rs` subcommands (`scan`, `spider`, `proxy`, `passive`, `plu
 | `src/analyze/inventory.rs` | Repo walk: languages, frameworks, entrypoints (Phase 2.5) |
 | `src/analyze/native/` | Built-in JS secrets/URLs, DOM sinks, forms, params (Phase 2.5) |
 | `src/analyze/static_report.rs` | Aggregate `Report.static` (risk, detection_checks, attack_plan) |
-| `src/analyze/checkov.rs` | Parse Checkov JSON → `Vec<Finding>` (optional; noisy) |
+| `src/analyze/checkov.rs` | Parse Checkov JSON → `Vec<Finding>` (`iac/checkov`; opt-in, noisy) |
 | `src/normalize/mod.rs` | Shared helpers: severity mapping, plugin id rules |
 | `src/correlate.rs` | Rule-based join of static + dynamic findings (Phase 2) |
 | `src/sarif.rs` | Emit SARIF 2.1 for GitHub Code Scanning (Phase 2) |
@@ -188,11 +188,11 @@ Extend `report::Report` with an optional field (use `#[serde(default)]` if deser
 **CLI shape (recommended)**
 
 ```text
-rustzap analyze --repo <PATH> [--semgrep-json <file.json>] --output <file.json>
+rustzap analyze [REPO] [--repo <PATH>] [--semgrep-json <file.json>] --output <file.json>
 ```
 
-- Default `--repo` = `.`
-- For Phase 1, `rustzap analyze` is **Semgrep-first only**.
+- Positional `REPO` overrides `--repo`. If neither is given, a TTY prompts `Repository path [.] :` (empty → `.`); non-TTY defaults to `.` only with `--yes`.
+- For Phase 1, `rustzap analyze` is **Semgrep-first only** (default `--tools semgrep`). Missing Semgrep on PATH falls back to native unless `--tools` was passed explicitly.
 - If `--semgrep-json` is provided, RustZAP parses it (no Semgrep runtime dependency).
 - **Consent:** `analyze` and `audit` must not walk a local repo silently. A TTY prints an ask-before-access prompt; CI / non-TTY **must** pass `--yes` (`-y`). DAST-only `scan` is unchanged.
 
@@ -274,13 +274,13 @@ Execution model (implemented in `analyze/mod.rs`):
 3. Static tools on `--repo` via `run_static_analysis` (fixture paths or subprocess).
 4. Merge findings, build `modules[]`, optional `correlate_findings`, JSON + optional SARIF.
 
-### 2.2 Parsers (**Done** for Semgrep, Trivy, Gitleaks)
+### 2.2 Parsers (**Done** for Semgrep, Trivy, Gitleaks, Checkov)
 
 | Tool | Output flag | Mapper module |
 |------|-------------|---------------|
 | Trivy | `trivy fs --format json` | `analyze/trivy.rs` → `plugin` id `sca/trivy` |
 | Gitleaks | `gitleaks detect --report-format json` | `analyze/gitleaks.rs` → `secrets/gitleaks` |
-| Checkov | JSON to stdout | Deferred (future `analyze/checkov.rs`) |
+| Checkov | `checkov -d . -o json --quiet --compact` | `analyze/checkov.rs` → `iac/checkov` (opt-in; `--tools checkov` / `iac`; `--checkov-json`) |
 
 ### 2.3 Correlation engine (**Done**, extensible)
 
@@ -384,9 +384,10 @@ Findings use `source_tool: "rustzap-native"`. Secret evidence is redacted.
 ### 2.5.4 CLI
 
 ```text
+rustzap analyze [REPO] --tools native
 rustzap analyze --repo <PATH> --tools native
 rustzap analyze --repo <PATH> --tools semgrep,trivy,gitleaks,native --yes   # CI
-rustzap audit   --repo <PATH> --tools native[,semgrep,…] --yes
+rustzap audit   [REPO] --tools native[,semgrep,…] --yes
 ```
 
 `AnalyzeTool::Native` alias: `native`. When selected, inventory + JS/HTML/param analyzers run **even without Semgrep**. Default `--tools` for `analyze` remains `semgrep` (native is opt-in).
@@ -412,11 +413,11 @@ rustzap audit   --repo <PATH> --tools native[,semgrep,…] --yes
 - [x] Cookie / `localStorage` / `sessionStorage` / `postMessage` sinks (`sast/js-cookies`, `sast/js-storage`, `sast/js-postmessage`).
 - [x] Form + param extractors populate `attack_plan`.
 - [x] JSON `static{}` with `risk_breakdown`, `detection_checks`, `attack_plan`; omitted when native is off.
-- [x] `rustzap analyze --tools native` (no Semgrep required); mixable with semgrep/trivy/gitleaks.
+- [x] `rustzap analyze --tools native` (no Semgrep required); mixable with semgrep/trivy/gitleaks/checkov.
 - [x] Fixture + unit tests; `cargo fmt`, `clippy -D warnings`, `cargo test`.
 - [x] Parallel native analyzers (P1).
 - [x] Gitignore-aware walk (P1; `.gitignore` + `.rustzapignore`; skip-list still covers generated trees).
-- [ ] Checkov / `iac/*` feeding live `risk_breakdown.iac` (still deferred with Phase 2).
+- [x] Checkov / `iac/checkov` feeding `risk_breakdown.iac` (opt-in `--tools checkov`; not in analyze/audit defaults).
 
 ---
 

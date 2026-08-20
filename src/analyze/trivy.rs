@@ -109,7 +109,7 @@ pub async fn run_trivy_fs(repo_path: &Path) -> Result<String> {
         .current_dir(repo_path)
         .output()
         .await
-        .context("Failed to spawn trivy")?;
+        .map_err(|e| super::map_spawn_io(e, "trivy"))?;
 
     if !output.status.success() {
         anyhow::bail!(

@@ -1,0 +1,45 @@
+{
+  "check_type": "terraform",
+  "results": {
+    "passed_checks": [],
+    "failed_checks": [
+      {
+        "check_id": "CKV_AWS_20",
+        "bc_check_id": "BC_AWS_S3_1",
+        "check_name": "S3 Bucket has an ACL defined which allows public READ access",
+        "check_result": {
+          "result": "FAILED",
+          "evaluated_keys": ["acl"]
+        },
+        "file_path": "/terraform/s3.tf",
+        "file_line_range": [12, 18],
+        "resource": "aws_s3_bucket.logs",
+        "check_class": "checkov.terraform.checks.resource.aws.S3PublicACLRead",
+        "guideline": "https://docs.prismacloud.io/en/enterprise-edition/policy-reference/aws-policies/s3-policies/s3-bucket-public-read-prohibited",
+        "severity": "HIGH"
+      },
+      {
+        "check_id": "CKV_K8S_21",
+        "check_name": "The default namespace should not be used",
+        "check_result": {
+          "result": "FAILED"
+        },
+        "file_path": "k8s/deployment.yaml",
+        "file_line_range": [4, 20],
+        "resource": "Pod.default.app",
+        "check_class": "checkov.kubernetes.checks.resource.k8s.DefaultNamespace",
+        "guideline": "https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/",
+        "severity": "MEDIUM"
+      }
+    ],
+    "skipped_checks": [],
+    "parsing_errors": []
+  },
+  "summary": {
+    "passed": 0,
+    "failed": 2,
+    "skipped": 0,
+    "parsing_errors": 0,
+    "checkov_version": "3.2.0"
+  }
+}

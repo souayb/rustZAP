@@ -2,3 +2,5 @@
 FEATURES.md
 CHANGELOG.md
 .claude/settings.local.json
+*.json
+public_repos/

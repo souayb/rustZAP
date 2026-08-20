@@ -15,7 +15,7 @@ Use this file so changes to **RustZAP** are correct, safe, and shippable. When i
 ## Legal and safety (non-negotiable)
 
 - **Only scan targets you own or have explicit written permission to test.** Unauthorized scanning is illegal.
-- `analyze` / `audit` must **ask before reading a local repo** (TTY prompt). Non-TTY / CI requires `--yes`. Do not walk the filesystem silently.
+- `analyze` / `audit` must **ask before reading a local repo**. CLI: TTY prompt, or `--yes` in CI. TUI Analyze tab: confirmation dialog, then `assume_yes` only after **Y**. Do not walk the filesystem silently.
 - Do not add **default-on** intrusive behavior (aggressive path brute force, OOB callbacks to third parties, etc.) without **explicit CLI flags** and README warnings.
 - Destructive or high-rate tests belong behind opt-in flags and local integration tests — never hard-coded against real domains.
 
@@ -38,7 +38,7 @@ Before saying work is complete:
 cargo test
 ```
 
-(There are **153** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
+(There are **195** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, TUI analyze helpers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
 
 ### Smoke run (after build)
 
@@ -65,10 +65,10 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 | `src/types.rs` | `Finding`, `Severity`, `DiscoveredUrl`, … |
 | `src/proxy.rs` | Intercepting proxy |
 | `src/stress.rs` | Load testing CLI |
-| `src/tui.rs` | Ratatui UI; keeps plugin defaults in sync with CLI where applicable |
+| `src/tui/` | Ratatui UI (`mod.rs` + `analyze.rs`); Scan URL + Analyze repo; plugin defaults stay in sync with CLI |
 | `src/tools.rs` | External tool detection + execution |
 | `src/installer.rs` | OS-aware companion tool installs |
-| `src/analyze/` | `analyze`/`audit`: Semgrep/Trivy/Gitleaks parsers + **native** inventory/JS/forms (`inventory.rs`, `gitignore.rs`, `native/`, `static_report.rs`) |
+| `src/analyze/` | `analyze`/`audit`: Semgrep/Trivy/Gitleaks/Checkov parsers + **native** inventory/JS/forms (`inventory.rs`, `gitignore.rs`, `native/`, `static_report.rs`) |
 | `FEATURE.md` | Implemented passive/active items + backlog; platform detail in `IMPLEMENTATION_PLAN.md` |
 | `IMPLEMENTATION_PLAN.md` | **Detailed specs** for analyze/audit, JSON `modules`/`static`, SARIF, `serve`, agentic mode |
 | `SOFTWARE_DESIGN_DOCUMENT.md` | Platform / SDD context (orchestration, UFF, workers) |
@@ -126,7 +126,7 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 1. Read **`FEATURE.md`** for what's shipped vs backlog; **`IMPLEMENTATION_PLAN.md`** for phased specs.
 2. Choose **passive** (header/body) vs **active** (`ScanPlugin`) vs **spider** (discovery).
 3. Add **stable** `plugin` identifiers and OWASP/CWE metadata where appropriate.
-4. Extend CLI defaults (`--plugins` in `main.rs`, TUI defaults in `tui.rs`) only when the feature is **safe and expected**.
+4. Extend CLI defaults (`--plugins` in `main.rs`, TUI defaults in `src/tui/`) only when the feature is **safe and expected**.
 5. Add **tests** or local mock-server checks for deterministic behavior.
 6. Update **README.md** only if user-facing behavior or flags change.
 
@@ -178,10 +178,10 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 | Passive-only scan | `cargo run -- scan --target URL --passive-only -o out.json` |
 | Full scan | `cargo run -- scan --target URL --plugins xss,sqli -o out.json` |
 | SARIF (Code Scanning) | `cargo run -- scan --target URL -o out.sarif` or `--sarif-out out.sarif` |
-| Analyze / audit | `cargo run -- analyze --repo . --tools semgrep,trivy,gitleaks,native --yes -o a.json` · `cargo run -- audit --repo . --target URL --yes …` (consent: TTY prompt, or `--yes` in CI) |
+| Analyze / audit | `cargo run -- analyze . --tools native --yes -o a.json` · `cargo run -- analyze ~/src/myapp --tools semgrep,trivy,gitleaks,native,checkov --yes` · `cargo run -- audit . --target URL --yes …` (positional `REPO` overrides `--repo`; TTY prompts for path if omitted; consent: TTY prompt, or `--yes` in CI; missing Semgrep falls back to native unless `--tools` was set; `--checkov-json` skips spawn) |
 | OpenAPI / HAR / Nuclei | `cargo run -- scan --target URL --openapi-path oas.json` · `--har-path rec.har` · `--nuclei` / `--nuclei-jsonl` (opt-in) |
 | Spider only | `cargo run -- spider --target URL` |
-| TUI | `cargo run -- tui` or bare `cargo run` |
+| TUI | `cargo run -- tui` or bare `cargo run` (tab 2 = Scan URL, tab 6 / `a` = Analyze repo) |
 
 ---
 

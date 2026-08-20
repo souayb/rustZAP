@@ -12,7 +12,7 @@ This document tracks **DAST / passive / discovery** ideas and what is still open
 | **TLS / transport** | `src/tls.rs` | Per unique host during scan |
 | **Sensitive paths** | `src/sensitive_paths.rs` — opt-in plugin | When `--plugins` includes `sensitive-paths` |
 | **External worker** | `src/tools.rs`, `src/installer.rs` | Optional shell-out to companion tools |
-| **Native static** | `src/analyze/inventory.rs`, `src/analyze/native/` | `rustzap analyze --tools native` (Phase 2.5). `analyze`/`audit` require repo consent (interactive prompt, or `--yes` in CI) |
+| **Native static** | `src/analyze/inventory.rs`, `src/analyze/native/` | `rustzap analyze --tools native` (Phase 2.5) or TUI tab **6·Analyze**. `analyze`/`audit` require repo consent (CLI prompt / `--yes`, or TUI `[Y]/[N]` dialog) |
 
 Stable `plugin` strings (e.g. `passive/security-txt`, `active/sqli-error`) are part of the JSON contract.
 
@@ -56,10 +56,12 @@ that need human follow-up (e.g. dispatched OOB payloads) are `tentative`.
 | **C2** | Intel (Shodan) | `src/intel.rs`, env-gated |
 | **D1** | Advanced SQLi plugins | `mod sqli_advanced` in `main.rs`, merged in `ActiveScanner::new` |
 | **D2** | Passive golden matrix | `tests/passive_golden.rs` + `passive::check_response_passive` harness |
-| **E1–E4** | Report `modules`, `analyze`, `audit`, SARIF | Per `IMPLEMENTATION_PLAN.md` Phases 1–2. Repo walk is gated: TTY prompt, or `--yes` when stdin is not a TTY |
+| **E2** | Checkov IaC | `iac/checkov` — `src/analyze/checkov.rs`; `--tools checkov` / `iac`; `--checkov-json`; feeds `risk_breakdown.iac` when native also ran |
+| **E1–E4** | Report `modules`, `analyze`, `audit`, SARIF | Per `IMPLEMENTATION_PLAN.md` Phases 1–2. Repo walk is gated: TTY prompt, `--yes` in CI, or TUI Analyze consent dialog |
 | **E5** | OpenAPI / HAR / Nuclei | `--openapi-path`/`--openapi-url`, `--har-path`, `--nuclei` / `--nuclei-jsonl` (opt-in) |
 | **E8** | Repo inventory | `sast/inventory` — languages, frameworks, entrypoints (`src/analyze/inventory.rs`) |
 | **E9** | Native JS / DOM / forms / params | `sast/js-secrets`, `sast/js-urls`, `sast/dom-sinks`, `sast/js-cookies`, `sast/js-storage`, `sast/js-postmessage`, `sast/forms`, `sast/params` + JSON `static{ risk_breakdown, detection_checks, attack_plan }` — Phase 2.5 P0+P1 (parallel analyzers, `.gitignore` / `.rustzapignore` walk) |
+| **E10** | TUI Analyze tab | `src/tui/analyze.rs` — tab 6 / `a`; consent `[Y]/[N]`; default tools `native`; writes `analyze-report.json` |
 
 Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPLEMENTATION_PLAN Phases 4–5.
 
@@ -67,19 +69,16 @@ Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPL
 
 ## Backlog — TODO
 
-1. **E2 gap — IaC static analysis**  
-   Checkov (or equivalent) parser + `iac/checkov`-style `plugin` prefix — deferred in IMPLEMENTATION_PLAN Phase 2 / 2.5 (`risk_breakdown.iac`).
-
-2. **E6 — `rustzap serve` HTTP worker**  
+1. **E6 — `rustzap serve` HTTP worker**  
    IMPLEMENTATION_PLAN Phase 4.
 
-3. **E7 — Agentic `rustzap agent`**  
+2. **E7 — Agentic `rustzap agent`**  
    IMPLEMENTATION_PLAN Phase 5 (opt-in only).
 
-4. **B2 enhancement (optional)**  
+3. **B2 enhancement (optional)**  
    User-supplied `--wordlist` for sensitive paths beyond the curated `SENSITIVE_PATHS` (still opt-in and rate-limited).
 
-5. **A5 refactor (optional)**  
+4. **A5 refactor (optional)**  
    Extract redirect logic shared with open-redirect checks into something like `src/redirect_helpers.rs` if duplication grows.
 
 ---
@@ -87,8 +86,7 @@ Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPL
 ## Suggested priority
 
 1. **Phases 4–6** when platform/orchestration needs `serve`, agents, or webhooks.  
-2. **Checkov** (E2) when IaC scanning is needed in `analyze`/`audit`.  
-3. Optional B2 `--wordlist` / A5 redirect helper cleanup.
+2. Optional B2 `--wordlist` / A5 redirect helper cleanup.
 
 ---
 

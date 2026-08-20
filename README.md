@@ -26,7 +26,7 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | 🛰️ **Intel Hook** | Optional Shodan enrichment when `SHODAN_API_KEY` is set (no-op otherwise) |
 | 🔀 **Intercepting Proxy** | HTTP(S) proxy for manual browsing + passive analysis |
 | 📊 **JSON / CSV / HTML Reports** | Machine-readable findings with OWASP/CWE references |
-| 🖥️ **Interactive TUI** | Five-tab Ratatui console — configure, launch, monitor scans, drill into findings |
+| 🖥️ **Interactive TUI** | Six-tab Ratatui console — DAST scans, local repo **analyze**, findings, tools, logs |
 | 🧰 **Unified Tool Console** | Detects & runs Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Falco, Hashcat, John, Hydra and more from the TUI |
 | 🚀 **Stress Tester** | 5-mode load tester with percentile latency, timeline, and JSON report |
 | 📋 **Roadmap** | [FEATURE.md](FEATURE.md) (DAST status + backlog) · [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) (analyze/audit/agent/API) |
@@ -216,15 +216,17 @@ rustzap scan --target https://lab.example.com --nuclei-jsonl nuclei-out.jsonl --
 
 ### Analyze a local repository
 
-Only analyze repositories you **own** or have **permission** to scan. Before walking or reading files, `analyze` and `audit` ask for consent. DAST-only `rustzap scan` of URLs does **not** use this prompt (different command). The TUI does not run analyze/audit yet — use the CLI.
+Only analyze repositories you **own** or have **permission** to scan. Before walking or reading files, `analyze` and `audit` ask for consent. DAST-only `rustzap scan` of URLs does **not** use this prompt (different command). The TUI **Analyze** tab (press `a` or `6`) shows the same consent as a dialog (`[Y]es` / `[N]o`) instead of stdin `Proceed? [y/N]`.
 
 **Interactive** (stdin is a terminal):
 
 ```bash
-rustzap analyze --repo . --tools native
+rustzap analyze ~/src/myapp --tools native
+rustzap analyze --repo ~/src/myapp --tools native
+# interactive: rustzap analyze   then enter path, then y
 ```
 
-RustZAP then prints the absolute path and waits:
+A positional `REPO` overrides `--repo`. If neither is given, RustZAP prompts `Repository path [.] :` (empty means the current directory). It then prints the absolute path and waits:
 
 ```
 RustZAP will read files under `/abs/path` for static analysis
@@ -235,16 +237,32 @@ Proceed? [y/N]:
 
 Type `y` or `yes` to continue. Empty, `n`, or `no` aborts with `Repo access declined`.
 
-**CI / non-interactive** — stdin is not a TTY, so you **must** pass `--yes` (`-y`):
+**CI / non-interactive** — stdin is not a TTY, so you **must** pass `--yes` (`-y`). Give a path (positional or `--repo`); with `--yes` and no path, the current directory is used:
 
 ```bash
+rustzap analyze ~/src/myapp --tools native --yes -o native-report.json
 rustzap analyze --repo . --tools native --yes -o native-report.json
 ```
 
-Mix tools (Semgrep, Trivy, Gitleaks, plus the built-in native pass):
+Semgrep is **optional**. The default `--tools` is `semgrep`; if that binary is not on `PATH`, `analyze` falls back to the built-in native analyzers and prints a warning. To skip the warning (or run without Semgrep on purpose):
+
+```bash
+rustzap analyze ~/src/myapp --tools native
+```
+
+If you pass `--tools semgrep` explicitly and Semgrep is missing, the command fails with install instructions. Additional tools listed in `--tools` that are missing from `PATH` are skipped; analysis continues with the rest.
+
+Mix tools (Semgrep, Trivy, Gitleaks, Checkov, plus the built-in native pass):
 
 ```bash
 rustzap analyze --repo . --tools semgrep,trivy,gitleaks,native --yes
+```
+
+Checkov is **opt-in** (noisy on large IaC trees; not in analyze/audit defaults). Alias: `iac`.
+
+```bash
+rustzap analyze --repo . --tools checkov --yes
+rustzap analyze --repo . --tools native,checkov --yes   # feeds risk_breakdown.iac in static{}
 ```
 
 Other analyze examples (still require `--yes` in CI):
@@ -258,6 +276,7 @@ rustzap analyze --repo . \
   --semgrep-json tests/fixtures/semgrep_small.json \
   --trivy-json tests/fixtures/trivy_small.json \
   --gitleaks-json tests/fixtures/gitleaks_small.json \
+  --checkov-json tests/fixtures/checkov_small.json \
   --yes --output analyze-report.json
 
 # Correlate SAST SQL signals with DAST SQLi + emit SARIF
@@ -265,10 +284,10 @@ rustzap analyze --repo . --semgrep-json semgrep.json --correlate --yes \
   --output analyze-report.json --sarif-out analyze.sarif
 ```
 
-**Audit** also walks `--repo` for static tools (and optionally spiders `--target`). Same consent rules:
+**Audit** also walks the repo (positional `REPO` or `--repo`) for static tools and optionally spiders `--target`. Same consent rules:
 
 ```bash
-rustzap audit --repo . --target https://lab.example.com \
+rustzap audit ~/src/myapp --target https://lab.example.com \
   --tools native --yes --passive-only --depth 2 \
   --output audit-report.json --sarif-out audit.sarif
 ```
@@ -299,7 +318,7 @@ Press `Ctrl+C` to stop and save captured transactions.
 
 ### Interactive Pentesting Console (TUI)
 
-RustZAP ships with a full multi-tab Ratatui-powered console — the operator's "single pane of glass" from the SDD. It lets you configure scans, launch them, watch live phase progress, browse findings, and drive the SDD's external tools (Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Hashcat, John, Hydra, Medusa, Aircrack-ng, Wifite, Falco, tshark) — all without leaving the terminal.
+RustZAP ships with a full multi-tab Ratatui-powered console — the operator's "single pane of glass" from the SDD. It lets you configure **URL scans**, **analyze a local repository**, watch live progress, browse findings, and drive the SDD's external tools (Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Hashcat, John, Hydra, Medusa, Aircrack-ng, Wifite, Falco, tshark) — all without leaving the terminal.
 
 ```bash
 rustzap            # bare command → drops straight into the TUI
@@ -308,17 +327,18 @@ rustzap ui         # alias
 rustzap console    # alias
 ```
 
-Running `rustzap` with no arguments launches the console immediately — useful as a daily-driver entry point. On launch the TUI auto-loads `report.json` or `rustzap-report.json` if either exists, so you can review prior scans without re-running. Static **analyze** / **audit** of a local repo is CLI-only (`rustzap analyze` / `rustzap audit`); the TUI does not walk a repository.
+Running `rustzap` with no arguments launches the console immediately — useful as a daily-driver entry point. On launch the TUI auto-loads `report.json`, `rustzap-report.json`, or `analyze-report.json` if one exists. **Scan URL** (tab 2) is unchanged. **Analyze repo** (tab 6, or press `a`) runs the same pipeline as `rustzap analyze --repo PATH --tools native` (TUI tools default is **`native`** so it works without Semgrep; type `semgrep,trivy,gitleaks,checkov` to add CLI tools). Unified **audit** (static + DAST in one command) remains CLI-only.
 
 #### Tabs
 
 | Tab | What you see | What you can do |
 |---|---|---|
-| **1·Dashboard** | Target card, color-coded risk score (0–100), severity bar chart, top-20 findings | At-a-glance posture overview |
+| **1·Dashboard** | Target URL + repo path, color-coded risk score (0–100), severity bar chart, top-20 findings | At-a-glance posture overview |
 | **2·Scan** | Inline config form + 3 live phase gauges (Spider · Passive · Active) + streaming findings | Edit target/plugins/output, toggle passive/insecure, tune depth/concurrency, start/cancel scans |
 | **3·Findings** | Findings list + scrolling detail pane (title, CWE, OWASP, evidence, solution) | Browse, severity-filter, deep-dive into each finding |
 | **4·Tools** | Inventory of 15 SDD-listed tools with install status, role, default cmdline | Run any installed tool against the current target — output streams to Logs |
-| **5·Logs** | Timestamped event stream from scans + tool runs (color-coded by type) | Scroll, jump to bottom, clear |
+| **5·Logs** | Timestamped event stream from scans, analyze, and tool runs | Scroll, jump to bottom, clear |
+| **6·Analyze** | Repo path, tools, output, optional SARIF / correlate | Consent dialog, then local static analysis (native by default) |
 
 #### Key bindings
 
@@ -326,9 +346,11 @@ Running `rustzap` with no arguments launches the console immediately — useful 
 
 | Key | Action |
 |---|---|
-| `1`–`5` | Jump to tab |
+| `1`–`6` | Jump to tab |
 | `Tab` / `Shift+Tab` | Cycle tabs |
-| `q` | Quit (aborts running scans/tools) |
+| `a` | Jump to **Analyze** tab |
+| `x` | Cancel a running **scan** or **analyze** (whichever is in progress) |
+| `q` | Quit (aborts running scans/analyze/tools) |
 
 **Scan tab**
 
@@ -344,6 +366,21 @@ Running `rustzap` with no arguments launches the console immediately — useful 
 | `s` | Start scan |
 | `x` | Cancel running scan |
 | `Enter` / `Esc` | Commit / cancel field edit |
+
+**Analyze tab** (also `a` or `6` from any tab)
+
+| Key | Action |
+|---|---|
+| `r` | Edit repo path (default `.`) |
+| `t` | Edit tools (default `native`; comma list: `semgrep`, `trivy`, `gitleaks`, `checkov`, `native`) |
+| `o` | Edit output file (default `analyze-report.json`) |
+| `S` | Edit optional SARIF path (empty = off) |
+| `c` | Toggle finding correlation |
+| `s` | Start analyze — **consent dialog first** (`Y` proceed / `N` or `Esc` cancel) |
+| `x` | Cancel running analyze |
+| `Enter` / `Esc` | Commit / cancel field edit |
+
+The consent dialog replaces CLI `--yes`: *RustZAP will read files under `<abs path>`. Only analyze repos you own. [Y]es / [N]o*. After **Y**, the TUI calls the same `run_analyze` library path as the CLI with `assume_yes`.
 
 **Findings tab**
 
@@ -380,6 +417,8 @@ rustzap tui            # opens the console
 # → press '3' to browse findings, 'f' to filter by severity
 # → press '4' to see which SDD tools are installed; 'r' runs the highlighted one
 # → press '5' to watch live event logs
+# → press 'a' or '6' for Analyze — edit repo with 'r', then 's'
+#    confirm [Y] to walk the repo (native tools by default)
 # → 'q' to quit
 ```
 
@@ -718,11 +757,11 @@ rustzap/
 │   ├── proxy.rs             # Intercepting HTTP proxy (hyper)
 │   ├── stress.rs            # Load/stress tester (5 modes, percentiles, timeline)
 │   ├── report.rs            # JSON / CSV / HTML — modules[], correlations[], static{}
-│   ├── analyze/             # analyze/audit: Semgrep/Trivy/Gitleaks parsers + native inventory/JS/forms
+│   ├── analyze/             # analyze/audit: Semgrep/Trivy/Gitleaks/Checkov parsers + native inventory/JS/forms
 │   ├── events.rs            # ScanEvent / ScanPhase — telemetry for the TUI
 │   ├── tools.rs             # External tool detection + streaming runner (Semgrep, Trivy, …)
 │   ├── installer.rs         # OS-aware companion-tool installer (`rustzap install`)
-│   └── tui.rs               # Multi-tab interactive console (Dashboard / Scan / Findings / Tools / Logs)
+│   └── tui/                 # Multi-tab console (Dashboard / Scan / Findings / Tools / Logs / Analyze)
 ├── scripts/
 │   └── install-tools.sh     # Canonical shell installer — used by Dockerfile & host
 ├── Dockerfile               # Multi-stage build with all companion tools pre-installed

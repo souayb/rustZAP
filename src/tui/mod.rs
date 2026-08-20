@@ -5,10 +5,18 @@
 //!   2·Scan      — edit config inline, launch scans, watch live phase progress
 //!   3·Findings  — browse, severity-filter, drill into details
 //!   4·Tools     — detect SDD tools (Semgrep/Trivy/Gitleaks/Checkov/Nmap/…) and run them
-//!   5·Logs      — live event stream from scans and tool runs
+//!   5·Logs      — live event stream from scans, analyze, and tool runs
+//!   6·Analyze   — local repo analysis (`rustzap analyze --tools native`)
+
+mod analyze;
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
+
+use analyze::{
+    consent_abs_path, consent_key_decision, draw_analyze, draw_consent_dialog, spawn_analyze,
+    AnalyzeEvent, AnalyzeForm, AnalyzeStatus,
+};
 
 use anyhow::Result;
 use crossterm::{
@@ -32,7 +40,14 @@ use crate::scanner::{run_scan_with_events, ScanConfig};
 use crate::tools::{detect_tools, run_tool, ExternalTool, ToolEvent};
 use crate::types::{Finding, Severity};
 
-const TAB_TITLES: &[&str] = &["1·Dashboard", "2·Scan", "3·Findings", "4·Tools", "5·Logs"];
+const TAB_TITLES: &[&str] = &[
+    "1·Dashboard",
+    "2·Scan",
+    "3·Findings",
+    "4·Tools",
+    "5·Logs",
+    "6·Analyze",
+];
 
 /// State for one module group in the Findings-tab tree (SDD §9.1).
 /// `ran` is set when a `ScanEvent::ModuleRan` arrives; it differentiates
@@ -77,6 +92,7 @@ enum Tab {
     Findings,
     Tools,
     Logs,
+    Analyze,
 }
 
 impl Tab {
@@ -87,6 +103,7 @@ impl Tab {
             Tab::Findings => 2,
             Tab::Tools => 3,
             Tab::Logs => 4,
+            Tab::Analyze => 5,
         }
     }
 
@@ -96,7 +113,8 @@ impl Tab {
             1 => Tab::Scan,
             2 => Tab::Findings,
             3 => Tab::Tools,
-            _ => Tab::Logs,
+            4 => Tab::Logs,
+            _ => Tab::Analyze,
         }
     }
 
@@ -115,6 +133,12 @@ enum InputMode {
     EditTarget,
     EditPlugins,
     EditOutput,
+    EditRepo,
+    EditAnalyzeTools,
+    EditAnalyzeOutput,
+    EditSarif,
+    /// Consent dialog before walking a local repo (replaces CLI stdin `y/N`).
+    ConfirmAnalyze,
 }
 
 #[derive(Clone)]
@@ -204,6 +228,13 @@ struct App {
     scan_handle: Option<JoinHandle<Result<()>>>,
     scan_rx: Option<mpsc::UnboundedReceiver<ScanEvent>>,
 
+    analyze: AnalyzeForm,
+    analyze_status: AnalyzeStatus,
+    analyze_handle: Option<JoinHandle<Result<()>>>,
+    analyze_rx: Option<mpsc::UnboundedReceiver<AnalyzeEvent>>,
+    /// Absolute path shown in the consent dialog (set when requesting analyze).
+    analyze_consent_path: String,
+
     findings: Vec<Finding>,
     findings_state: ListState,
     severity_filter: HashSet<Severity>,
@@ -241,6 +272,12 @@ impl App {
             scan_handle: None,
             scan_rx: None,
 
+            analyze: AnalyzeForm::default(),
+            analyze_status: AnalyzeStatus::Idle,
+            analyze_handle: None,
+            analyze_rx: None,
+            analyze_consent_path: String::new(),
+
             findings: Vec::new(),
             findings_state,
             severity_filter: HashSet::new(),
@@ -261,7 +298,7 @@ impl App {
         };
 
         // Pre-load any existing report so the dashboard isn't empty on first run.
-        for path in ["report.json", "rustzap-report.json"] {
+        for path in ["report.json", "rustzap-report.json", "analyze-report.json"] {
             if let Ok(contents) = std::fs::read_to_string(path) {
                 if let Ok(parsed) = serde_json::from_str::<crate::report::Report>(&contents) {
                     app.findings = parsed.findings;
@@ -274,7 +311,7 @@ impl App {
                 }
             }
         }
-        app.log("RustZAP TUI ready. Press '?' for help, 'q' to quit.".into());
+        app.log("RustZAP TUI ready. Press 'a' or 6 for repo analysis, 'q' to quit.".into());
         app
     }
 
@@ -284,6 +321,10 @@ impl App {
         }
         let ts = chrono::Utc::now().format("%H:%M:%S");
         self.logs.push_back(format!("[{}] {}", ts, line));
+    }
+
+    fn is_job_running(&self) -> bool {
+        matches!(self.scan_status, ScanStatus::Running { .. }) || self.analyze_status.is_running()
     }
 
     /// Build the flattened module tree shown in the Findings tab (SDD §9.1).
@@ -379,8 +420,10 @@ impl App {
     }
 
     fn start_scan(&mut self) {
-        if matches!(self.scan_status, ScanStatus::Running { .. }) {
-            self.log("A scan is already running. Press 'x' to cancel first.".into());
+        if self.is_job_running() {
+            self.log(
+                "A scan or analyze run is already in progress. Press 'x' to cancel first.".into(),
+            );
             return;
         }
         let config = self.config.to_scan_config();
@@ -410,6 +453,61 @@ impl App {
             };
         }
         self.scan_rx = None;
+    }
+
+    /// Show the consent dialog; analysis starts only after [Y].
+    fn request_analyze(&mut self) {
+        if self.is_job_running() {
+            self.log(
+                "A scan or analyze run is already in progress. Press 'x' to cancel first.".into(),
+            );
+            return;
+        }
+        if let Err(err) = self.analyze.validate_tools() {
+            self.log(format!("Invalid tools list: {err}"));
+            return;
+        }
+        self.analyze_consent_path = consent_abs_path(&self.analyze.repo);
+        self.input_mode = InputMode::ConfirmAnalyze;
+        self.log(format!(
+            "Confirm repo access for {}",
+            self.analyze_consent_path
+        ));
+    }
+
+    fn start_analyze(&mut self) {
+        if self.is_job_running() {
+            self.log(
+                "A scan or analyze run is already in progress. Press 'x' to cancel first.".into(),
+            );
+            return;
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.analyze_rx = Some(rx);
+        self.analyze_status = AnalyzeStatus::Running {
+            repo: self.analyze_consent_path.clone(),
+            started_at: Instant::now(),
+        };
+        self.findings.clear();
+        self.modules.clear();
+        self.findings_state.select(Some(0));
+        self.log(format!(
+            "Launching analyze on {} (tools: {})",
+            self.analyze_consent_path, self.analyze.tools
+        ));
+        self.analyze_handle = Some(spawn_analyze(&self.analyze, tx));
+        self.tab = Tab::Analyze;
+    }
+
+    fn cancel_analyze(&mut self) {
+        if let Some(handle) = self.analyze_handle.take() {
+            handle.abort();
+            self.log("Analyze cancelled by user.".into());
+            self.analyze_status = AnalyzeStatus::Failed {
+                error: "Cancelled".to_string(),
+            };
+        }
+        self.analyze_rx = None;
     }
 
     fn run_selected_tool(&mut self) {
@@ -486,6 +584,34 @@ impl App {
                     let _ = handle.await;
                 });
                 self.active_tool = None;
+            }
+        }
+
+        // Drain analyze events
+        if let Some(rx) = &mut self.analyze_rx {
+            for _ in 0..256 {
+                match rx.try_recv() {
+                    Ok(ev) => Self::apply_analyze_event(
+                        &mut self.analyze_status,
+                        &mut self.findings,
+                        &mut self.logs,
+                        &mut self.modules,
+                        ev,
+                    ),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.analyze_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(handle) = &self.analyze_handle {
+            if handle.is_finished() {
+                let handle = self.analyze_handle.take().unwrap();
+                tokio::spawn(async move {
+                    let _ = handle.await;
+                });
             }
         }
     }
@@ -624,6 +750,82 @@ impl App {
             }
         }
     }
+
+    fn apply_analyze_event(
+        status: &mut AnalyzeStatus,
+        findings: &mut Vec<Finding>,
+        logs: &mut VecDeque<String>,
+        modules: &mut BTreeMap<String, ModuleNode>,
+        ev: AnalyzeEvent,
+    ) {
+        let push_log = |logs: &mut VecDeque<String>, msg: String| {
+            if logs.len() >= MAX_LOGS {
+                logs.pop_front();
+            }
+            let ts = chrono::Utc::now().format("%H:%M:%S");
+            logs.push_back(format!("[{}] {}", ts, msg));
+        };
+
+        match ev {
+            AnalyzeEvent::Started { repo } => {
+                push_log(logs, format!("Analyze started: {repo}"));
+            }
+            AnalyzeEvent::Log(msg) => push_log(logs, msg),
+            AnalyzeEvent::Finding(f) => {
+                push_log(
+                    logs,
+                    format!("Finding [{}] {} @ {}", f.severity, f.title, f.url),
+                );
+                // Unfold even if ModuleRan arrived first (analyze emits the
+                // full report at once, unlike the streaming DAST path).
+                let entry = modules.entry(f.plugin.clone()).or_default();
+                entry.folded = false;
+                findings.push(*f);
+            }
+            AnalyzeEvent::ModuleRan { name, findings: n } => {
+                let marker = if n == 0 { "·" } else { "✓" };
+                push_log(
+                    logs,
+                    format!(
+                        "{} module {} ({})",
+                        marker,
+                        name,
+                        if n == 0 {
+                            "quiet".to_string()
+                        } else if n == 1 {
+                            "1 finding".to_string()
+                        } else {
+                            format!("{n} findings")
+                        }
+                    ),
+                );
+                modules.entry(name).or_default().ran = true;
+            }
+            AnalyzeEvent::Completed {
+                duration_secs,
+                findings: total_findings,
+                risk_score,
+                report_path,
+            } => {
+                push_log(
+                    logs,
+                    format!(
+                        "Analyze complete: {total_findings} findings, risk={risk_score}, duration={duration_secs:.1}s, report={report_path}"
+                    ),
+                );
+                *status = AnalyzeStatus::Completed {
+                    findings: total_findings,
+                    risk_score,
+                    duration_secs,
+                    report_path,
+                };
+            }
+            AnalyzeEvent::Failed { error } => {
+                push_log(logs, format!("ERROR: {error}"));
+                *status = AnalyzeStatus::Failed { error };
+            }
+        }
+    }
 }
 
 pub async fn run_tui() -> anyhow::Result<()> {
@@ -668,12 +870,30 @@ async fn event_loop(
             if let Some(h) = app.tool_handle.take() {
                 h.abort();
             }
+            if let Some(h) = app.analyze_handle.take() {
+                h.abort();
+            }
             return Ok(());
         }
     }
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if app.input_mode == InputMode::ConfirmAnalyze {
+        match consent_key_decision(code) {
+            Some(true) => {
+                app.input_mode = InputMode::Normal;
+                app.start_analyze();
+            }
+            Some(false) => {
+                app.input_mode = InputMode::Normal;
+                app.log("Repo access declined.".into());
+            }
+            None => {}
+        }
+        return;
+    }
+
     // Editing modes intercept most keys.
     if app.input_mode != InputMode::Normal {
         match code {
@@ -696,7 +916,27 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                         app.config.output = value;
                         app.log(format!("Output file set to {}", app.config.output));
                     }
-                    InputMode::Normal => {}
+                    InputMode::EditRepo => {
+                        app.analyze.repo = value;
+                        app.log(format!("Repo path set to {}", app.analyze.repo));
+                    }
+                    InputMode::EditAnalyzeTools => {
+                        app.analyze.tools = value;
+                        app.log(format!("Analyze tools set to {}", app.analyze.tools));
+                    }
+                    InputMode::EditAnalyzeOutput => {
+                        app.analyze.output = value;
+                        app.log(format!("Analyze output set to {}", app.analyze.output));
+                    }
+                    InputMode::EditSarif => {
+                        app.analyze.sarif_out = value;
+                        app.log(if app.analyze.sarif_out.trim().is_empty() {
+                            "SARIF export disabled".into()
+                        } else {
+                            format!("SARIF output set to {}", app.analyze.sarif_out)
+                        });
+                    }
+                    InputMode::Normal | InputMode::ConfirmAnalyze => {}
                 }
                 app.input_mode = InputMode::Normal;
             }
@@ -723,12 +963,21 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('3') => app.tab = Tab::Findings,
         KeyCode::Char('4') => app.tab = Tab::Tools,
         KeyCode::Char('5') => app.tab = Tab::Logs,
+        KeyCode::Char('6') | KeyCode::Char('a') => app.tab = Tab::Analyze,
+        KeyCode::Char('x') => {
+            if app.analyze_status.is_running() {
+                app.cancel_analyze();
+            } else if matches!(app.scan_status, ScanStatus::Running { .. }) {
+                app.cancel_scan();
+            }
+        }
         _ => match app.tab {
             Tab::Dashboard => {}
             Tab::Scan => handle_scan_keys(app, code),
             Tab::Findings => handle_findings_keys(app, code),
             Tab::Tools => handle_tools_keys(app, code),
             Tab::Logs => handle_logs_keys(app, code),
+            Tab::Analyze => handle_analyze_keys(app, code),
         },
     }
 }
@@ -762,7 +1011,36 @@ fn handle_scan_keys(app: &mut App, code: KeyCode) {
             app.config.concurrency = app.config.concurrency.saturating_sub(1).max(1);
         }
         KeyCode::Char('s') => app.start_scan(),
-        KeyCode::Char('x') => app.cancel_scan(),
+        _ => {}
+    }
+}
+
+fn handle_analyze_keys(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('r') => {
+            app.input_buffer = app.analyze.repo.clone();
+            app.input_mode = InputMode::EditRepo;
+        }
+        KeyCode::Char('t') => {
+            app.input_buffer = app.analyze.tools.clone();
+            app.input_mode = InputMode::EditAnalyzeTools;
+        }
+        KeyCode::Char('o') => {
+            app.input_buffer = app.analyze.output.clone();
+            app.input_mode = InputMode::EditAnalyzeOutput;
+        }
+        KeyCode::Char('S') => {
+            app.input_buffer = app.analyze.sarif_out.clone();
+            app.input_mode = InputMode::EditSarif;
+        }
+        KeyCode::Char('c') => {
+            app.analyze.correlate = !app.analyze.correlate;
+            app.log(format!(
+                "Correlate {}",
+                if app.analyze.correlate { "ON" } else { "OFF" }
+            ));
+        }
+        KeyCode::Char('s') => app.request_analyze(),
         _ => {}
     }
 }
@@ -881,9 +1159,38 @@ fn draw(f: &mut Frame, app: &App) {
         Tab::Findings => draw_findings(f, app, outer[1]),
         Tab::Tools => draw_tools(f, app, outer[1]),
         Tab::Logs => draw_logs(f, app, outer[1]),
+        Tab::Analyze => {
+            let edit = match app.input_mode {
+                InputMode::EditRepo => Some(("Editing repo path", app.input_buffer.as_str())),
+                InputMode::EditAnalyzeTools => {
+                    Some(("Editing tools (comma-separated)", app.input_buffer.as_str()))
+                }
+                InputMode::EditAnalyzeOutput => Some((
+                    "Editing output path (.json/.csv/.html)",
+                    app.input_buffer.as_str(),
+                )),
+                InputMode::EditSarif => Some((
+                    "Editing SARIF path (empty = off)",
+                    app.input_buffer.as_str(),
+                )),
+                _ => None,
+            };
+            draw_analyze(
+                f,
+                outer[1],
+                &app.analyze,
+                &app.analyze_status,
+                &app.findings,
+                edit,
+            );
+        }
     }
 
     draw_status_bar(f, app, outer[2]);
+
+    if app.input_mode == InputMode::ConfirmAnalyze {
+        draw_consent_dialog(f, &app.analyze_consent_path);
+    }
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
@@ -969,6 +1276,10 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
             "depth={} concurrency={}",
             app.config.depth, app.config.concurrency
         )),
+        Line::from(Span::styled(
+            format!("repo: {}", app.analyze.repo),
+            Style::default().fg(Color::Yellow),
+        )),
         Line::from(format!(
             "passive_only={} insecure={}",
             app.config.passive_only, app.config.insecure
@@ -1008,34 +1319,75 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
     .alignment(Alignment::Center);
     f.render_widget(score_card, cards[1]);
 
-    let status_text = match &app.scan_status {
-        ScanStatus::Idle => Line::from(Span::styled(
-            "Idle — press 's' on Scan tab to begin",
-            Style::default().fg(Color::Gray),
-        )),
-        ScanStatus::Running {
-            phase, started_at, ..
-        } => Line::from(vec![
-            Span::styled(
-                format!("RUNNING [{}]", phase.label()),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" · {:.0}s", started_at.elapsed().as_secs_f64())),
-        ]),
-        ScanStatus::Completed {
-            findings,
-            duration_secs,
-            ..
-        } => Line::from(Span::styled(
-            format!("Completed · {} findings · {:.1}s", findings, duration_secs),
-            Style::default().fg(Color::Green),
-        )),
-        ScanStatus::Failed { error } => Line::from(Span::styled(
-            format!("Failed: {}", error),
-            Style::default().fg(Color::Red),
-        )),
+    let status_text = if app.analyze_status.is_running() {
+        match &app.analyze_status {
+            AnalyzeStatus::Running {
+                repo, started_at, ..
+            } => Line::from(vec![
+                Span::styled(
+                    "ANALYZE",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    " · {} · {:.0}s",
+                    repo,
+                    started_at.elapsed().as_secs_f64()
+                )),
+            ]),
+            _ => Line::from(""),
+        }
+    } else if matches!(app.scan_status, ScanStatus::Running { .. })
+        || !matches!(app.scan_status, ScanStatus::Idle)
+    {
+        match &app.scan_status {
+            ScanStatus::Idle => Line::from(""),
+            ScanStatus::Running {
+                phase, started_at, ..
+            } => Line::from(vec![
+                Span::styled(
+                    format!("RUNNING [{}]", phase.label()),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" · {:.0}s", started_at.elapsed().as_secs_f64())),
+            ]),
+            ScanStatus::Completed {
+                findings,
+                duration_secs,
+                ..
+            } => Line::from(Span::styled(
+                format!("Completed · {} findings · {:.1}s", findings, duration_secs),
+                Style::default().fg(Color::Green),
+            )),
+            ScanStatus::Failed { error } => Line::from(Span::styled(
+                format!("Failed: {}", error),
+                Style::default().fg(Color::Red),
+            )),
+        }
+    } else {
+        match &app.analyze_status {
+            AnalyzeStatus::Idle => Line::from(Span::styled(
+                "Idle — Scan tab [s] or Analyze [a]/[6]",
+                Style::default().fg(Color::Gray),
+            )),
+            AnalyzeStatus::Running { .. } => Line::from(""),
+            AnalyzeStatus::Completed {
+                findings,
+                duration_secs,
+                report_path,
+                ..
+            } => Line::from(Span::styled(
+                format!("Analyze done · {findings} findings · {duration_secs:.1}s · {report_path}"),
+                Style::default().fg(Color::Green),
+            )),
+            AnalyzeStatus::Failed { error } => Line::from(Span::styled(
+                format!("Analyze failed: {error}"),
+                Style::default().fg(Color::Red),
+            )),
+        }
     };
     let status_card = Paragraph::new(vec![
         Line::from(format!("Findings: {}", app.findings.len())),
@@ -1172,7 +1524,7 @@ fn draw_scan(f: &mut Frame, app: &App, area: Rect) {
             InputMode::EditTarget => "Editing target URL",
             InputMode::EditPlugins => "Editing plugins (comma-separated)",
             InputMode::EditOutput => "Editing output path (.json/.csv/.html)",
-            InputMode::Normal => "",
+            _ => "",
         };
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1445,7 +1797,7 @@ fn draw_findings(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(0)
         .min(rows.len().saturating_sub(1));
     let detail_text = if rows.is_empty() {
-        "No findings yet. Run a scan from the Scan tab.".to_string()
+        "No findings yet. Run a scan (tab 2) or analyze a repo (tab 6 / 'a').".to_string()
     } else {
         match &rows[sel] {
             TreeRow::Header {
@@ -1663,18 +2015,26 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.tab {
-        Tab::Dashboard => "1-5/Tab: switch · q: quit",
+        Tab::Dashboard => "1-6/Tab: switch · a: analyze · q: quit",
         Tab::Scan => "t/P/o: edit · p/i: toggle · +/-/[/]: tune · s: start · x: cancel",
         Tab::Findings => {
             "j/k: nav · Enter/Space: fold · o: open-all · O: close-all · f: filter · c: clear"
         }
         Tab::Tools => "j/k: navigate · r/Enter: run · R: re-detect",
         Tab::Logs => "j/k/PgUp/PgDn: scroll · G: bottom · c: clear",
+        Tab::Analyze => "r/t/o/S: edit · c: correlate · s: start · x: cancel",
     };
 
     let mode_label = match app.input_mode {
         InputMode::Normal => "NORMAL",
-        InputMode::EditTarget | InputMode::EditPlugins | InputMode::EditOutput => "EDIT",
+        InputMode::ConfirmAnalyze => "CONFIRM",
+        InputMode::EditTarget
+        | InputMode::EditPlugins
+        | InputMode::EditOutput
+        | InputMode::EditRepo
+        | InputMode::EditAnalyzeTools
+        | InputMode::EditAnalyzeOutput
+        | InputMode::EditSarif => "EDIT",
     };
 
     let scan_label = match &app.scan_status {
@@ -1700,10 +2060,93 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
+        Span::styled(
+            app.analyze_status.short_label(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
         Span::styled(hints, Style::default().fg(Color::DarkGray)),
     ]);
 
     let bar =
         Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" Controls "));
     f.render_widget(bar, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_cycle_includes_analyze_as_sixth() {
+        assert_eq!(TAB_TITLES.len(), 6);
+        assert_eq!(Tab::Analyze.index(), 5);
+        assert!(matches!(Tab::from_index(5), Tab::Analyze));
+        assert!(matches!(Tab::Logs.next(), Tab::Analyze));
+        assert!(matches!(Tab::Analyze.next(), Tab::Dashboard));
+        assert!(matches!(Tab::Dashboard.prev(), Tab::Analyze));
+        assert_eq!(TAB_TITLES[5], "6·Analyze");
+    }
+
+    #[test]
+    fn job_running_covers_scan_and_analyze() {
+        let mut app = App::new();
+        assert!(!app.is_job_running());
+        app.analyze_status = AnalyzeStatus::Running {
+            repo: "/tmp".into(),
+            started_at: Instant::now(),
+        };
+        assert!(app.is_job_running());
+        app.analyze_status = AnalyzeStatus::Idle;
+        assert!(!app.is_job_running());
+        app.scan_status = ScanStatus::Running {
+            phase: ScanPhase::Spider,
+            spider_count: 0,
+            passive: (0, 0),
+            active: (0, 0),
+            started_at: Instant::now(),
+        };
+        assert!(app.is_job_running());
+    }
+
+    #[test]
+    fn analyze_finding_expands_module_after_module_ran() {
+        let mut status = AnalyzeStatus::Running {
+            repo: "/tmp".into(),
+            started_at: Instant::now(),
+        };
+        let mut findings = Vec::new();
+        let mut logs = VecDeque::new();
+        let mut modules = BTreeMap::new();
+        App::apply_analyze_event(
+            &mut status,
+            &mut findings,
+            &mut logs,
+            &mut modules,
+            AnalyzeEvent::ModuleRan {
+                name: "sast/inventory".into(),
+                findings: 1,
+            },
+        );
+        App::apply_analyze_event(
+            &mut status,
+            &mut findings,
+            &mut logs,
+            &mut modules,
+            AnalyzeEvent::Finding(Box::new(Finding::new(
+                "test",
+                Severity::Low,
+                "file.rs",
+                "desc",
+                "fix",
+                "sast/inventory",
+            ))),
+        );
+        assert_eq!(findings.len(), 1);
+        let node = modules.get("sast/inventory").expect("module registered");
+        assert!(node.ran);
+        assert!(!node.folded, "findings must be visible after analyze");
+    }
 }

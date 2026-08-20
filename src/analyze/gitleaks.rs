@@ -124,7 +124,7 @@ pub async fn run_gitleaks(repo_path: &Path) -> Result<String> {
         ])
         .output()
         .await
-        .context("Failed to spawn gitleaks")?;
+        .map_err(|e| super::map_spawn_io(e, "gitleaks"))?;
 
     // Exit code 1 = leaks found (still wrote report); other failures are errors.
     if !output.status.success() && output.status.code() != Some(1) {

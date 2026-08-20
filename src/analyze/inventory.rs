@@ -8,30 +8,59 @@ use crate::analyze::gitignore::IgnoreSet;
 use crate::report::Inventory;
 use crate::types::{CodeLocation, Finding, Severity};
 
-pub(crate) const MAX_REPO_FILES: usize = 4000;
+pub(crate) const MAX_REPO_FILES: usize = 25_000;
 pub(crate) const MAX_SOURCE_BYTES: u64 = 512 * 1024;
 const MAX_ENTRYPOINTS: usize = 40;
 
+/// Directories skipped by the repo walk: version-control internals and
+/// generated / cache / dependency trees only.
+///
+/// This is an explicit blocklist — we intentionally do NOT skip every
+/// dot-directory, because `.github/workflows`, `.circleci`, `.gitlab`, and
+/// similar dot-config folders hold security-relevant files that must be walked.
 const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
+    // Version control internals
     ".git",
-    "vendor",
+    ".svn",
+    ".hg",
+    // JS / package trees
+    "node_modules",
+    "bower_components",
+    ".pnpm-store",
+    ".yarn",
+    // Build / output
+    "target",
     "dist",
     "build",
+    "coverage",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".angular",
+    ".parcel-cache",
+    ".turbo",
+    ".serverless",
+    ".dart_tool",
+    // Python
     "__pycache__",
     ".venv",
     "venv",
-    ".next",
-    "coverage",
-    ".idea",
-    ".vscode",
-    "Pods",
-    "Carthage",
-    "bower_components",
     ".tox",
     ".mypy_cache",
     ".pytest_cache",
+    // Other language / tool caches
+    "vendor",
+    ".gradle",
+    ".terraform",
+    ".cargo",
+    ".sass-cache",
+    ".cache",
+    // Editor / IDE
+    ".idea",
+    ".vscode",
+    // Apple / mobile deps
+    "Pods",
+    "Carthage",
 ];
 
 const ENTRYPOINT_NAMES: &[&str] = &[
@@ -68,6 +97,7 @@ pub fn collect_repo_files(root: &Path) -> Vec<PathBuf> {
     root_ignore.load_file("", &root.join(".rustzapignore"));
 
     let mut out = Vec::new();
+    let mut truncated = false;
     let mut stack = vec![WalkFrame {
         dir: root.to_path_buf(),
         ignore: root_ignore,
@@ -85,6 +115,7 @@ pub fn collect_repo_files(root: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             if out.len() >= MAX_REPO_FILES {
+                truncated = true;
                 break;
             }
             let path = entry.path();
@@ -113,17 +144,24 @@ pub fn collect_repo_files(root: &Path) -> Vec<PathBuf> {
             }
         }
         if out.len() >= MAX_REPO_FILES {
+            truncated = true;
             break;
         }
+    }
+    if truncated {
+        let msg = format!(
+            "rustzap: repo file cap of {MAX_REPO_FILES} reached under {}; \
+             some files were NOT analyzed. Narrow the path or split the repo for full coverage.",
+            root.display()
+        );
+        tracing::warn!("{msg}");
+        eprintln!("{msg}");
     }
     out.sort();
     out
 }
 
 fn should_skip_dir(name: &str) -> bool {
-    if name.starts_with('.') {
-        return true;
-    }
     SKIP_DIRS.iter().any(|s| name.eq_ignore_ascii_case(s))
 }
 
@@ -466,11 +504,40 @@ mod tests {
     }
 
     #[test]
-    fn skip_dir_hides_dot_and_vendor() {
+    fn skip_dir_hides_vcs_and_generated_only() {
+        // Version control internals and generated/cache trees are skipped.
         assert!(should_skip_dir(".git"));
         assert!(should_skip_dir("node_modules"));
         assert!(should_skip_dir("TARGET"));
+        assert!(should_skip_dir(".venv"));
+        assert!(should_skip_dir(".terraform"));
+        // Security-relevant dot-config directories are NOT skipped.
+        assert!(!should_skip_dir(".github"));
+        assert!(!should_skip_dir(".circleci"));
+        assert!(!should_skip_dir(".gitlab"));
+        assert!(!should_skip_dir(".devcontainer"));
         assert!(!should_skip_dir("src"));
+    }
+
+    #[test]
+    fn walk_includes_github_workflows() {
+        let tmp = std::env::temp_dir().join(format!("rz-gh-{}", crate::types::uuid_v4()));
+        fs::create_dir_all(tmp.join(".github/workflows")).unwrap();
+        fs::create_dir_all(tmp.join(".git")).unwrap();
+        fs::write(tmp.join(".github/workflows/ci.yml"), "on: push").unwrap();
+        fs::write(tmp.join(".git/config"), "[core]").unwrap();
+        let files = collect_repo_files(&tmp);
+        assert!(
+            files
+                .iter()
+                .any(|p| p.ends_with(".github/workflows/ci.yml")),
+            "CI workflow files must be walked"
+        );
+        assert!(
+            !files.iter().any(|p| p.to_string_lossy().contains("/.git/")),
+            ".git internals must stay skipped"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
