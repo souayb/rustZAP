@@ -600,6 +600,21 @@ the target's system prompt), so there are no false positives when it is omitted.
 Findings land in the report with OWASP + CWE metadata under plugin
 `agent/ai-redteam`.
 
+A brain can call `ai_redteam` mid-run, or you can invoke the battery directly
+with the **`--ai-redteam`** flag — no LLM brain required. In this mode `--target`
+is the chat endpoint, `--model` / `--api-key-env` name the *target's* model/key,
+and `--ai-redteam-marker` supplies the leak marker. The flag is explicit consent
+for the intrusive action, so it runs without a separate approval prompt — but the
+target must still be in scope (host allowlist, budget, and rate limit all apply).
+
+```bash
+rustzap agent --scope scope.yaml \
+  --target http://localhost:3000/v1/chat/completions \
+  --ai-redteam --model gpt-4o-mini \
+  --ai-redteam-marker "You are ShopBot, the internal assistant" \
+  -o redteam-report.json
+```
+
 ### MCP server
 
 Expose the whole registry to an external agent over stdio:

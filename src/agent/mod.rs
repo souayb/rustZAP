@@ -41,6 +41,10 @@ pub struct AgentConfig {
     pub trace_path: String,
     /// CI / headless: approvals are auto-denied instead of prompting.
     pub non_interactive: bool,
+    /// Explicit-consent runs (e.g. the `--ai-redteam` CLI wrapper) pre-approve
+    /// gated actions — the flag naming the action IS the approval. Scope
+    /// enforcement (hosts, schemes, budget, forbidden paths) still fully applies.
+    pub auto_approve: bool,
 }
 
 /// Drive the agent loop to completion and write the report.
@@ -107,7 +111,10 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
                 repeats = 0;
 
                 let class = tools::action_class_of(&tool);
-                if scope.requires_approval(class) && !approve(&cfg, &tool, class) {
+                if scope.requires_approval(class)
+                    && !cfg.auto_approve
+                    && !approve(&cfg, &tool, class)
+                {
                     trace.note("approval_denied", tool.clone());
                     state.transcript.push(TranscriptEntry {
                         tool,
@@ -306,6 +313,8 @@ pub async fn run_agent_cli(
     non_interactive: bool,
     script: Option<String>,
     llm: LlmOverrides,
+    ai_redteam: bool,
+    ai_redteam_marker: Option<String>,
 ) -> Result<()> {
     let mut scope = ScopeConfig::load(Path::new(&scope_path))?;
     if let Some(a) = autonomy_override {
@@ -314,39 +323,72 @@ pub async fn run_agent_cli(
         scope.set_autonomy(parsed);
     }
 
-    let brain: Box<dyn AgentBrain> = match script {
-        Some(sp) => Box::new(ScriptedBrain::from_json_file(Path::new(&sp))?),
-        None => {
-            // CLI override → scope file → Ollama default.
-            let base = llm
-                .base_url
-                .or_else(|| scope.model.base_url.clone())
-                .unwrap_or_else(|| DEFAULT_LLM_BASE_URL.to_string());
-            let model = llm.model.or_else(|| scope.model.model.clone()).context(
-                "LLM model not set — pass --model or set scope.model.model \
-                 (e.g. qwen2.5-coder, gpt-4o-mini, claude-3-5-sonnet), or use --script",
-            )?;
-            // Key from env only if an env var is named; keyless is fine for local servers.
-            let key_env = llm.api_key_env.or_else(|| scope.model.api_key_env.clone());
-            let api_key =
-                key_env.and_then(|env| std::env::var(&env).ok().filter(|k| !k.is_empty()));
-            let json_mode = llm.json_mode || scope.model.json_mode;
-            let privacy_on = llm.privacy || scope.privacy;
-            let vault = build_vault(privacy_on, &scope.allowed_hosts, target.as_deref());
-            Box::new(LlmBrain::with_vault(
-                &base, &model, api_key, json_mode, vault,
-            ))
+    let brain: Box<dyn AgentBrain> = if let Some(sp) = script {
+        Box::new(ScriptedBrain::from_json_file(Path::new(&sp))?)
+    } else if ai_redteam {
+        // Thin CLI wrapper: run the OWASP LLM Top-10 battery once against the
+        // target chat endpoint — no LLM brain needed. `--model` / `--api-key-env`
+        // here name the *target's* model/key; `--ai-redteam-marker` enables leak
+        // detection. This path pre-approves the (Exploit-class) action.
+        let endpoint = target
+            .clone()
+            .context("--ai-redteam requires --target (the target chat-completions URL)")?;
+        eprintln!("⚠ AI red-team: sending OWASP LLM Top-10 probes to {endpoint} (in-scope only)");
+        let mut args = json!({ "endpoint": endpoint });
+        if let Some(m) = llm.model.clone() {
+            args["model"] = json!(m);
         }
+        if let Some(env) = llm.api_key_env.clone() {
+            args["api_key_env"] = json!(env);
+        }
+        if let Some(marker) = ai_redteam_marker {
+            args["system_marker"] = json!(marker);
+        }
+        Box::new(ScriptedBrain::new(vec![
+            AgentAction::CallTool {
+                tool: "ai_redteam".into(),
+                args,
+            },
+            AgentAction::Finish {
+                summary: "AI red-team battery complete".into(),
+            },
+        ]))
+    } else {
+        // CLI override → scope file → Ollama default.
+        let base = llm
+            .base_url
+            .or_else(|| scope.model.base_url.clone())
+            .unwrap_or_else(|| DEFAULT_LLM_BASE_URL.to_string());
+        let model = llm.model.or_else(|| scope.model.model.clone()).context(
+            "LLM model not set — pass --model or set scope.model.model \
+                 (e.g. qwen2.5-coder, gpt-4o-mini, claude-3-5-sonnet), or use --script",
+        )?;
+        // Key from env only if an env var is named; keyless is fine for local servers.
+        let key_env = llm.api_key_env.or_else(|| scope.model.api_key_env.clone());
+        let api_key = key_env.and_then(|env| std::env::var(&env).ok().filter(|k| !k.is_empty()));
+        let json_mode = llm.json_mode || scope.model.json_mode;
+        let privacy_on = llm.privacy || scope.privacy;
+        let vault = build_vault(privacy_on, &scope.allowed_hosts, target.as_deref());
+        Box::new(LlmBrain::with_vault(
+            &base, &model, api_key, json_mode, vault,
+        ))
     };
 
     let goal = goal.unwrap_or_else(|| {
-        format!(
-            "Assess the security of {}",
-            target
-                .as_deref()
-                .or(repo.as_deref())
-                .unwrap_or("the provided scope")
-        )
+        if ai_redteam {
+            format!(
+                "Run the OWASP LLM Top-10 red-team battery against {}",
+                target.as_deref().unwrap_or("the target")
+            )
+        } else {
+            format!(
+                "Assess the security of {}",
+                target
+                    .as_deref()
+                    .or(repo.as_deref())
+                    .unwrap_or("the provided scope")
+            )
+        }
     });
     let output_for_msg = output.clone();
     let cfg = AgentConfig {
@@ -358,6 +400,7 @@ pub async fn run_agent_cli(
         sarif_out,
         trace_path,
         non_interactive,
+        auto_approve: ai_redteam,
     };
     let report = run_agent(cfg, brain).await?;
     println!(
@@ -413,6 +456,7 @@ mod tests {
             sarif_out: None,
             trace_path: trace.to_string_lossy().to_string(),
             non_interactive: true,
+            auto_approve: false,
         };
         let report = run_agent(cfg, brain).await.expect("agent run");
         assert!(!report.findings.is_empty());
@@ -441,5 +485,101 @@ mod tests {
         let scope = scope_yaml("allowed_hosts: []\nautonomy: assisted\n");
         assert!(scope.requires_approval(ActionClass::Exploit));
         assert!(!scope.requires_approval(ActionClass::Recon));
+    }
+
+    /// OpenAI-shaped echo server: reply content is the request body, so a probe
+    /// canary is reflected back and the red-team battery flags it.
+    async fn spawn_llm_echo_server() -> std::net::SocketAddr {
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Request, Response, Server};
+        let make = make_service_fn(|_| async {
+            Ok::<_, std::convert::Infallible>(service_fn(|req: Request<Body>| async move {
+                let bytes = hyper::body::to_bytes(req.into_body())
+                    .await
+                    .unwrap_or_default();
+                let content = String::from_utf8_lossy(&bytes).to_string();
+                let reply = json!({"choices": [{"message": {"content": content}}]}).to_string();
+                Ok::<_, std::convert::Infallible>(Response::new(Body::from(reply)))
+            }))
+        });
+        let addr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind(&addr).serve(make);
+        let local = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+        local
+    }
+
+    fn redteam_cfg(endpoint: &str, auto_approve: bool) -> (AgentConfig, String, String) {
+        let out = std::env::temp_dir()
+            .join(format!("rz-rt-{}.json", crate::types::uuid_v4()))
+            .to_string_lossy()
+            .to_string();
+        let trace = std::env::temp_dir()
+            .join(format!("rz-rt-{}.jsonl", crate::types::uuid_v4()))
+            .to_string_lossy()
+            .to_string();
+        let cfg = AgentConfig {
+            scope: scope_yaml("allowed_hosts: [\"127.0.0.1\"]\nautonomy: assisted\n"),
+            goal: "red-team".into(),
+            target: Some(endpoint.to_string()),
+            repo: None,
+            output: out.clone(),
+            sarif_out: None,
+            trace_path: trace.clone(),
+            non_interactive: true,
+            auto_approve,
+        };
+        (cfg, out, trace)
+    }
+
+    fn redteam_brain(endpoint: &str) -> Box<dyn AgentBrain> {
+        Box::new(ScriptedBrain::new(vec![
+            AgentAction::CallTool {
+                tool: "ai_redteam".into(),
+                args: json!({ "endpoint": endpoint }),
+            },
+            AgentAction::Finish {
+                summary: "done".into(),
+            },
+        ]))
+    }
+
+    #[tokio::test]
+    async fn ai_redteam_wrapper_auto_approves_exploit_action() {
+        let addr = spawn_llm_echo_server().await;
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+
+        // auto_approve = true (the --ai-redteam CLI consent): the Exploit-class
+        // battery runs even in assisted+non-interactive → findings appear.
+        let (cfg, out, trace) = redteam_cfg(&endpoint, true);
+        let report = run_agent(cfg, redteam_brain(&endpoint)).await.unwrap();
+        assert!(
+            !report.findings.is_empty(),
+            "consented red-team should produce findings"
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&trace);
+    }
+
+    #[tokio::test]
+    async fn exploit_action_denied_without_consent_headless() {
+        let addr = spawn_llm_echo_server().await;
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+
+        // auto_approve = false + assisted + non-interactive: the gate denies the
+        // Exploit action, so no red-team findings are recorded.
+        let (cfg, out, trace) = redteam_cfg(&endpoint, false);
+        let report = run_agent(cfg, redteam_brain(&endpoint)).await.unwrap();
+        assert!(
+            report.findings.is_empty(),
+            "unconsented exploit action must be denied"
+        );
+        assert!(std::fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .contains("approval_denied"));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&trace);
     }
 }

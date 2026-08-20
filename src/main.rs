@@ -401,6 +401,14 @@ enum Commands {
         /// reach the LLM, restore locally before tools run. Overrides scope.
         #[arg(long)]
         privacy: bool,
+        /// Run the OWASP LLM Top-10 red-team battery directly against --target
+        /// (no LLM brain). --model/--api-key-env name the target's model/key.
+        #[arg(long)]
+        ai_redteam: bool,
+        /// A phrase known to be in the target's system prompt; enables leak
+        /// detection in --ai-redteam mode (no effect otherwise).
+        #[arg(long)]
+        ai_redteam_marker: Option<String>,
         #[arg(short, long, default_value = "agent-report.json")]
         output: String,
         #[arg(long)]
@@ -625,6 +633,8 @@ async fn main() -> anyhow::Result<()> {
             api_key_env,
             json_mode,
             privacy,
+            ai_redteam,
+            ai_redteam_marker,
             output,
             sarif_out,
             trace,
@@ -648,6 +658,8 @@ async fn main() -> anyhow::Result<()> {
                 non_interactive,
                 script,
                 llm,
+                ai_redteam,
+                ai_redteam_marker,
             )
             .await?;
         }
