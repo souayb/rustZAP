@@ -43,6 +43,35 @@ pub struct ActiveScanner {
     all_paths: bool,
 }
 
+/// Every active plugin RustZAP ships, freshly constructed. Single source of
+/// truth for `ActiveScanner::new`, `list_plugins`, and `plugin_by_name`.
+pub fn all_active_plugins() -> Vec<Box<dyn ScanPlugin>> {
+    let mut plugins: Vec<Box<dyn ScanPlugin>> = vec![
+        Box::new(XssPlugin),
+        Box::new(SqlInjectionPlugin),
+        Box::new(PathTraversalPlugin),
+        Box::new(OpenRedirectPlugin),
+        Box::new(SsrfPlugin),
+        Box::new(XxePlugin),
+        Box::new(CmdInjectionPlugin),
+        Box::new(SstiPlugin),
+        Box::new(GraphqlIntrospectionPlugin),
+        Box::new(HttpMethodsPlugin::new()),
+        Box::new(RedirectChainPlugin::new()),
+        Box::new(crate::sensitive_paths::SensitivePathsPlugin::new()),
+    ];
+    plugins.extend(crate::sqli_advanced::plugins());
+    plugins
+}
+
+/// Look up a single active plugin by its `name()` (case-insensitive). Lets the
+/// agent / MCP layer run one plugin against one `DiscoveredUrl`.
+pub fn plugin_by_name(name: &str) -> Option<Box<dyn ScanPlugin>> {
+    all_active_plugins()
+        .into_iter()
+        .find(|p| p.name().eq_ignore_ascii_case(name))
+}
+
 impl ActiveScanner {
     pub fn new(
         client: Arc<reqwest::Client>,
@@ -50,23 +79,7 @@ impl ActiveScanner {
         concurrency: usize,
         all_paths: bool,
     ) -> Self {
-        let mut all_plugins: Vec<Box<dyn ScanPlugin>> = vec![
-            Box::new(XssPlugin),
-            Box::new(SqlInjectionPlugin),
-            Box::new(PathTraversalPlugin),
-            Box::new(OpenRedirectPlugin),
-            Box::new(SsrfPlugin),
-            Box::new(XxePlugin),
-            Box::new(CmdInjectionPlugin),
-            Box::new(SstiPlugin),
-            Box::new(GraphqlIntrospectionPlugin),
-            Box::new(HttpMethodsPlugin::new()),
-            Box::new(RedirectChainPlugin::new()),
-            Box::new(crate::sensitive_paths::SensitivePathsPlugin::new()),
-        ];
-        all_plugins.extend(crate::sqli_advanced::plugins());
-
-        let plugins = all_plugins
+        let plugins = all_active_plugins()
             .into_iter()
             .filter(|p| {
                 let name = p.name().to_lowercase();
@@ -146,21 +159,7 @@ impl ActiveScanner {
 }
 
 pub fn list_plugins() {
-    let mut plugins: Vec<Box<dyn ScanPlugin>> = vec![
-        Box::new(XssPlugin),
-        Box::new(SqlInjectionPlugin),
-        Box::new(PathTraversalPlugin),
-        Box::new(OpenRedirectPlugin),
-        Box::new(SsrfPlugin),
-        Box::new(XxePlugin),
-        Box::new(CmdInjectionPlugin),
-        Box::new(SstiPlugin),
-        Box::new(GraphqlIntrospectionPlugin),
-        Box::new(HttpMethodsPlugin::new()),
-        Box::new(RedirectChainPlugin::new()),
-        Box::new(crate::sensitive_paths::SensitivePathsPlugin::new()),
-    ];
-    plugins.extend(crate::sqli_advanced::plugins());
+    let plugins = all_active_plugins();
 
     println!("{}", "Available Active Scan Plugins".bright_white().bold());
     println!("{}", "─".repeat(50).dimmed());

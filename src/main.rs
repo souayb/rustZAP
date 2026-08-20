@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use rustzap::scanner::ScanConfig;
 use rustzap::stress::StressCliArgs;
-use rustzap::{active, analyze, installer, passive, proxy, scanner, spider, stress, tui};
+use rustzap::{
+    active, agent, analyze, installer, mcp, passive, proxy, scanner, spider, stress, tui,
+};
 use tracing_subscriber::EnvFilter;
 
 /// RustZAP - OWASP ZAP-inspired web security scanner written in Rust
@@ -357,6 +359,49 @@ enum Commands {
         #[arg(short, long)]
         yes: bool,
     },
+
+    /// Agentic tester (scope-gated; Phase 5). An LLM (or scripted) brain drives
+    /// RustZAP's scanners/verification under a mandatory scope file.
+    Agent {
+        /// Scope/config file (YAML/JSON) — REQUIRED. Allowed hosts/schemes,
+        /// rate + budget caps, autonomy mode, approval classes, model config.
+        #[arg(long)]
+        scope: String,
+        /// Natural-language goal (derived from target/repo when omitted)
+        #[arg(long)]
+        goal: Option<String>,
+        /// Live target URL for DAST
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Local repository path for SAST
+        #[arg(short, long)]
+        repo: Option<String>,
+        /// Override the scope file's autonomy: assisted | semi | auto
+        #[arg(long)]
+        autonomy: Option<String>,
+        /// Non-interactive (CI): approval gates are auto-denied, never prompted
+        #[arg(short = 'n', long)]
+        non_interactive: bool,
+        /// Deterministic brain: a JSON file of scripted steps (no live LLM)
+        #[arg(long)]
+        script: Option<String>,
+        #[arg(short, long, default_value = "agent-report.json")]
+        output: String,
+        #[arg(long)]
+        sarif_out: Option<String>,
+        #[arg(long, default_value = "agent-trace.jsonl")]
+        trace: String,
+    },
+
+    /// Run as an MCP server on stdio, exposing RustZAP's tools to external
+    /// agents (Claude Code, Cursor, …). Network tools require `--scope`.
+    Mcp {
+        /// Scope file for network-touching tools (without it, only local analysis is allowed)
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, default_value = "agent-trace.jsonl")]
+        trace: String,
+    },
 }
 
 #[tokio::main]
@@ -372,6 +417,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(format!("rustzap={}", level)))
         .with_target(false)
+        // Logs go to stderr so stdout stays clean (required for MCP stdio).
+        .with_writer(std::io::stderr)
         .init();
 
     // Bare `rustzap` (no subcommand) → drop straight into the interactive TUI.
@@ -380,7 +427,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    print_banner();
+    // The MCP server owns stdout as its protocol channel — no banner there.
+    if !matches!(command, Commands::Mcp { .. }) {
+        print_banner();
+    }
 
     match command {
         Commands::Scan {
@@ -544,6 +594,37 @@ async fn main() -> anyhow::Result<()> {
                 passive_all_methods,
             )
             .await?;
+        }
+
+        Commands::Agent {
+            scope,
+            goal,
+            target,
+            repo,
+            autonomy,
+            non_interactive,
+            script,
+            output,
+            sarif_out,
+            trace,
+        } => {
+            agent::run_agent_cli(
+                scope,
+                goal,
+                target,
+                repo,
+                output,
+                sarif_out,
+                trace,
+                autonomy,
+                non_interactive,
+                script,
+            )
+            .await?;
+        }
+
+        Commands::Mcp { scope, trace } => {
+            mcp::run_mcp_stdio(scope, trace).await?;
         }
 
         Commands::Tui => {
