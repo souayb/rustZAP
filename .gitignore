@@ -1,6 +1,37 @@
+# Build artifacts
 /target
+/dist
+
+# Local editor / assistant
+.claude/settings.local.json
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Secrets / local env (never commit)
+.env
+.env.*
+!.env.example
+
+# Generated scanner / analyzer / stress output (CLI, TUI, docker compose)
+/report.json
+/report.csv
+/report.html
+/*-report.json
+/*-report.csv
+/*-report.html
+/*.sarif
+.rustzap-gitleaks-report.json
+**/.rustzap-gitleaks-report.json
+/reports/*
+!/reports/.gitkeep
+
+# Local clones used for analysis (not part of the product)
+public_repos/
+
+# Draft / local notes
 FEATURES.md
 CHANGELOG.md
-.claude/settings.local.json
-*.json
-public_repos/

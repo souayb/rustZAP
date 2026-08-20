@@ -89,9 +89,12 @@ A Homebrew formula is also generated per release (`packaging/homebrew/`); see
 # Requires Rust 1.75+
 git clone https://github.com/souayb/rustZAP
 cd rustZAP
+./scripts/install-hooks.sh    # Linux/macOS/Git Bash; Windows: scripts\install-hooks.cmd
 cargo build --release
 ./target/release/rustzap --help
 ```
+
+Contribution checks (fmt, clippy, tests) and how to install hooks on Windows are in [CONTRIBUTION.md](CONTRIBUTION.md).
 
 ### Install companion tools (OS-aware)
 

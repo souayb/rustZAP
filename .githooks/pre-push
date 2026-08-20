@@ -1,0 +1,5 @@
+#!/bin/sh
+# Linux / macOS / Git for Windows. Install once: ./scripts/install-hooks.sh
+set -eu
+ROOT="$(git rev-parse --show-toplevel)"
+exec "$ROOT/scripts/dev-check.sh" pre-push
