@@ -385,6 +385,22 @@ enum Commands {
         /// Deterministic brain: a JSON file of scripted steps (no live LLM)
         #[arg(long)]
         script: Option<String>,
+        /// LLM model id (e.g. qwen2.5-coder, gpt-4o-mini, claude-3-5-sonnet). Overrides scope.
+        #[arg(long)]
+        model: Option<String>,
+        /// OpenAI-compatible base URL. Default: http://localhost:11434/v1 (Ollama). Overrides scope.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Env var holding the API key (omit for keyless local servers). Overrides scope.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Force strict JSON output (response_format) — helps some open-source models.
+        #[arg(long)]
+        json_mode: bool,
+        /// Privacy tokenization: redact real hosts/secrets/emails/IPs before they
+        /// reach the LLM, restore locally before tools run. Overrides scope.
+        #[arg(long)]
+        privacy: bool,
         #[arg(short, long, default_value = "agent-report.json")]
         output: String,
         #[arg(long)]
@@ -604,10 +620,22 @@ async fn main() -> anyhow::Result<()> {
             autonomy,
             non_interactive,
             script,
+            model,
+            base_url,
+            api_key_env,
+            json_mode,
+            privacy,
             output,
             sarif_out,
             trace,
         } => {
+            let llm = agent::LlmOverrides {
+                base_url,
+                model,
+                api_key_env,
+                json_mode,
+                privacy,
+            };
             agent::run_agent_cli(
                 scope,
                 goal,
@@ -619,6 +647,7 @@ async fn main() -> anyhow::Result<()> {
                 autonomy,
                 non_interactive,
                 script,
+                llm,
             )
             .await?;
         }

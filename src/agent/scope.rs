@@ -88,15 +88,23 @@ impl Default for Budget {
 }
 
 /// LLM brain configuration (provider-agnostic, OpenAI-compatible).
+///
+/// Works with any server that speaks OpenAI `/chat/completions`: OpenAI,
+/// OpenRouter/Together/Groq, Anthropic & Gemini compat endpoints, and local
+/// servers (Ollama, vLLM, LM Studio, llama.cpp). Local keyless servers just
+/// omit `api_key_env`.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ModelConfig {
-    /// OpenAI-compatible base URL (e.g. an Anthropic-compat gateway).
+    /// OpenAI-compatible base URL. Defaults to local Ollama (`http://localhost:11434/v1`).
     pub base_url: Option<String>,
-    /// Model id; defaults to a Claude model when omitted.
+    /// Model id (e.g. `qwen2.5-coder`, `gpt-4o-mini`, `claude-3-5-sonnet`).
     pub model: Option<String>,
-    /// Env var holding the API key (default `LLM_API_KEY`).
+    /// Env var holding the API key. Omit for keyless local servers.
     pub api_key_env: Option<String>,
+    /// Request strict JSON output via `response_format` (helps open-source models
+    /// that otherwise wrap actions in prose). Off by default for max compatibility.
+    pub json_mode: bool,
 }
 
 /// Parsed, validated scope file.
@@ -122,6 +130,11 @@ pub struct ScopeConfig {
     pub budget: Budget,
     #[serde(default)]
     pub model: ModelConfig,
+    /// Opt-in Dark-Moon privacy tokenization: redact real hosts/secrets/emails/IPs
+    /// before they reach the LLM, restore locally before tool execution. Off by
+    /// default. Only applies to the `LlmBrain` (the scripted CI brain is offline).
+    #[serde(default)]
+    pub privacy: bool,
 
     /// Compiled `forbidden_paths` (built by `compile`, not deserialized).
     #[serde(skip)]

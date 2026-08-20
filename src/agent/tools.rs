@@ -7,8 +7,8 @@
 //! gated by the scope file.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -18,7 +18,19 @@ use crate::agent::trace::Trace;
 use crate::analyze::{self, StaticInputs};
 use crate::report::{AttackPlanEntry, StaticAnalysis};
 use crate::scanner::{self, ScanConfig};
-use crate::types::{DiscoveredUrl, Finding, Severity, UrlSource};
+use crate::types::{
+    DiscoveredUrl, Finding, HttpRequest, HttpResponse, HttpTransaction, Severity, UrlSource,
+};
+
+/// Response/request headers that reqwest manages itself; forwarding them from a
+/// captured request breaks a replay (wrong length, double compression, …).
+const REPLAY_SKIP_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "connection",
+    "accept-encoding",
+    "transfer-encoding",
+];
 
 const HTTP_PROBE_TIMEOUT_SECS: u64 = 10;
 const HTTP_PROBE_MAX_BODY: usize = 64 * 1024;
@@ -29,6 +41,10 @@ pub struct ToolCtx {
     pub trace: Arc<Trace>,
     client: reqwest::Client,
     requests: AtomicU32,
+    /// Strix-style traffic capture: every probe/replay is recorded here so the
+    /// brain can list past requests and replay them with mutations. Reuses the
+    /// `proxy.rs` transaction record so both share one on-disk format.
+    captures: Mutex<Vec<HttpTransaction>>,
 }
 
 impl ToolCtx {
@@ -39,6 +55,7 @@ impl ToolCtx {
             trace,
             client,
             requests: AtomicU32::new(0),
+            captures: Mutex::new(Vec::new()),
         })
     }
 
@@ -59,6 +76,82 @@ impl ToolCtx {
             bail!("out of scope ({}): {url}", verdict.reason());
         }
         Ok(())
+    }
+
+    /// Look up a captured transaction by id (clone of the stored record).
+    fn capture_by_id(&self, id: &str) -> Option<HttpTransaction> {
+        self.captures
+            .lock()
+            .ok()?
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+    }
+
+    /// Drain the captured transactions (called once at end of run to persist them).
+    pub fn take_captures(&self) -> Vec<HttpTransaction> {
+        self.captures
+            .lock()
+            .map(|mut c| std::mem::take(&mut *c))
+            .unwrap_or_default()
+    }
+
+    /// Send one in-scope request, record it as a capture, and return the stored
+    /// transaction plus whether the body was truncated. Shared by `http_probe`
+    /// and `replay_request`.
+    async fn send_and_capture(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<String>,
+        headers: &[(String, String)],
+    ) -> Result<(HttpTransaction, bool)> {
+        self.enforce_scope(url)?;
+        self.charge_request()?;
+        let m = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| anyhow::anyhow!("bad HTTP method: {method}"))?;
+        let mut req = self
+            .client
+            .request(m, url)
+            .timeout(Duration::from_secs(HTTP_PROBE_TIMEOUT_SECS));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        if let Some(b) = &body {
+            req = req.body(b.clone());
+        }
+        let start = Instant::now();
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let resp_headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let full = resp.text().await.unwrap_or_default();
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let truncated = full.len() > HTTP_PROBE_MAX_BODY;
+        let snippet: String = full.chars().take(HTTP_PROBE_MAX_BODY).collect();
+        let txn = HttpTransaction {
+            id: crate::types::uuid_v4(),
+            request: HttpRequest {
+                method: method.to_string(),
+                url: url.to_string(),
+                headers: headers.to_vec(),
+                body,
+            },
+            response: Some(HttpResponse {
+                status,
+                headers: resp_headers,
+                body: snippet,
+                elapsed_ms,
+            }),
+            timestamp: chrono::Utc::now(),
+        };
+        if let Ok(mut caps) = self.captures.lock() {
+            caps.push(txn.clone());
+        }
+        Ok((txn, truncated))
     }
 }
 
@@ -158,7 +251,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "http_probe",
-            description: "Send one bounded HTTP request to an in-scope URL and return status/headers/body-snippet.",
+            description: "Send one bounded HTTP request to an in-scope URL and return status/headers/body-snippet. The request/response is captured (returns a capture_id) for later replay.",
             action_class: ActionClass::Recon,
             input_schema: json!({
                 "type": "object",
@@ -168,6 +261,27 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "body": {"type": "string"}
                 },
                 "required": ["url"]
+            }),
+        },
+        ToolSpec {
+            name: "list_captures",
+            description: "List captured HTTP transactions from this run (id, method, url, status) — the traffic available to replay.",
+            action_class: ActionClass::Recon,
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolSpec {
+            name: "replay_request",
+            description: "Re-send a captured request (by capture_id) with optional mutations, or a fresh request. Overrides: method/url/body, and headers (object of name→value). Returns the new response plus a diff vs the original (status change, body-length delta).",
+            action_class: ActionClass::Recon,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "capture_id": {"type": "string", "description": "Id of a captured request to base the replay on (from http_probe/list_captures). Omit to send a fresh request (url required)."},
+                    "url": {"type": "string", "description": "Override the URL (required if no capture_id)."},
+                    "method": {"type": "string", "description": "Override the HTTP method."},
+                    "body": {"type": "string", "description": "Override the request body."},
+                    "headers": {"type": "object", "description": "Header name→value overrides merged onto the captured request."}
+                }
             }),
         },
     ]
@@ -192,6 +306,8 @@ pub async fn execute(name: &str, args: &Value, ctx: &ToolCtx) -> Result<ToolOutp
         "list_plugins" => Ok(list_plugins_tool()),
         "run_plugin" => run_plugin(args, ctx).await,
         "http_probe" => http_probe(args, ctx).await,
+        "list_captures" => Ok(list_captures_tool(ctx)),
+        "replay_request" => replay_request(args, ctx).await,
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -359,37 +475,132 @@ async fn run_plugin(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
 
 async fn http_probe(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     let url = arg_str(args, "url")?;
-    ctx.enforce_scope(&url)?;
-    ctx.charge_request()?;
     let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
     let body = args.get("body").and_then(|v| v.as_str()).map(String::from);
+    let (txn, truncated) = ctx.send_and_capture(method, &url, body, &[]).await?;
+    Ok(ToolOutput::value_only(probe_value(&txn, truncated)))
+}
 
-    let m = reqwest::Method::from_bytes(method.as_bytes())
-        .map_err(|_| anyhow::anyhow!("bad HTTP method: {method}"))?;
-    let mut req = ctx
-        .client
-        .request(m, &url)
-        .timeout(Duration::from_secs(HTTP_PROBE_TIMEOUT_SECS));
-    if let Some(b) = body {
-        req = req.body(b);
-    }
-    let resp = req.send().await?;
-    let status = resp.status().as_u16();
+/// Brain-facing view of a captured transaction.
+fn probe_value(txn: &HttpTransaction, truncated: bool) -> Value {
+    let resp = txn.response.as_ref();
     let headers: Vec<Value> = resp
-        .headers()
-        .iter()
-        .map(|(k, v)| json!({"name": k.as_str(), "value": v.to_str().unwrap_or("")}))
-        .collect();
-    let full = resp.text().await.unwrap_or_default();
-    let truncated = full.len() > HTTP_PROBE_MAX_BODY;
-    let snippet = full.chars().take(HTTP_PROBE_MAX_BODY).collect::<String>();
-    Ok(ToolOutput::value_only(json!({
-        "url": url,
-        "status": status,
+        .map(|r| {
+            r.headers
+                .iter()
+                .map(|(k, v)| json!({"name": k, "value": v}))
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "capture_id": txn.id,
+        "url": txn.request.url,
+        "method": txn.request.method,
+        "status": resp.map(|r| r.status),
         "headers": headers,
-        "body_snippet": snippet,
+        "body_snippet": resp.map(|r| r.body.clone()).unwrap_or_default(),
         "body_truncated": truncated,
-    })))
+    })
+}
+
+fn list_captures_tool(ctx: &ToolCtx) -> ToolOutput {
+    let caps = ctx.captures.lock().map(|c| c.clone()).unwrap_or_default();
+    let items: Vec<Value> = caps
+        .iter()
+        .map(|t| {
+            json!({
+                "capture_id": t.id,
+                "method": t.request.method,
+                "url": t.request.url,
+                "status": t.response.as_ref().map(|r| r.status),
+            })
+        })
+        .collect();
+    ToolOutput::value_only(json!({"count": items.len(), "captures": items}))
+}
+
+/// Merge header overrides (case-insensitive) onto a base header list.
+fn merge_headers(base: &[(String, String)], overrides: &Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = base
+        .iter()
+        .filter(|(k, _)| {
+            !REPLAY_SKIP_HEADERS
+                .iter()
+                .any(|s| k.eq_ignore_ascii_case(s))
+        })
+        .cloned()
+        .collect();
+    if let Some(map) = overrides.as_object() {
+        for (k, v) in map {
+            let Some(val) = v.as_str() else { continue };
+            out.retain(|(ek, _)| !ek.eq_ignore_ascii_case(k));
+            out.push((k.clone(), val.to_string()));
+        }
+    }
+    out
+}
+
+async fn replay_request(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+    // Base the replay on a captured request when an id is given.
+    let base = match args.get("capture_id").and_then(|v| v.as_str()) {
+        Some(id) => Some(
+            ctx.capture_by_id(id)
+                .ok_or_else(|| anyhow::anyhow!("no captured request with capture_id '{id}'"))?,
+        ),
+        None => None,
+    };
+
+    let (base_method, base_url, base_headers, base_body, base_resp) = match &base {
+        Some(t) => (
+            t.request.method.clone(),
+            t.request.url.clone(),
+            t.request.headers.clone(),
+            t.request.body.clone(),
+            t.response.clone(),
+        ),
+        None => ("GET".to_string(), String::new(), Vec::new(), None, None),
+    };
+
+    let method = args
+        .get("method")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or(base_method);
+    let url = match args.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u.to_string(),
+        None if !base_url.is_empty() => base_url,
+        None => bail!("replay_request needs a url (or a capture_id to base on)"),
+    };
+    let body = match args.get("body").and_then(|v| v.as_str()) {
+        Some(b) => Some(b.to_string()),
+        None => base_body,
+    };
+    let headers = match args.get("headers") {
+        Some(h) => merge_headers(&base_headers, h),
+        None => base_headers
+            .into_iter()
+            .filter(|(k, _)| {
+                !REPLAY_SKIP_HEADERS
+                    .iter()
+                    .any(|s| k.eq_ignore_ascii_case(s))
+            })
+            .collect(),
+    };
+
+    let (txn, truncated) = ctx.send_and_capture(&method, &url, body, &headers).await?;
+
+    // Diff vs the original response, if we replayed a captured one.
+    let mut value = probe_value(&txn, truncated);
+    if let (Some(orig), Some(new)) = (base_resp.as_ref(), txn.response.as_ref()) {
+        value["diff"] = json!({
+            "based_on": base.as_ref().map(|t| t.id.clone()),
+            "status_changed": orig.status != new.status,
+            "orig_status": orig.status,
+            "new_status": new.status,
+            "body_len_delta": new.body.len() as i64 - orig.body.len() as i64,
+        });
+    }
+    Ok(ToolOutput::value_only(value))
 }
 
 /// Compact, brain-friendly summary of a finding set.
@@ -499,5 +710,116 @@ mod tests {
         let specs = tool_specs();
         assert!(specs.len() >= 6);
         assert_eq!(action_class_of("scan_target"), ActionClass::Recon);
+        assert_eq!(action_class_of("replay_request"), ActionClass::Recon);
+    }
+
+    #[test]
+    fn merge_headers_drops_skip_list_and_applies_overrides() {
+        let base = vec![
+            ("Host".into(), "old".into()),
+            ("Cookie".into(), "sid=1".into()),
+            ("Accept".into(), "text/html".into()),
+        ];
+        let merged = merge_headers(&base, &json!({"Accept": "application/json", "X-New": "1"}));
+        // Host (skip-list) is gone; Cookie survives; Accept is overridden; X-New added.
+        assert!(!merged.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")));
+        assert!(merged.iter().any(|(k, v)| k == "Cookie" && v == "sid=1"));
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("accept") && v == "application/json"));
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("accept"))
+                .count(),
+            1,
+            "override replaces rather than duplicates"
+        );
+        assert!(merged.iter().any(|(k, v)| k == "X-New" && v == "1"));
+    }
+
+    /// Minimal echo server: body reflects the method + path so replay mutations
+    /// are observable. Returns the bound address.
+    async fn spawn_echo_server() -> std::net::SocketAddr {
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Request, Response, Server};
+        let make = make_service_fn(|_| async {
+            Ok::<_, std::convert::Infallible>(service_fn(|req: Request<Body>| async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_string();
+                Ok::<_, std::convert::Infallible>(Response::new(Body::from(format!(
+                    "method={method} path={path}"
+                ))))
+            }))
+        });
+        let addr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind(&addr).serve(make);
+        let local = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+        local
+    }
+
+    #[tokio::test]
+    async fn probe_captures_then_replay_mutates_and_diffs() {
+        let addr = spawn_echo_server().await;
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let url = format!("http://{addr}/a");
+
+        // Probe records a capture and returns its id.
+        let probe = execute("http_probe", &json!({ "url": url }), &ctx)
+            .await
+            .unwrap();
+        let id = probe.value["capture_id"].as_str().unwrap().to_string();
+        assert!(probe.value["body_snippet"]
+            .as_str()
+            .unwrap()
+            .contains("method=GET"));
+
+        let listed = execute("list_captures", &json!({}), &ctx).await.unwrap();
+        assert_eq!(listed.value["count"].as_u64().unwrap(), 1);
+
+        // Replay the captured request with a method mutation.
+        let replay = execute(
+            "replay_request",
+            &json!({ "capture_id": id, "method": "POST" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(replay.value["body_snippet"]
+            .as_str()
+            .unwrap()
+            .contains("method=POST"));
+        assert_eq!(replay.value["diff"]["status_changed"], json!(false));
+
+        // Both requests are now captured and drainable for the report dump.
+        assert_eq!(ctx.take_captures().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn replay_unknown_capture_id_errors() {
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let res = execute(
+            "replay_request",
+            &json!({ "capture_id": "does-not-exist" }),
+            &ctx,
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_enforces_scope() {
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let res = execute(
+            "replay_request",
+            &json!({ "url": "http://evil.com/" }),
+            &ctx,
+        )
+        .await;
+        let err = res.err().expect("expected an out-of-scope error");
+        assert!(err.to_string().contains("out of scope"));
     }
 }

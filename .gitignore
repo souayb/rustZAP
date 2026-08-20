@@ -4,6 +4,10 @@
 
 # Local editor / assistant
 .claude/settings.local.json
+# ruflo / claude-flow generated runtime state (per-machine tuning + telemetry)
+.claude-flow/
+.claude/proven-config.json
+.claude/.proven-config-version
 .idea/
 .vscode/
 *.swp
