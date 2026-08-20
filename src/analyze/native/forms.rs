@@ -6,7 +6,7 @@ use regex::Regex;
 use scraper::{Html, Selector};
 
 use crate::analyze::inventory::{
-    file_url, is_html_like, line_number, read_text_capped, rel_path, MAX_SOURCE_BYTES,
+    file_url, is_html_like, line_number, read_text_head, rel_path, MAX_SOURCE_BYTES,
 };
 use crate::analyze::native::SOURCE_TOOL;
 use crate::report::AttackPlanEntry;
@@ -26,7 +26,7 @@ pub fn scan(root: &Path, files: &[PathBuf]) -> FormScanResult {
         if !is_html_like(path) {
             continue;
         }
-        let Some(src) = read_text_capped(path, MAX_SOURCE_BYTES) else {
+        let Some((src, _truncated)) = read_text_head(path, MAX_SOURCE_BYTES) else {
             continue;
         };
         let extracted = extract_forms(&src);

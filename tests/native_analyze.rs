@@ -69,6 +69,7 @@ async fn run_static_analysis_native_attaches_static_block() {
         trivy_json: None,
         gitleaks_json: None,
         checkov_json: None,
+        walk: rustzap::analyze::inventory::WalkConfig::default(),
     })
     .await
     .expect("static native");

@@ -72,10 +72,12 @@ pub fn parse_tools(spec: &str) -> Result<Vec<AnalyzeTool>> {
     Ok(out)
 }
 
-/// Default `--tools` for `analyze` when the flag is omitted.
-pub const DEFAULT_ANALYZE_TOOLS: &str = "semgrep";
+/// Default `--tools` for `analyze` when the flag is omitted. `native` is always
+/// included so the zero-dependency full-tree walk (inventory, secrets, IaC,
+/// attack plan) runs even when Semgrep is absent.
+pub const DEFAULT_ANALYZE_TOOLS: &str = "semgrep,native";
 /// Default `--tools` for `audit` when the flag is omitted.
-pub const DEFAULT_AUDIT_TOOLS: &str = "semgrep,trivy,gitleaks";
+pub const DEFAULT_AUDIT_TOOLS: &str = "semgrep,trivy,gitleaks,native";
 
 /// Spawn failed because the tool binary was not on PATH (`ENOENT`).
 #[derive(Debug, thiserror::Error)]
@@ -298,6 +300,8 @@ pub struct StaticInputs {
     pub trivy_json: Option<PathBuf>,
     pub gitleaks_json: Option<PathBuf>,
     pub checkov_json: Option<PathBuf>,
+    /// Controls the native repo walk (`.gitignore` / symlink handling).
+    pub walk: crate::analyze::inventory::WalkConfig,
 }
 
 /// Findings plus optional Phase 2.5 `static{}` roll-up (when `native` ran).
@@ -361,7 +365,7 @@ pub async fn run_static_analysis(inputs: &StaticInputs) -> Result<StaticRunResul
             );
         }
         warn_fallback_native("semgrep");
-        let native = native::run(&inputs.repo)
+        let native = native::run_with(&inputs.repo, inputs.walk)
             .await
             .context("Running native static analyzers")?;
         all.extend(native.findings);
@@ -529,6 +533,8 @@ pub async fn run_analyze(
     sarif_out: Option<String>,
     assume_yes: bool,
     tools_explicit: bool,
+    include_ignored: bool,
+    follow_symlinks: bool,
 ) -> Result<Report> {
     let start = Instant::now();
     let parsed_tools = parse_tools(&tools)?;
@@ -541,6 +547,10 @@ pub async fn run_analyze(
         trivy_json: trivy_json.map(PathBuf::from),
         gitleaks_json: gitleaks_json.map(PathBuf::from),
         checkov_json: checkov_json.map(PathBuf::from),
+        walk: crate::analyze::inventory::WalkConfig {
+            include_ignored,
+            follow_symlinks,
+        },
     };
 
     confirm_repo_access(&inputs.repo, assume_yes)?;
@@ -576,6 +586,8 @@ pub async fn run_analyze_cli(
     sarif_out: Option<String>,
     assume_yes: bool,
     tools_explicit: bool,
+    include_ignored: bool,
+    follow_symlinks: bool,
 ) -> Result<()> {
     run_analyze(
         repo,
@@ -589,6 +601,8 @@ pub async fn run_analyze_cli(
         sarif_out,
         assume_yes,
         tools_explicit,
+        include_ignored,
+        follow_symlinks,
     )
     .await
     .map(|_| ())
@@ -614,6 +628,10 @@ pub async fn run_audit_cli(
     insecure: bool,
     assume_yes: bool,
     tools_explicit: bool,
+    include_ignored: bool,
+    follow_symlinks: bool,
+    active_all_paths: bool,
+    passive_all_methods: bool,
 ) -> Result<()> {
     let start = Instant::now();
     let parsed_tools = parse_tools(&tools)?;
@@ -627,6 +645,10 @@ pub async fn run_audit_cli(
         trivy_json: trivy_json.map(PathBuf::from),
         gitleaks_json: gitleaks_json.map(PathBuf::from),
         checkov_json: checkov_json.map(PathBuf::from),
+        walk: crate::analyze::inventory::WalkConfig {
+            include_ignored,
+            follow_symlinks,
+        },
     };
 
     confirm_repo_access(&static_inputs.repo, assume_yes)?;
@@ -663,6 +685,8 @@ pub async fn run_audit_cli(
             har_path: None,
             nuclei: false,
             nuclei_jsonl: None,
+            active_all_paths,
+            passive_all_methods,
         };
         let collected = collect_scan(scan_config).await?;
         findings.extend(collected.findings);
@@ -690,6 +714,7 @@ pub async fn run_audit_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyze::inventory::WalkConfig;
     use crate::types::Severity;
     use std::path::Path;
 
@@ -922,6 +947,7 @@ mod tests {
             trivy_json: None,
             gitleaks_json: None,
             checkov_json: None,
+            walk: WalkConfig::default(),
         })
         .await
         .expect("native fallback");
@@ -944,6 +970,7 @@ mod tests {
             trivy_json: None,
             gitleaks_json: None,
             checkov_json: None,
+            walk: WalkConfig::default(),
         })
         .await
         {
@@ -969,6 +996,7 @@ mod tests {
             trivy_json: None,
             gitleaks_json: None,
             checkov_json: Some(root.join("tests/fixtures/checkov_small.json")),
+            walk: WalkConfig::default(),
         })
         .await
         .expect("skip semgrep, keep checkov");
@@ -992,6 +1020,7 @@ mod tests {
             trivy_json: None,
             gitleaks_json: None,
             checkov_json: None,
+            walk: WalkConfig::default(),
         })
         .await
         {
@@ -1106,6 +1135,8 @@ mod tests {
             None,
             true,
             true,
+            false,
+            false,
         )
         .await
         .expect("analyze native");
@@ -1144,6 +1175,7 @@ mod tests {
             trivy_json: None,
             gitleaks_json: None,
             checkov_json: Some(root.join("tests/fixtures/checkov_small.json")),
+            walk: WalkConfig::default(),
         })
         .await
         .expect("checkov fixture");
@@ -1168,6 +1200,7 @@ mod tests {
             trivy_json: None,
             gitleaks_json: None,
             checkov_json: Some(root.join("tests/fixtures/checkov_small.json")),
+            walk: WalkConfig::default(),
         })
         .await
         .expect("native+checkov");
@@ -1282,6 +1315,10 @@ mod tests {
             false,
             true,
             true,
+            false,
+            false,
+            false,
+            false,
         )
         .await
         .expect("audit static");

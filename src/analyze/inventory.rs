@@ -9,7 +9,9 @@ use crate::report::Inventory;
 use crate::types::{CodeLocation, Finding, Severity};
 
 pub(crate) const MAX_REPO_FILES: usize = 25_000;
-pub(crate) const MAX_SOURCE_BYTES: u64 = 512 * 1024;
+/// Per-file byte budget for heuristic content scans. Oversized files are read
+/// up to this many bytes from the head (see [`read_text_head`]) rather than skipped.
+pub(crate) const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ENTRYPOINTS: usize = 40;
 
 /// Directories skipped by the repo walk: version-control internals and
@@ -87,8 +89,59 @@ struct WalkFrame {
     ignore: IgnoreSet,
 }
 
-/// Walk `root` (file or directory), skipping generated trees, `.gitignore`, and `.rustzapignore`.
+/// Options controlling how `collect_repo_files_with` walks the tree.
+///
+/// The default is safe: respect ignore files and do not follow symlinks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalkConfig {
+    /// Descend into and collect paths matched by `.gitignore` / `.rustzapignore`.
+    pub include_ignored: bool,
+    /// Follow symlinked files and directories (with cycle protection).
+    pub follow_symlinks: bool,
+}
+
+/// Filenames that commonly hold credentials. These are collected even when a
+/// `.gitignore` rule would normally exclude them — secrets frequently live in
+/// ignored files (`.env`, key material), which is exactly what we must scan.
+fn is_sensitive_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const EXACT: &[&str] = &[
+        "credentials",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".pgpass",
+        ".htpasswd",
+        ".dockercfg",
+    ];
+    if EXACT.contains(&lower.as_str()) {
+        return true;
+    }
+    // `.env`, `.env.local`, `.env.production`, …
+    if lower == ".env" || lower.starts_with(".env.") {
+        return true;
+    }
+    const EXTS: &[&str] = &["pem", "key", "p12", "pfx", "keystore", "jks", "kdbx"];
+    Path::new(&lower)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| EXTS.contains(&e))
+        .unwrap_or(false)
+}
+
+/// Walk `root` (file or directory), skipping generated trees, `.gitignore`, and
+/// `.rustzapignore`, with the default [`WalkConfig`].
 pub fn collect_repo_files(root: &Path) -> Vec<PathBuf> {
+    collect_repo_files_with(root, WalkConfig::default())
+}
+
+/// Walk `root` honoring `cfg`. Sensitive credential filenames are always
+/// collected, even when ignored, so secret scanning cannot be gitignored away.
+pub fn collect_repo_files_with(root: &Path, cfg: WalkConfig) -> Vec<PathBuf> {
     if root.is_file() {
         return vec![root.to_path_buf()];
     }
@@ -98,6 +151,11 @@ pub fn collect_repo_files(root: &Path) -> Vec<PathBuf> {
 
     let mut out = Vec::new();
     let mut truncated = false;
+    // Canonical dirs already visited — guards against symlink cycles.
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    if let Ok(c) = root.canonicalize() {
+        visited.insert(c);
+    }
     let mut stack = vec![WalkFrame {
         dir: root.to_path_buf(),
         ignore: root_ignore,
@@ -122,22 +180,35 @@ pub fn collect_repo_files(root: &Path) -> Vec<PathBuf> {
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            if meta.file_type().is_symlink() {
+            let is_symlink = meta.file_type().is_symlink();
+            if is_symlink && !cfg.follow_symlinks {
                 continue;
             }
+            // With follow_symlinks, `metadata()` already resolved the target
+            // (unlike `symlink_metadata`), so is_dir()/is_file() reflect it.
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             let rel = rel_path(root, &path);
             if meta.is_dir() {
-                if should_skip_dir(&name_str) || ignore.is_ignored(&rel, true) {
+                if should_skip_dir(&name_str) {
                     continue;
+                }
+                if !cfg.include_ignored && ignore.is_ignored(&rel, true) {
+                    continue;
+                }
+                // Cycle guard: only descend into a canonical dir once.
+                if let Ok(c) = path.canonicalize() {
+                    if !visited.insert(c) {
+                        continue;
+                    }
                 }
                 stack.push(WalkFrame {
                     dir: path,
                     ignore: ignore.clone(),
                 });
             } else if meta.is_file() {
-                if ignore.is_ignored(&rel, false) {
+                let ignored = !cfg.include_ignored && ignore.is_ignored(&rel, false);
+                if ignored && !is_sensitive_filename(&name_str) {
                     continue;
                 }
                 out.push(path);
@@ -158,6 +229,7 @@ pub fn collect_repo_files(root: &Path) -> Vec<PathBuf> {
         eprintln!("{msg}");
     }
     out.sort();
+    out.dedup();
     out
 }
 
@@ -165,6 +237,8 @@ fn should_skip_dir(name: &str) -> bool {
     SKIP_DIRS.iter().any(|s| name.eq_ignore_ascii_case(s))
 }
 
+/// Read a whole text file, returning `None` if it exceeds `max_bytes` or is
+/// binary. Used for manifests that must parse in full (e.g. `package.json`).
 pub fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
     let meta = fs::metadata(path).ok()?;
     if meta.len() > max_bytes {
@@ -175,6 +249,26 @@ pub fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
         return None;
     }
     String::from_utf8(bytes).ok()
+}
+
+/// Read up to `max_bytes` from the head of a file for heuristic scanning.
+///
+/// Unlike [`read_text_capped`], oversized files are **partially** scanned
+/// rather than skipped. Returns `(text, truncated)` where `truncated` is true
+/// when the file was longer than `max_bytes`; `None` for binary/unreadable
+/// files. Invalid UTF-8 at the cut point is replaced, not rejected.
+pub fn read_text_head(path: &Path, max_bytes: u64) -> Option<(String, bool)> {
+    use std::io::Read;
+    let meta = fs::metadata(path).ok()?;
+    let full = meta.len();
+    let to_read = full.min(max_bytes) as usize;
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; to_read];
+    f.read_exact(&mut buf).ok()?;
+    if buf.contains(&0) {
+        return None;
+    }
+    Some((String::from_utf8_lossy(&buf).into_owned(), full > max_bytes))
 }
 
 pub fn rel_path(root: &Path, path: &Path) -> String {

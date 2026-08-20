@@ -14,6 +14,8 @@ use crate::types::{DiscoveredUrl, Finding, Severity};
 pub struct PassiveScanner {
     client: Arc<reqwest::Client>,
     seen_origins: Mutex<HashSet<String>>,
+    /// When true, passive checks also run on non-GET discovered requests.
+    all_methods: bool,
 }
 
 impl PassiveScanner {
@@ -21,7 +23,14 @@ impl PassiveScanner {
         PassiveScanner {
             client,
             seen_origins: Mutex::new(HashSet::new()),
+            all_methods: false,
         }
+    }
+
+    /// Enable passive checks on non-GET requests (`--passive-all-methods`).
+    pub fn with_all_methods(mut self, all_methods: bool) -> Self {
+        self.all_methods = all_methods;
+        self
     }
 
     /// Run all passive checks against discovered URLs
@@ -32,8 +41,8 @@ impl PassiveScanner {
             pb.inc(1);
             pb.set_message(format!("Checking {}", &du.url[..du.url.len().min(50)]));
 
-            // Only check GET URLs for passive scanning
-            if du.method != "GET" {
+            // Only check GET URLs for passive scanning, unless all methods opted in.
+            if !self.all_methods && du.method != "GET" {
                 continue;
             }
 

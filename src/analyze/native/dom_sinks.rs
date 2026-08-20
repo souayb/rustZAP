@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 use crate::analyze::inventory::{
-    file_url, is_js_like, is_minified_name, line_number, read_text_capped, rel_path,
-    MAX_SOURCE_BYTES,
+    file_url, is_js_like, is_minified_name, line_number, read_text_head, rel_path, MAX_SOURCE_BYTES,
 };
 use crate::analyze::native::SOURCE_TOOL;
 use crate::types::{CodeLocation, Finding, Severity};
@@ -193,7 +192,7 @@ pub fn scan(root: &Path, files: &[PathBuf]) -> Vec<Finding> {
         if !is_js_like(path) || is_minified_name(path) {
             continue;
         }
-        let Some(src) = read_text_capped(path, MAX_SOURCE_BYTES) else {
+        let Some((src, _truncated)) = read_text_head(path, MAX_SOURCE_BYTES) else {
             continue;
         };
         out.extend(scan_source(root, path, &src, &pats));

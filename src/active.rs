@@ -39,10 +39,17 @@ pub struct ActiveScanner {
     client: Arc<reqwest::Client>,
     plugins: Vec<Box<dyn ScanPlugin>>,
     semaphore: Arc<Semaphore>,
+    /// When true, run plugins on URLs without query parameters too.
+    all_paths: bool,
 }
 
 impl ActiveScanner {
-    pub fn new(client: Arc<reqwest::Client>, enabled: Vec<String>, concurrency: usize) -> Self {
+    pub fn new(
+        client: Arc<reqwest::Client>,
+        enabled: Vec<String>,
+        concurrency: usize,
+        all_paths: bool,
+    ) -> Self {
         let mut all_plugins: Vec<Box<dyn ScanPlugin>> = vec![
             Box::new(XssPlugin),
             Box::new(SqlInjectionPlugin),
@@ -73,6 +80,7 @@ impl ActiveScanner {
             client,
             plugins,
             semaphore: Arc::new(Semaphore::new(concurrency)),
+            all_paths,
         }
     }
 
@@ -93,7 +101,8 @@ impl ActiveScanner {
             pb.inc(1);
             pb.set_message(format!("Scanning {}", &du.url[..du.url.len().min(50)]));
 
-            let has_params = !du.parameters.is_empty() || du.url.contains('?');
+            // `--active-all-paths` forces plugins to run even on paramless URLs.
+            let has_params = self.all_paths || !du.parameters.is_empty() || du.url.contains('?');
             let any_always_run = self.plugins.iter().any(|p| p.always_run());
 
             // Skip URLs with no parameters for active scanning, unless at

@@ -49,6 +49,11 @@ pub struct ScanConfig {
     pub nuclei: bool,
     /// Opt-in: parse existing Nuclei `-jsonl` output (no spawn).
     pub nuclei_jsonl: Option<String>,
+    /// Opt-in: run active plugins on URLs without query parameters too
+    /// (path-based injection). Higher traffic — off by default.
+    pub active_all_paths: bool,
+    /// Opt-in: run passive checks on non-GET discovered requests too.
+    pub passive_all_methods: bool,
 }
 
 /// Shared HTTP client factory
@@ -145,7 +150,8 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
 
     let passive_pb =
         ProgressBar::with_draw_target(Some(discovered.len() as u64), ProgressDrawTarget::hidden());
-    let passive_scanner = PassiveScanner::new(client.clone());
+    let passive_scanner =
+        PassiveScanner::new(client.clone()).with_all_methods(config.passive_all_methods);
     let passive_findings = passive_scanner.scan_all(&discovered, &passive_pb).await?;
     passive_pb.finish();
     {
@@ -159,8 +165,12 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
             Some(discovered.len() as u64),
             ProgressDrawTarget::hidden(),
         );
-        let active_scanner =
-            ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
+        let active_scanner = ActiveScanner::new(
+            client.clone(),
+            config.plugins.clone(),
+            config.concurrency,
+            config.active_all_paths,
+        );
         active_module_names = active_scanner.enabled_module_names();
         let af = active_scanner.scan_all(&discovered, &active_pb).await?;
         active_pb.finish();
@@ -421,7 +431,8 @@ pub async fn run_scan_with_events(
         }
     });
 
-    let passive_scanner = PassiveScanner::new(client.clone());
+    let passive_scanner =
+        PassiveScanner::new(client.clone()).with_all_methods(config.passive_all_methods);
     let passive_findings = passive_scanner.scan_all(&discovered, &passive_pb).await?;
     passive_pb.finish();
     let _ = passive_tick.await;
@@ -469,8 +480,12 @@ pub async fn run_scan_with_events(
             }
         });
 
-        let active_scanner =
-            ActiveScanner::new(client.clone(), config.plugins.clone(), config.concurrency);
+        let active_scanner = ActiveScanner::new(
+            client.clone(),
+            config.plugins.clone(),
+            config.concurrency,
+            config.active_all_paths,
+        );
         active_module_names = active_scanner.enabled_module_names();
         let active_findings = active_scanner.scan_all(&discovered, &active_pb).await?;
         active_pb.finish();

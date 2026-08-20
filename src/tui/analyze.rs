@@ -22,7 +22,7 @@ use crate::analyze::{self, parse_tools};
 use crate::report::Report;
 use crate::types::{Finding, Severity};
 
-/// TUI default `--tools` (CLI `DEFAULT_ANALYZE_TOOLS` remains `semgrep`).
+/// TUI default `--tools` (CLI `DEFAULT_ANALYZE_TOOLS` is `semgrep,native`).
 pub const DEFAULT_TUI_ANALYZE_TOOLS: &str = "native";
 /// Default JSON/CSV/HTML path for TUI-launched analysis.
 pub const DEFAULT_ANALYZE_OUTPUT: &str = "analyze-report.json";
@@ -185,6 +185,8 @@ pub fn spawn_analyze(
             sarif_out,
             true,
             true,
+            false,
+            false,
         )
         .await
         {

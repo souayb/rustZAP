@@ -192,6 +192,8 @@ impl ConfigForm {
             har_path: None,
             nuclei: false,
             nuclei_jsonl: None,
+            active_all_paths: false,
+            passive_all_methods: false,
         }
     }
 }

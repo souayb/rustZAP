@@ -72,6 +72,12 @@ enum Commands {
         /// Opt-in: parse existing Nuclei `-jsonl` output (no spawn)
         #[arg(long)]
         nuclei_jsonl: Option<String>,
+        /// Opt-in: run active plugins on URLs without query params too (more traffic)
+        #[arg(long)]
+        active_all_paths: bool,
+        /// Opt-in: run passive checks on non-GET discovered requests too
+        #[arg(long)]
+        passive_all_methods: bool,
     },
 
     /// Run spider only
@@ -150,6 +156,14 @@ enum Commands {
         /// Assume yes — skip the interactive repo-access prompt (required in CI / non-TTY)
         #[arg(short = 'y', long)]
         yes: bool,
+
+        /// Also scan paths excluded by .gitignore / .rustzapignore (full-tree coverage)
+        #[arg(long)]
+        include_ignored: bool,
+
+        /// Follow symlinked files and directories (cycle-protected)
+        #[arg(long)]
+        follow_symlinks: bool,
     },
 
     /// Unified audit: static analysis + optional DAST scan
@@ -215,6 +229,22 @@ enum Commands {
         /// Assume yes — skip the interactive repo-access prompt (required in CI / non-TTY)
         #[arg(short = 'y', long)]
         yes: bool,
+
+        /// Also scan paths excluded by .gitignore / .rustzapignore (full-tree coverage)
+        #[arg(long)]
+        include_ignored: bool,
+
+        /// Follow symlinked files and directories (cycle-protected)
+        #[arg(long)]
+        follow_symlinks: bool,
+
+        /// Opt-in: run active plugins on URLs without query params too (more traffic)
+        #[arg(long)]
+        active_all_paths: bool,
+
+        /// Opt-in: run passive checks on non-GET discovered requests too
+        #[arg(long)]
+        passive_all_methods: bool,
     },
 
     /// Stress test / load test an API endpoint
@@ -373,6 +403,8 @@ async fn main() -> anyhow::Result<()> {
             har_path,
             nuclei,
             nuclei_jsonl,
+            active_all_paths,
+            passive_all_methods,
         } => {
             let config = ScanConfig {
                 target_url: target,
@@ -394,6 +426,8 @@ async fn main() -> anyhow::Result<()> {
                 har_path,
                 nuclei,
                 nuclei_jsonl,
+                active_all_paths,
+                passive_all_methods,
             };
             scanner::run_scan(config).await?;
         }
@@ -434,6 +468,8 @@ async fn main() -> anyhow::Result<()> {
             output,
             sarif_out,
             yes,
+            include_ignored,
+            follow_symlinks,
         } => {
             let tools_explicit = tools.is_some();
             let tools = tools.unwrap_or_else(|| analyze::DEFAULT_ANALYZE_TOOLS.to_string());
@@ -450,6 +486,8 @@ async fn main() -> anyhow::Result<()> {
                 sarif_out,
                 yes,
                 tools_explicit,
+                include_ignored,
+                follow_symlinks,
             )
             .await?;
         }
@@ -473,6 +511,10 @@ async fn main() -> anyhow::Result<()> {
             insecure,
             plugins,
             yes,
+            include_ignored,
+            follow_symlinks,
+            active_all_paths,
+            passive_all_methods,
         } => {
             let tools_explicit = tools.is_some();
             let tools = tools.unwrap_or_else(|| analyze::DEFAULT_AUDIT_TOOLS.to_string());
@@ -496,6 +538,10 @@ async fn main() -> anyhow::Result<()> {
                 insecure,
                 yes,
                 tools_explicit,
+                include_ignored,
+                follow_symlinks,
+                active_all_paths,
+                passive_all_methods,
             )
             .await?;
         }

@@ -5,19 +5,22 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::analyze::inventory::{self, collect_repo_files};
+use crate::analyze::inventory::{self, collect_repo_files_with, WalkConfig};
 use crate::report::{AttackPlanEntry, Inventory};
 use crate::types::Finding;
 
+pub mod config_audit;
 pub mod dom_sinks;
 pub mod forms;
 pub mod js_surface;
 pub mod params;
+pub mod secrets;
 
 pub const SOURCE_TOOL: &str = "rustzap-native";
 
 pub const NATIVE_MODULES: &[&str] = &[
     "sast/inventory",
+    "sast/secrets",
     "sast/js-secrets",
     "sast/js-urls",
     "sast/dom-sinks",
@@ -26,6 +29,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     "sast/js-postmessage",
     "sast/forms",
     "sast/params",
+    "iac/native",
 ];
 
 pub struct NativeScanResult {
@@ -34,9 +38,15 @@ pub struct NativeScanResult {
     pub attack_plan: Vec<AttackPlanEntry>,
 }
 
-/// Run inventory, then JS/HTML/param analyzers in parallel over `repo`.
+/// Run inventory, then JS/HTML/param analyzers in parallel over `repo`,
+/// using the default [`WalkConfig`].
 pub async fn run(repo: &Path) -> Result<NativeScanResult> {
-    let files = collect_repo_files(repo);
+    run_with(repo, WalkConfig::default()).await
+}
+
+/// Like [`run`], but with an explicit walk configuration (ignore/symlink flags).
+pub async fn run_with(repo: &Path, walk: WalkConfig) -> Result<NativeScanResult> {
+    let files = collect_repo_files_with(repo, walk);
     run_on_files(repo, &files).await
 }
 
@@ -54,8 +64,12 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     let forms_files = Arc::clone(&files);
     let params_root = Arc::clone(&root);
     let params_files = Arc::clone(&files);
+    let secrets_root = Arc::clone(&root);
+    let secrets_files = Arc::clone(&files);
+    let config_root = Arc::clone(&root);
+    let config_files = Arc::clone(&files);
 
-    let (js_res, sinks_res, forms_res, params_res) = tokio::join!(
+    let (js_res, sinks_res, forms_res, params_res, secrets_res, config_res) = tokio::join!(
         tokio::task::spawn_blocking(move || js_surface::scan(js_root.as_path(), js_files.as_ref())),
         tokio::task::spawn_blocking(move || {
             dom_sinks::scan(sinks_root.as_path(), sinks_files.as_ref())
@@ -67,18 +81,28 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
         tokio::task::spawn_blocking(move || {
             params::scan(params_root.as_path(), params_files.as_ref())
         }),
+        tokio::task::spawn_blocking(move || {
+            secrets::scan(secrets_root.as_path(), secrets_files.as_ref())
+        }),
+        tokio::task::spawn_blocking(move || {
+            config_audit::scan(config_root.as_path(), config_files.as_ref())
+        }),
     );
 
     let js = js_res.context("js_surface analyzer task failed")?;
     let sinks = sinks_res.context("dom_sinks analyzer task failed")?;
     let form_result = forms_res.context("forms analyzer task failed")?;
     let param_result = params_res.context("params analyzer task failed")?;
+    let secret_findings = secrets_res.context("secrets analyzer task failed")?;
+    let config_findings = config_res.context("config_audit analyzer task failed")?;
 
     let mut findings = vec![inv_finding];
     findings.extend(js);
     findings.extend(sinks);
     findings.extend(form_result.findings);
     findings.extend(param_result.findings);
+    findings.extend(secret_findings);
+    findings.extend(config_findings);
     sort_native_findings(&mut findings);
 
     let mut attack_plan = form_result.attack_plan;
