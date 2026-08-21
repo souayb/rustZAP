@@ -1,0 +1,14 @@
+# Deliberately-insecure Dockerfile — SAST bait (iac/native). Not built in CI.
+FROM node:latest
+
+# curl-pipe-shell: unverified remote script piped to a shell
+RUN curl https://get.example.invalid/install.sh | bash
+
+# secret baked into the image
+ENV API_KEY=supersecretvalue123
+ENV DB_PASSWORD=hardcodedpassword
+
+# fetch remote artifact over the network into the image
+ADD https://example.invalid/payload.tar.gz /opt/payload.tar.gz
+
+CMD ["node", "server.js"]

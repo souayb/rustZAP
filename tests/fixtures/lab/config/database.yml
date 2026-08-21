@@ -1,0 +1,7 @@
+# Deliberately-insecure DB config — SAST bait (sast/secrets). Fake creds only.
+production:
+  # db-connection-string with embedded credentials
+  url: "postgres://admin:s3cr3tpassword@db.internal:5432/vitalpulse"
+  pool: 10
+staging:
+  url: "mysql://root:rootpw12345@localhost:3306/vitalpulse_staging"

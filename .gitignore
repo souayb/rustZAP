@@ -4,6 +4,10 @@
 
 # Local editor / assistant
 .claude/settings.local.json
+# ruflo / claude-flow generated runtime state (per-machine tuning + telemetry)
+.claude-flow/
+.claude/proven-config.json
+.claude/.proven-config-version
 .idea/
 .vscode/
 *.swp
@@ -28,6 +32,14 @@ Thumbs.db
 **/.rustzap-gitleaks-report.json
 /reports/*
 !/reports/.gitkeep
+
+# Agent scope files are environment-specific and list real targets — the
+# documented template `scope.example.yaml` is committed; a real `scope.yaml` is not.
+/scope.yaml
+/scope.yml
+agent-report*.json
+agent-report*.captures.json
+agent-trace*.jsonl
 
 # Local clones used for analysis (not part of the product)
 public_repos/

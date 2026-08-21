@@ -1,0 +1,70 @@
+# RustZAP agent scope file — the mandatory guardrail for `rustzap agent` / `rustzap mcp`.
+#
+# Copy this to `scope.yaml`, edit it, and pass it with `--scope scope.yaml`.
+# Network-touching tools REFUSE to run without a scope file. Only ever list
+# hosts you own or have explicit written permission to test — unauthorized
+# scanning is illegal.
+#
+# Scaffold a fresh copy any time with:  rustzap agent --init-scope scope.yaml
+
+# ── What is in bounds ────────────────────────────────────────────────────────
+
+# URL schemes the agent may request.
+allowed_schemes: [http, https]
+
+# Hosts the agent may touch. Exact (`api.example.com`) or a suffix wildcard
+# (`*.example.com`, which also matches the bare `example.com`). An EMPTY list
+# means no host is in scope and every network tool refuses — set this.
+allowed_hosts:
+  - localhost
+  - 127.0.0.1
+  # - "*.staging.example.com"
+
+# Regex patterns matched against the URL PATH; a match puts the URL out of
+# bounds even if its host is allowed. Use this to fence off destructive routes.
+forbidden_paths:
+  - "^/admin/delete"
+  # - "^/api/v1/users/\\d+/purge"
+
+# Soft rate ceiling (requests per minute) the agent aims to stay under.
+max_requests_per_min: 120
+
+# ── How much it may do on its own ────────────────────────────────────────────
+
+# assisted | semi | auto
+#   assisted (default, safest): recon (spider/scan/analyze/verify) runs freely;
+#                               every intrusive action needs approval.
+#   semi:  runs autonomously; only the classes in `approval_for` need approval.
+#   auto:  runs the whole loop with no prompts — scope + budget are the only
+#          guardrails. Approval prompts are auto-DENIED when headless (`-n`).
+autonomy: assisted
+
+# Action classes that require human approval in `semi` mode.
+# One or more of: exploit, rce, exfil  (recon is never gated).
+approval_for: [exploit, rce, exfil]
+
+# ── Resource budget (hard caps for one run) ──────────────────────────────────
+
+budget:
+  max_requests: 500   # 0 = unlimited
+  max_turns: 40       # brain turns before the loop stops
+  max_tokens: 0       # 0 = unlimited (LLM output tokens)
+
+# ── Privacy (opt-in) ─────────────────────────────────────────────────────────
+
+# Tokenize real hosts / secrets / emails / IPs before they reach the LLM, and
+# restore them locally before tools run. Off by default; `--privacy` also toggles
+# it. No effect on the scripted/CI brain.
+privacy: false
+
+# ── LLM brain (optional; only the native `rustzap agent` LLM brain reads this) ──
+#
+# Speaks any OpenAI-compatible `/chat/completions` endpoint: OpenAI, OpenRouter/
+# Together/Groq, Anthropic & Gemini compat gateways, or local Ollama / vLLM /
+# LM Studio / llama.cpp. CLI flags (--model/--base-url/--api-key-env/--json-mode)
+# override these. The scripted brain and `--ai-redteam` ignore this section.
+model:
+  # base_url: http://localhost:11434/v1   # default is local Ollama
+  # model: qwen2.5-coder                   # required for the LLM brain
+  # api_key_env: LLM_API_KEY               # omit for keyless local servers
+  json_mode: false                         # force response_format for OSS models

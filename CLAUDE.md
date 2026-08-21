@@ -65,7 +65,7 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 | `src/types.rs` | `Finding`, `Severity`, `DiscoveredUrl`, … |
 | `src/proxy.rs` | Intercepting proxy |
 | `src/stress.rs` | Load testing CLI |
-| `src/tui/` | Ratatui UI (`mod.rs` + `analyze.rs`); Scan URL + Analyze repo; plugin defaults stay in sync with CLI |
+| `src/tui/` | Ratatui UI (`mod.rs` + `analyze.rs` + `agent.rs`); Scan URL + Analyze repo + Agent tab; plugin defaults stay in sync with CLI |
 | `src/tools.rs` | External tool detection + execution |
 | `src/installer.rs` | OS-aware companion tool installs |
 | `src/analyze/` | `analyze`/`audit`: Semgrep/Trivy/Gitleaks/Checkov parsers + **native** inventory/JS/forms (`inventory.rs`, `gitignore.rs`, `native/`, `static_report.rs`) |
@@ -182,7 +182,7 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 | Analyze / audit | `cargo run -- analyze . --tools native --yes -o a.json` · `cargo run -- analyze ~/src/myapp --tools semgrep,trivy,gitleaks,native,checkov --yes` · `cargo run -- audit . --target URL --yes …` (positional `REPO` overrides `--repo`; TTY prompts for path if omitted; consent: TTY prompt, or `--yes` in CI; missing Semgrep falls back to native unless `--tools` was set; `--checkov-json` skips spawn) |
 | OpenAPI / HAR / Nuclei | `cargo run -- scan --target URL --openapi-path oas.json` · `--har-path rec.har` · `--nuclei` / `--nuclei-jsonl` (opt-in) |
 | Spider only | `cargo run -- spider --target URL` |
-| TUI | `cargo run -- tui` or bare `cargo run` (tab 2 = Scan URL, tab 6 / `a` = Analyze repo) |
+| TUI | `cargo run -- tui` or bare `cargo run` (tab 2 = Scan URL, tab 6 / `a` = Analyze repo, tab 7 = Agent) |
 
 ---
 

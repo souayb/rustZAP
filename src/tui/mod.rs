@@ -8,11 +8,16 @@
 //!   5·Logs      — live event stream from scans, analyze, and tool runs
 //!   6·Analyze   — local repo analysis (`rustzap analyze --tools native`)
 
+mod agent;
 mod analyze;
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use agent::{
+    autonomy_next, draw_agent, draw_consent_dialog as draw_agent_consent, spawn_agent, AgentEvent,
+    AgentForm, AgentStatus,
+};
 use analyze::{
     consent_abs_path, consent_key_decision, draw_analyze, draw_consent_dialog, spawn_analyze,
     AnalyzeEvent, AnalyzeForm, AnalyzeStatus,
@@ -47,6 +52,7 @@ const TAB_TITLES: &[&str] = &[
     "4·Tools",
     "5·Logs",
     "6·Analyze",
+    "7·Agent",
 ];
 
 /// State for one module group in the Findings-tab tree (SDD §9.1).
@@ -93,6 +99,7 @@ enum Tab {
     Tools,
     Logs,
     Analyze,
+    Agent,
 }
 
 impl Tab {
@@ -104,6 +111,7 @@ impl Tab {
             Tab::Tools => 3,
             Tab::Logs => 4,
             Tab::Analyze => 5,
+            Tab::Agent => 6,
         }
     }
 
@@ -114,7 +122,8 @@ impl Tab {
             2 => Tab::Findings,
             3 => Tab::Tools,
             4 => Tab::Logs,
-            _ => Tab::Analyze,
+            5 => Tab::Analyze,
+            _ => Tab::Agent,
         }
     }
 
@@ -137,8 +146,14 @@ enum InputMode {
     EditAnalyzeTools,
     EditAnalyzeOutput,
     EditSarif,
+    EditAgentScope,
+    EditAgentTarget,
+    EditAgentRepo,
+    EditAgentOutput,
     /// Consent dialog before walking a local repo (replaces CLI stdin `y/N`).
     ConfirmAnalyze,
+    /// Consent dialog before an agent run (network/repo access).
+    ConfirmAgent,
 }
 
 #[derive(Clone)]
@@ -237,6 +252,11 @@ struct App {
     /// Absolute path shown in the consent dialog (set when requesting analyze).
     analyze_consent_path: String,
 
+    agent: AgentForm,
+    agent_status: AgentStatus,
+    agent_handle: Option<JoinHandle<Result<()>>>,
+    agent_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+
     findings: Vec<Finding>,
     findings_state: ListState,
     severity_filter: HashSet<Severity>,
@@ -280,6 +300,11 @@ impl App {
             analyze_rx: None,
             analyze_consent_path: String::new(),
 
+            agent: AgentForm::default(),
+            agent_status: AgentStatus::Idle,
+            agent_handle: None,
+            agent_rx: None,
+
             findings: Vec::new(),
             findings_state,
             severity_filter: HashSet::new(),
@@ -313,7 +338,9 @@ impl App {
                 }
             }
         }
-        app.log("RustZAP TUI ready. Press 'a' or 6 for repo analysis, 'q' to quit.".into());
+        app.log(
+            "RustZAP TUI ready. Press 6/a for repo analysis, 7 for the agent, 'q' to quit.".into(),
+        );
         app
     }
 
@@ -326,7 +353,9 @@ impl App {
     }
 
     fn is_job_running(&self) -> bool {
-        matches!(self.scan_status, ScanStatus::Running { .. }) || self.analyze_status.is_running()
+        matches!(self.scan_status, ScanStatus::Running { .. })
+            || self.analyze_status.is_running()
+            || self.agent_status.is_running()
     }
 
     /// Build the flattened module tree shown in the Findings tab (SDD §9.1).
@@ -512,6 +541,55 @@ impl App {
         self.analyze_rx = None;
     }
 
+    /// Validate the agent form, then show the consent dialog; the run starts
+    /// only after [Y].
+    fn request_agent(&mut self) {
+        if self.is_job_running() {
+            self.log("A run is already in progress. Press 'x' to cancel first.".into());
+            return;
+        }
+        if let Err(err) = self.agent.validate() {
+            self.log(format!("Agent config invalid: {err}"));
+            return;
+        }
+        self.input_mode = InputMode::ConfirmAgent;
+        self.log("Confirm agent run".into());
+    }
+
+    fn start_agent(&mut self) {
+        if self.is_job_running() {
+            self.log("A run is already in progress. Press 'x' to cancel first.".into());
+            return;
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.agent_rx = Some(rx);
+        self.agent_status = AgentStatus::Running {
+            label: self.agent.brain.label().to_string(),
+            started_at: Instant::now(),
+        };
+        self.findings.clear();
+        self.modules.clear();
+        self.findings_state.select(Some(0));
+        self.log(format!(
+            "Launching agent [{}] under scope {}",
+            self.agent.brain.label(),
+            self.agent.scope
+        ));
+        self.agent_handle = Some(spawn_agent(&self.agent, tx));
+        self.tab = Tab::Agent;
+    }
+
+    fn cancel_agent(&mut self) {
+        if let Some(handle) = self.agent_handle.take() {
+            handle.abort();
+            self.log("Agent run cancelled by user.".into());
+            self.agent_status = AgentStatus::Failed {
+                error: "Cancelled".to_string(),
+            };
+        }
+        self.agent_rx = None;
+    }
+
     fn run_selected_tool(&mut self) {
         let Some(idx) = self.tools_state.selected() else {
             return;
@@ -611,6 +689,34 @@ impl App {
         if let Some(handle) = &self.analyze_handle {
             if handle.is_finished() {
                 let handle = self.analyze_handle.take().unwrap();
+                tokio::spawn(async move {
+                    let _ = handle.await;
+                });
+            }
+        }
+
+        // Drain agent events
+        if let Some(rx) = &mut self.agent_rx {
+            for _ in 0..256 {
+                match rx.try_recv() {
+                    Ok(ev) => Self::apply_agent_event(
+                        &mut self.agent_status,
+                        &mut self.findings,
+                        &mut self.logs,
+                        &mut self.modules,
+                        ev,
+                    ),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.agent_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(handle) = &self.agent_handle {
+            if handle.is_finished() {
+                let handle = self.agent_handle.take().unwrap();
                 tokio::spawn(async move {
                     let _ = handle.await;
                 });
@@ -828,6 +934,66 @@ impl App {
             }
         }
     }
+
+    fn apply_agent_event(
+        status: &mut AgentStatus,
+        findings: &mut Vec<Finding>,
+        logs: &mut VecDeque<String>,
+        modules: &mut BTreeMap<String, ModuleNode>,
+        ev: AgentEvent,
+    ) {
+        let push_log = |logs: &mut VecDeque<String>, msg: String| {
+            if logs.len() >= MAX_LOGS {
+                logs.pop_front();
+            }
+            let ts = chrono::Utc::now().format("%H:%M:%S");
+            logs.push_back(format!("[{}] {}", ts, msg));
+        };
+
+        match ev {
+            AgentEvent::Started { label } => {
+                push_log(logs, format!("Agent started: {label}"));
+            }
+            AgentEvent::Log(msg) => push_log(logs, msg),
+            AgentEvent::Finding(f) => {
+                push_log(
+                    logs,
+                    format!("Finding [{}] {} @ {}", f.severity, f.title, f.url),
+                );
+                let entry = modules.entry(f.plugin.clone()).or_default();
+                entry.folded = false;
+                findings.push(*f);
+            }
+            AgentEvent::ModuleRan { name, findings: n } => {
+                let marker = if n == 0 { "·" } else { "✓" };
+                push_log(logs, format!("{marker} module {name} ({n} findings)"));
+                modules.entry(name).or_default().ran = true;
+            }
+            AgentEvent::Completed {
+                duration_secs,
+                findings: total_findings,
+                risk_score,
+                report_path,
+            } => {
+                push_log(
+                    logs,
+                    format!(
+                        "Agent complete: {total_findings} findings, risk={risk_score}, duration={duration_secs:.1}s, report={report_path}"
+                    ),
+                );
+                *status = AgentStatus::Completed {
+                    findings: total_findings,
+                    risk_score,
+                    duration_secs,
+                    report_path,
+                };
+            }
+            AgentEvent::Failed { error } => {
+                push_log(logs, format!("ERROR: {error}"));
+                *status = AgentStatus::Failed { error };
+            }
+        }
+    }
 }
 
 pub async fn run_tui() -> anyhow::Result<()> {
@@ -896,6 +1062,21 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         return;
     }
 
+    if app.input_mode == InputMode::ConfirmAgent {
+        match consent_key_decision(code) {
+            Some(true) => {
+                app.input_mode = InputMode::Normal;
+                app.start_agent();
+            }
+            Some(false) => {
+                app.input_mode = InputMode::Normal;
+                app.log("Agent run declined.".into());
+            }
+            None => {}
+        }
+        return;
+    }
+
     // Editing modes intercept most keys.
     if app.input_mode != InputMode::Normal {
         match code {
@@ -938,7 +1119,23 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                             format!("SARIF output set to {}", app.analyze.sarif_out)
                         });
                     }
-                    InputMode::Normal | InputMode::ConfirmAnalyze => {}
+                    InputMode::EditAgentScope => {
+                        app.agent.scope = value;
+                        app.log(format!("Agent scope file set to {}", app.agent.scope));
+                    }
+                    InputMode::EditAgentTarget => {
+                        app.agent.target = value;
+                        app.log(format!("Agent target set to {}", app.agent.target));
+                    }
+                    InputMode::EditAgentRepo => {
+                        app.agent.repo = value;
+                        app.log(format!("Agent repo set to {}", app.agent.repo));
+                    }
+                    InputMode::EditAgentOutput => {
+                        app.agent.output = value;
+                        app.log(format!("Agent output set to {}", app.agent.output));
+                    }
+                    InputMode::Normal | InputMode::ConfirmAnalyze | InputMode::ConfirmAgent => {}
                 }
                 app.input_mode = InputMode::Normal;
             }
@@ -966,9 +1163,12 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('4') => app.tab = Tab::Tools,
         KeyCode::Char('5') => app.tab = Tab::Logs,
         KeyCode::Char('6') | KeyCode::Char('a') => app.tab = Tab::Analyze,
+        KeyCode::Char('7') => app.tab = Tab::Agent,
         KeyCode::Char('x') => {
             if app.analyze_status.is_running() {
                 app.cancel_analyze();
+            } else if app.agent_status.is_running() {
+                app.cancel_agent();
             } else if matches!(app.scan_status, ScanStatus::Running { .. }) {
                 app.cancel_scan();
             }
@@ -980,6 +1180,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             Tab::Tools => handle_tools_keys(app, code),
             Tab::Logs => handle_logs_keys(app, code),
             Tab::Analyze => handle_analyze_keys(app, code),
+            Tab::Agent => handle_agent_keys(app, code),
         },
     }
 }
@@ -1043,6 +1244,40 @@ fn handle_analyze_keys(app: &mut App, code: KeyCode) {
             ));
         }
         KeyCode::Char('s') => app.request_analyze(),
+        _ => {}
+    }
+}
+
+fn handle_agent_keys(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('c') => {
+            app.input_buffer = app.agent.scope.clone();
+            app.input_mode = InputMode::EditAgentScope;
+        }
+        KeyCode::Char('t') => {
+            app.input_buffer = app.agent.target.clone();
+            app.input_mode = InputMode::EditAgentTarget;
+        }
+        KeyCode::Char('r') => {
+            app.input_buffer = app.agent.repo.clone();
+            app.input_mode = InputMode::EditAgentRepo;
+        }
+        KeyCode::Char('o') => {
+            app.input_buffer = app.agent.output.clone();
+            app.input_mode = InputMode::EditAgentOutput;
+        }
+        KeyCode::Char('u') => {
+            app.agent.autonomy = autonomy_next(app.agent.autonomy);
+            app.log(format!(
+                "Autonomy → {}",
+                agent::autonomy_label(app.agent.autonomy)
+            ));
+        }
+        KeyCode::Char('b') => {
+            app.agent.brain = app.agent.brain.next();
+            app.log(format!("Brain → {}", app.agent.brain.label()));
+        }
+        KeyCode::Char('s') => app.request_agent(),
         _ => {}
     }
 }
@@ -1186,12 +1421,38 @@ fn draw(f: &mut Frame, app: &App) {
                 edit,
             );
         }
+        Tab::Agent => {
+            let edit = match app.input_mode {
+                InputMode::EditAgentScope => {
+                    Some(("Editing scope file path", app.input_buffer.as_str()))
+                }
+                InputMode::EditAgentTarget => {
+                    Some(("Editing target URL", app.input_buffer.as_str()))
+                }
+                InputMode::EditAgentRepo => Some(("Editing repo path", app.input_buffer.as_str())),
+                InputMode::EditAgentOutput => {
+                    Some(("Editing output path", app.input_buffer.as_str()))
+                }
+                _ => None,
+            };
+            draw_agent(
+                f,
+                outer[1],
+                &app.agent,
+                &app.agent_status,
+                &app.findings,
+                edit,
+            );
+        }
     }
 
     draw_status_bar(f, app, outer[2]);
 
     if app.input_mode == InputMode::ConfirmAnalyze {
         draw_consent_dialog(f, &app.analyze_consent_path);
+    }
+    if app.input_mode == InputMode::ConfirmAgent {
+        draw_agent_consent(f, &app.agent);
     }
 }
 
@@ -2017,7 +2278,7 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.tab {
-        Tab::Dashboard => "1-6/Tab: switch · a: analyze · q: quit",
+        Tab::Dashboard => "1-7/Tab: switch · a: analyze · q: quit",
         Tab::Scan => "t/P/o: edit · p/i: toggle · +/-/[/]: tune · s: start · x: cancel",
         Tab::Findings => {
             "j/k: nav · Enter/Space: fold · o: open-all · O: close-all · f: filter · c: clear"
@@ -2025,18 +2286,23 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         Tab::Tools => "j/k: navigate · r/Enter: run · R: re-detect",
         Tab::Logs => "j/k/PgUp/PgDn: scroll · G: bottom · c: clear",
         Tab::Analyze => "r/t/o/S: edit · c: correlate · s: start · x: cancel",
+        Tab::Agent => "c/t/r/o: edit · u: autonomy · b: brain · s: start · x: cancel",
     };
 
     let mode_label = match app.input_mode {
         InputMode::Normal => "NORMAL",
-        InputMode::ConfirmAnalyze => "CONFIRM",
+        InputMode::ConfirmAnalyze | InputMode::ConfirmAgent => "CONFIRM",
         InputMode::EditTarget
         | InputMode::EditPlugins
         | InputMode::EditOutput
         | InputMode::EditRepo
         | InputMode::EditAnalyzeTools
         | InputMode::EditAnalyzeOutput
-        | InputMode::EditSarif => "EDIT",
+        | InputMode::EditSarif
+        | InputMode::EditAgentScope
+        | InputMode::EditAgentTarget
+        | InputMode::EditAgentRepo
+        | InputMode::EditAgentOutput => "EDIT",
     };
 
     let scan_label = match &app.scan_status {
@@ -2069,6 +2335,13 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
+        Span::styled(
+            app.agent_status.short_label(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
         Span::styled(hints, Style::default().fg(Color::DarkGray)),
     ]);
 
@@ -2082,14 +2355,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tab_cycle_includes_analyze_as_sixth() {
-        assert_eq!(TAB_TITLES.len(), 6);
+    fn tab_cycle_includes_analyze_and_agent() {
+        assert_eq!(TAB_TITLES.len(), 7);
         assert_eq!(Tab::Analyze.index(), 5);
         assert!(matches!(Tab::from_index(5), Tab::Analyze));
         assert!(matches!(Tab::Logs.next(), Tab::Analyze));
-        assert!(matches!(Tab::Analyze.next(), Tab::Dashboard));
-        assert!(matches!(Tab::Dashboard.prev(), Tab::Analyze));
         assert_eq!(TAB_TITLES[5], "6·Analyze");
+
+        // Agent is the seventh tab and wraps back to Dashboard.
+        assert_eq!(Tab::Agent.index(), 6);
+        assert!(matches!(Tab::from_index(6), Tab::Agent));
+        assert!(matches!(Tab::Analyze.next(), Tab::Agent));
+        assert!(matches!(Tab::Agent.next(), Tab::Dashboard));
+        assert!(matches!(Tab::Dashboard.prev(), Tab::Agent));
+        assert_eq!(TAB_TITLES[6], "7·Agent");
     }
 
     #[test]

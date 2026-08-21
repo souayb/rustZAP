@@ -1,0 +1,7 @@
+Deployment key material committed by mistake — SAST bait (sast/secrets). Fake.
+
+-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEA0FAKEfakeFAKEfakeexamplekeymaterialnotarealkeyatall
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+notARealPrivateKeyJustFixtureContentForSecretScannerRegexToMatchXXXX
+-----END RSA PRIVATE KEY-----

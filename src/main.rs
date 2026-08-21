@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use rustzap::scanner::ScanConfig;
 use rustzap::stress::StressCliArgs;
-use rustzap::{active, analyze, installer, passive, proxy, scanner, spider, stress, tui};
+use rustzap::{
+    active, agent, analyze, installer, mcp, passive, proxy, scanner, spider, stress, tui,
+};
 use tracing_subscriber::EnvFilter;
 
 /// RustZAP - OWASP ZAP-inspired web security scanner written in Rust
@@ -357,6 +359,76 @@ enum Commands {
         #[arg(short, long)]
         yes: bool,
     },
+
+    /// Agentic tester (scope-gated; Phase 5). An LLM (or scripted) brain drives
+    /// RustZAP's scanners/verification under a mandatory scope file.
+    Agent {
+        /// Scope/config file (YAML/JSON) — REQUIRED. Allowed hosts/schemes,
+        /// rate + budget caps, autonomy mode, approval classes, model config.
+        #[arg(long, required_unless_present = "init_scope")]
+        scope: Option<String>,
+        /// Write a documented starter scope file to PATH and exit (won't overwrite).
+        #[arg(long, value_name = "PATH")]
+        init_scope: Option<String>,
+        /// Natural-language goal (derived from target/repo when omitted)
+        #[arg(long)]
+        goal: Option<String>,
+        /// Live target URL for DAST
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Local repository path for SAST
+        #[arg(short, long)]
+        repo: Option<String>,
+        /// Override the scope file's autonomy: assisted | semi | auto
+        #[arg(long)]
+        autonomy: Option<String>,
+        /// Non-interactive (CI): approval gates are auto-denied, never prompted
+        #[arg(short = 'n', long)]
+        non_interactive: bool,
+        /// Deterministic brain: a JSON file of scripted steps (no live LLM)
+        #[arg(long)]
+        script: Option<String>,
+        /// LLM model id (e.g. qwen2.5-coder, gpt-4o-mini, claude-3-5-sonnet). Overrides scope.
+        #[arg(long)]
+        model: Option<String>,
+        /// OpenAI-compatible base URL. Default: http://localhost:11434/v1 (Ollama). Overrides scope.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Env var holding the API key (omit for keyless local servers). Overrides scope.
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Force strict JSON output (response_format) — helps some open-source models.
+        #[arg(long)]
+        json_mode: bool,
+        /// Privacy tokenization: redact real hosts/secrets/emails/IPs before they
+        /// reach the LLM, restore locally before tools run. Overrides scope.
+        #[arg(long)]
+        privacy: bool,
+        /// Run the OWASP LLM Top-10 red-team battery directly against --target
+        /// (no LLM brain). --model/--api-key-env name the target's model/key.
+        #[arg(long)]
+        ai_redteam: bool,
+        /// A phrase known to be in the target's system prompt; enables leak
+        /// detection in --ai-redteam mode (no effect otherwise).
+        #[arg(long)]
+        ai_redteam_marker: Option<String>,
+        #[arg(short, long, default_value = "agent-report.json")]
+        output: String,
+        #[arg(long)]
+        sarif_out: Option<String>,
+        #[arg(long, default_value = "agent-trace.jsonl")]
+        trace: String,
+    },
+
+    /// Run as an MCP server on stdio, exposing RustZAP's tools to external
+    /// agents (Claude Code, Cursor, …). Network tools require `--scope`.
+    Mcp {
+        /// Scope file for network-touching tools (without it, only local analysis is allowed)
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, default_value = "agent-trace.jsonl")]
+        trace: String,
+    },
 }
 
 #[tokio::main]
@@ -372,6 +444,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(format!("rustzap={}", level)))
         .with_target(false)
+        // Logs go to stderr so stdout stays clean (required for MCP stdio).
+        .with_writer(std::io::stderr)
         .init();
 
     // Bare `rustzap` (no subcommand) → drop straight into the interactive TUI.
@@ -380,7 +454,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    print_banner();
+    // The MCP server owns stdout as its protocol channel — no banner there.
+    if !matches!(command, Commands::Mcp { .. }) {
+        print_banner();
+    }
 
     match command {
         Commands::Scan {
@@ -544,6 +621,64 @@ async fn main() -> anyhow::Result<()> {
                 passive_all_methods,
             )
             .await?;
+        }
+
+        Commands::Agent {
+            scope,
+            init_scope,
+            goal,
+            target,
+            repo,
+            autonomy,
+            non_interactive,
+            script,
+            model,
+            base_url,
+            api_key_env,
+            json_mode,
+            privacy,
+            ai_redteam,
+            ai_redteam_marker,
+            output,
+            sarif_out,
+            trace,
+        } => {
+            if let Some(path) = init_scope {
+                let p = std::path::Path::new(&path);
+                agent::scope::write_template(p)?;
+                println!(
+                    "Wrote starter scope → {path}\nEdit `allowed_hosts`, then run: rustzap agent --scope {path} --target <URL>"
+                );
+                return Ok(());
+            }
+            let scope = scope.expect("clap requires --scope unless --init-scope is set");
+            let llm = agent::LlmOverrides {
+                base_url,
+                model,
+                api_key_env,
+                json_mode,
+                privacy,
+            };
+            agent::run_agent_cli(
+                scope,
+                goal,
+                target,
+                repo,
+                output,
+                sarif_out,
+                trace,
+                autonomy,
+                non_interactive,
+                script,
+                llm,
+                ai_redteam,
+                ai_redteam_marker,
+            )
+            .await?;
+        }
+
+        Commands::Mcp { scope, trace } => {
+            mcp::run_mcp_stdio(scope, trace).await?;
         }
 
         Commands::Tui => {

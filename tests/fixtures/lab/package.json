@@ -1,0 +1,13 @@
+{
+  "name": "rustzap-vuln-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deliberately-vulnerable lab target for RustZAP (authorized testing only)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

@@ -1,0 +1,16 @@
+# Scope file for pointing `rustzap agent` / `rustzap mcp` at the local lab.
+allowed_schemes: [http, https]
+allowed_hosts:
+  - localhost
+  - 127.0.0.1
+  - vuln-lab
+forbidden_paths:
+  - "^/admin/delete"
+max_requests_per_min: 240
+autonomy: assisted
+approval_for: [exploit, rce, exfil]
+budget:
+  max_requests: 1000
+  max_turns: 40
+  max_tokens: 0
+privacy: false
