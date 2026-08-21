@@ -26,7 +26,7 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | 🛰️ **Intel Hook** | Optional Shodan enrichment when `SHODAN_API_KEY` is set (no-op otherwise) |
 | 🔀 **Intercepting Proxy** | HTTP(S) proxy for manual browsing + passive analysis |
 | 📊 **JSON / CSV / HTML Reports** | Machine-readable findings with OWASP/CWE references |
-| 🖥️ **Interactive TUI** | Six-tab Ratatui console — DAST scans, local repo **analyze**, findings, tools, logs |
+| 🖥️ **Interactive TUI** | Seven-tab Ratatui console — DAST scans, local repo **analyze**, scope-gated **agent** runs, findings, tools, logs |
 | 🧰 **Unified Tool Console** | Detects & runs Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, Falco, Hashcat, John, Hydra and more from the TUI |
 | 🚀 **Stress Tester** | 5-mode load tester with percentile latency, timeline, and JSON report |
 | 🤖 **Agentic Tester** | Scope-gated agent (`rustzap agent`) + MCP server (`rustzap mcp`) over one tool registry — LLM or scripted brain, autonomy modes, HTTP capture/replay, privacy tokenization, prompt-injection shield, OWASP LLM Top-10 red-team |
@@ -332,6 +332,8 @@ rustzap console    # alias
 ```
 
 Running `rustzap` with no arguments launches the console immediately — useful as a daily-driver entry point. On launch the TUI auto-loads `report.json`, `rustzap-report.json`, or `analyze-report.json` if one exists. **Scan URL** (tab 2) is unchanged. **Analyze repo** (tab 6, or press `a`) runs the same pipeline as `rustzap analyze --repo PATH --tools native` (TUI tools default is **`native`** so it works without Semgrep; type `semgrep,trivy,gitleaks,checkov` to add CLI tools). Unified **audit** (static + DAST in one command) remains CLI-only.
+
+**Agent** (tab 7) is a front-end for the [agentic tester](#agentic-tester-agent--mcp): point it at a scope file plus a target and/or repo, pick a brain — **Recon** (`scan_target` + `analyze_repo`) or **Red-team** (OWASP LLM Top-10) — and an autonomy mode, then confirm the consent dialog. Runs are scope-gated and non-interactive (findings flow into the Findings tab); the LLM brain stays on the CLI (`rustzap agent --model …`) since a raw-mode terminal can't service its approval prompt.
 
 #### Tabs
 
@@ -983,7 +985,7 @@ rustzap/
 │   ├── events.rs            # ScanEvent / ScanPhase — telemetry for the TUI
 │   ├── tools.rs             # External tool detection + streaming runner (Semgrep, Trivy, …)
 │   ├── installer.rs         # OS-aware companion-tool installer (`rustzap install`)
-│   └── tui/                 # Multi-tab console (Dashboard / Scan / Findings / Tools / Logs / Analyze)
+│   └── tui/                 # Multi-tab console (Dashboard / Scan / Findings / Tools / Logs / Analyze / Agent)
 ├── scripts/
 │   └── install-tools.sh     # Canonical shell installer — used by Dockerfile & host
 ├── Dockerfile               # Multi-stage build with all companion tools pre-installed
