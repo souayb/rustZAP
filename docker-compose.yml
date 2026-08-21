@@ -39,3 +39,18 @@ services:
     ports:
       - "3000:3000"
     restart: unless-stopped
+
+  # RustZAP's own deliberately-vulnerable lab (also the SAST fixture). It backs
+  # the pure-Rust CI matrix (tests/vuln_lab_*.rs), which needs neither node nor
+  # docker; this service is only for manual/browsable runs.
+  # Bring it up with: docker compose --profile labs up -d vuln-lab
+  vuln-lab:
+    build:
+      context: ./tests/fixtures/lab
+      dockerfile: Dockerfile
+    image: rustzap-vuln-lab:latest
+    container_name: rustzap-vuln-lab
+    profiles: ["labs"]
+    ports:
+      - "3001:3000"
+    restart: unless-stopped

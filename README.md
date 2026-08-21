@@ -162,6 +162,33 @@ docker compose run --rm rustzap scan --target http://juice-shop:3000
 
 The compose file mounts `./reports → /workspace` and exposes the intercepting proxy on `:8080`.
 
+### Vulnerable lab target
+
+RustZAP ships its own deliberately-vulnerable app under
+[`tests/fixtures/lab/`](tests/fixtures/lab) — a Node/Express target with an
+endpoint per active plugin, an insecure passive surface, a crawlable spider
+surface, an injectable mock LLM endpoint, and (as source) a SAST corpus with
+planted secrets and IaC. Drive it with `scripts/lab.sh`:
+
+```bash
+scripts/lab.sh up        # build + start the lab on http://localhost:3001
+scripts/lab.sh scan      # full DAST scan → reports/lab-report.json
+scripts/lab.sh analyze   # native SAST over the lab source → reports/lab-sast.json
+scripts/lab.sh redteam   # agent OWASP-LLM battery against the mock endpoint
+scripts/lab.sh down
+```
+
+> Only ever scan the lab or hosts you own. The lab embeds **fake** credentials
+> for the scanners to find; never reuse them.
+
+The lab is a **manual** convenience. Regression coverage of the scanner lives in
+the pure-Rust matrix `tests/vuln_lab_*.rs`, which boots a deterministic loopback
+target inside `cargo test` — every active plugin, the passive checks, the spider,
+the full pipeline, and the agent/red-team paths — needing **neither Node nor
+Docker**, so it runs in CI on all three OSes. The two slow timing detectors
+(`sqli-time`/`sqli-stacked`) are covered positively by the Node lab and asserted
+negatively (fast) in the matrix.
+
 ---
 
 ## Usage

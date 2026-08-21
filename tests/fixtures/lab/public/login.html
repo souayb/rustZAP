@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+  <head><title>Vuln Lab — Login</title></head>
+  <body>
+    <h1>Sign in</h1>
+    <!-- sast/forms: a password form (+ hidden CSRF token) drives the attack plan -->
+    <form method="POST" action="/login">
+      <input type="text" name="username" placeholder="username" />
+      <input type="password" name="password" placeholder="password" />
+      <input type="hidden" name="csrf_token" value="" />
+      <input type="file" name="avatar" />
+      <button type="submit">Login</button>
+    </form>
+  </body>
+</html>

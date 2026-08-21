@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <head><title>Vuln Lab</title></head>
+  <body>
+    <h1>RustZAP Vulnerable Lab</h1>
+    <ul>
+      <li><a href="/dast/sqli?id=1">sqli</a></li>
+      <li><a href="/dast/xss?q=1">xss</a></li>
+      <li><a href="/dast/traversal?file=a">traversal</a></li>
+      <li><a href="/dast/render?name=x">ssti</a></li>
+      <li><a href="/dast/ping?host=h">cmd</a></li>
+      <li><a href="/login.html">login</a></li>
+    </ul>
+    <form method="POST" action="/dast/login">
+      <input type="text" name="username" />
+      <input type="password" name="password" />
+    </form>
+    <script src="/static/app.js"></script>
+    <script>fetch('/dast/sqli?id=1');</script>
+  </body>
+</html>
