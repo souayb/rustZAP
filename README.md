@@ -464,6 +464,13 @@ the autonomy mode, which action classes need human approval, and the resource
 budget. Loading is strict — a missing or malformed scope is a hard error, never
 a default.
 
+Scaffold a documented starter (a copy of [`scope.example.yaml`](scope.example.yaml))
+and edit `allowed_hosts`:
+
+```bash
+rustzap agent --init-scope scope.yaml     # writes a commented template (won't overwrite)
+```
+
 ```yaml
 # scope.yaml
 allowed_schemes: [http, https]

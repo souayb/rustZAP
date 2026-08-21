@@ -365,8 +365,11 @@ enum Commands {
     Agent {
         /// Scope/config file (YAML/JSON) — REQUIRED. Allowed hosts/schemes,
         /// rate + budget caps, autonomy mode, approval classes, model config.
-        #[arg(long)]
-        scope: String,
+        #[arg(long, required_unless_present = "init_scope")]
+        scope: Option<String>,
+        /// Write a documented starter scope file to PATH and exit (won't overwrite).
+        #[arg(long, value_name = "PATH")]
+        init_scope: Option<String>,
         /// Natural-language goal (derived from target/repo when omitted)
         #[arg(long)]
         goal: Option<String>,
@@ -622,6 +625,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Agent {
             scope,
+            init_scope,
             goal,
             target,
             repo,
@@ -639,6 +643,15 @@ async fn main() -> anyhow::Result<()> {
             sarif_out,
             trace,
         } => {
+            if let Some(path) = init_scope {
+                let p = std::path::Path::new(&path);
+                agent::scope::write_template(p)?;
+                println!(
+                    "Wrote starter scope → {path}\nEdit `allowed_hosts`, then run: rustzap agent --scope {path} --target <URL>"
+                );
+                return Ok(());
+            }
+            let scope = scope.expect("clap requires --scope unless --init-scope is set");
             let llm = agent::LlmOverrides {
                 base_url,
                 model,

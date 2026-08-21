@@ -33,6 +33,14 @@ Thumbs.db
 /reports/*
 !/reports/.gitkeep
 
+# Agent scope files are environment-specific and list real targets — the
+# documented template `scope.example.yaml` is committed; a real `scope.yaml` is not.
+/scope.yaml
+/scope.yml
+agent-report*.json
+agent-report*.captures.json
+agent-trace*.jsonl
+
 # Local clones used for analysis (not part of the product)
 public_repos/
 

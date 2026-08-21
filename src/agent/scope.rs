@@ -7,10 +7,25 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use url::Url;
+
+/// The documented starter scope, embedded from the repo's `scope.example.yaml`
+/// so the shipped example and `--init-scope` output never drift apart.
+pub const EXAMPLE_SCOPE: &str = include_str!("../../scope.example.yaml");
+
+/// Write the starter scope template to `path`. Refuses to overwrite an existing
+/// file so a real scope is never clobbered.
+pub fn write_template(path: &Path) -> Result<()> {
+    if path.exists() {
+        bail!("{} already exists — refusing to overwrite", path.display());
+    }
+    std::fs::write(path, EXAMPLE_SCOPE)
+        .with_context(|| format!("writing scope template to {}", path.display()))?;
+    Ok(())
+}
 
 /// How much the agent may do without asking. Chosen in the scope file
 /// (overridable per run); defaults to the safest, `Assisted`.
@@ -321,5 +336,32 @@ mod tests {
         assert_eq!(Autonomy::parse("SEMI"), Some(Autonomy::Semi));
         assert_eq!(Autonomy::parse("autonomous"), Some(Autonomy::Auto));
         assert_eq!(Autonomy::parse("nope"), None);
+    }
+
+    #[test]
+    fn shipped_example_scope_parses_and_compiles() {
+        // Guards against the example drifting out of sync with the parser.
+        let mut cfg: ScopeConfig =
+            serde_yaml::from_str(EXAMPLE_SCOPE).expect("scope.example.yaml must parse");
+        cfg.compile().expect("example forbidden_paths must compile");
+        assert_eq!(cfg.autonomy, Autonomy::Assisted);
+        assert!(cfg.allowed_hosts.iter().any(|h| h == "localhost"));
+        assert!(!cfg.privacy);
+        // The example's forbidden path is actually enforced.
+        assert_eq!(
+            cfg.check_url("http://localhost/admin/delete"),
+            ScopeVerdict::ForbiddenPath
+        );
+    }
+
+    #[test]
+    fn write_template_refuses_to_overwrite() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rz-scope-{}.yaml", crate::types::uuid_v4()));
+        super::write_template(&path).expect("write fresh template");
+        assert!(path.exists());
+        // Second write must refuse rather than clobber.
+        assert!(super::write_template(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }
