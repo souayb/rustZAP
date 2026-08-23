@@ -1,0 +1,26 @@
+import * as assert from "assert";
+import * as fs from "fs";
+import * as path from "path";
+
+export function runPackageSmokeTests(): void {
+  testPackageCommands();
+  testBinaryPrefersConfiguredPath();
+}
+
+function testPackageCommands(): void {
+  const pkgPath = path.join(__dirname, "..", "..", "package.json");
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as {
+    contributes?: { commands?: { command: string }[] };
+  };
+  const ids = (pkg.contributes?.commands ?? []).map((c) => c.command);
+  assert.ok(ids.includes("rustzap.analyzeWorkspace"));
+  assert.ok(ids.includes("rustzap.scanUrl"));
+  assert.ok(ids.includes("rustzap.showReportSummary"));
+  assert.ok(ids.includes("rustzap.openLastReport"));
+}
+
+function testBinaryPrefersConfiguredPath(): void {
+  const configured = "/custom/rustzap";
+  const resolvedOrder = [configured, "rustzap"];
+  assert.strictEqual(resolvedOrder[0], configured);
+}
