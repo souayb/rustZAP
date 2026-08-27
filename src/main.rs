@@ -1,9 +1,10 @@
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use colored::*;
 use rustzap::scanner::ScanConfig;
 use rustzap::stress::StressCliArgs;
 use rustzap::{
-    active, agent, analyze, installer, mcp, passive, proxy, scanner, spider, stress, tui,
+    active, ad, agent, analyze, installer, mcp, passive, proxy, scanner, spider, stress, tui,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -247,6 +248,70 @@ enum Commands {
         /// Opt-in: run passive checks on non-GET discovered requests too
         #[arg(long)]
         passive_all_methods: bool,
+    },
+
+    /// Detect Active Directory / NTLM-relay attack vectors (LDAP + SPN + NTLM).
+    ///
+    /// Detection only: enumerates the directory and reads relay posture; it never
+    /// generates a relay-target list or triggers coercion. Intrusive — requires
+    /// authorization consent (TTY prompt, or --yes in CI). Only scan AD you own or
+    /// are explicitly authorized to test.
+    Ad {
+        /// AD domain FQDN, e.g. corp.local
+        #[arg(long)]
+        domain: String,
+
+        /// Domain controller IP (used for LDAP bind + domain DNS)
+        #[arg(long)]
+        dc_ip: String,
+
+        /// Explicit target host(s); repeat for several. Defaults to the DC.
+        #[arg(short = 't', long = "target")]
+        targets: Vec<String>,
+
+        /// File of target hosts, one per line
+        #[arg(short = 'f', long)]
+        targets_file: Option<String>,
+
+        /// Username for an authenticated bind (UPN built as user@domain)
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+
+        /// Env var holding the bind password (never pass the password on argv)
+        #[arg(long, default_value = "RZ_AD_PASS")]
+        password_env: String,
+
+        /// Unauthenticated (anonymous) bind
+        #[arg(long)]
+        null_auth: bool,
+
+        /// Use Kerberos authentication (reserved; not yet wired for Tier A)
+        #[arg(short = 'k', long)]
+        kerberos: bool,
+
+        /// Enumerate domain computers from AD and scan each (needs creds)
+        #[arg(long)]
+        audit: bool,
+
+        /// Which check families to run: all, or a comma list of ldap,spn,ntlm
+        #[arg(long, default_value = "all")]
+        checks: String,
+
+        /// Skip TLS verification for LDAPS / WinRM probes
+        #[arg(long)]
+        insecure: bool,
+
+        /// Output report path (.json/.sarif/.csv/.html by extension)
+        #[arg(short, long, default_value = "ad-report.json")]
+        output: String,
+
+        /// Also write a SARIF report to this path
+        #[arg(long)]
+        sarif_out: Option<String>,
+
+        /// Confirm authorization non-interactively (CI)
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Stress test / load test an API endpoint
@@ -692,6 +757,62 @@ async fn main() -> anyhow::Result<()> {
             yes,
         } => {
             installer::run(dry_run, tool, yes, list).await?;
+        }
+
+        Commands::Ad {
+            domain,
+            dc_ip,
+            targets,
+            targets_file,
+            username,
+            password_env,
+            null_auth,
+            kerberos,
+            audit,
+            checks,
+            insecure,
+            output,
+            sarif_out,
+            yes,
+        } => {
+            let mut targets = targets;
+            if let Some(file) = targets_file {
+                let contents = std::fs::read_to_string(&file)
+                    .with_context(|| format!("read targets file {file}"))?;
+                targets.extend(
+                    contents
+                        .lines()
+                        .map(|l| l.trim())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(|l| l.to_string()),
+                );
+            }
+            let password = if null_auth {
+                None
+            } else {
+                std::env::var(&password_env).ok().filter(|v| !v.is_empty())
+            };
+            if username.is_some() && !null_auth && password.is_none() {
+                anyhow::bail!(
+                    "No password found in ${password_env}. Set it (e.g. `export {password_env}=...`)                      or use --null-auth."
+                );
+            }
+            let config = ad::AdConfig {
+                domain,
+                dc_ip,
+                targets,
+                username,
+                password,
+                null_auth,
+                kerberos,
+                audit,
+                checks: ad::AdChecks::parse(&checks),
+                insecure,
+                output,
+                sarif_out,
+                assume_yes: yes,
+            };
+            ad::run_ad_cli(config).await?;
         }
 
         Commands::Stress {

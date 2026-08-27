@@ -9,7 +9,11 @@
 .claude/proven-config.json
 .claude/.proven-config-version
 .idea/
-.vscode/
+/.vscode/
+vscode-extension/node_modules/
+vscode-extension/out/
+vscode-extension/*.vsix
+vscode-extension/.vscode-test/
 *.swp
 *~
 .DS_Store

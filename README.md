@@ -45,7 +45,7 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | [CLAUDE.md](CLAUDE.md) | Contributor / AI assistant guardrails |
 | [CONTRIBUTION.md](CONTRIBUTION.md) | PR workflow + dev expectations |
 
-> **Note:** `rustzap analyze` (including `--tools native`), `rustzap audit`, JSON `"modules"` / `"static"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2.5. OpenAPI/HAR/Nuclei are Phase 3. The **agentic tester** (`rustzap agent` + `rustzap mcp`) is implemented — see [Agentic Tester](#agentic-tester-agent--mcp) below. The hosted `serve` viewer remains planned.
+> **Note:** `rustzap analyze` (including `--tools native`), `rustzap audit`, JSON `"modules"` / `"static"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2.5. OpenAPI/HAR/Nuclei are Phase 3. The **agentic tester** (`rustzap agent` + `rustzap mcp`) is implemented — see [Agentic Tester](#agentic-tester-agent--mcp) below. Native **Active Directory / NTLM-relay detection** (`rustzap ad`, Tier A) is implemented — see [Active Directory](#active-directory--ntlm-relay-detection-ad) below. The hosted `serve` viewer remains planned.
 
 ---
 
@@ -96,6 +96,16 @@ cargo build --release
 ```
 
 Contribution checks (fmt, clippy, tests) and how to install hooks on Windows are in [CONTRIBUTION.md](CONTRIBUTION.md).
+
+### VS Code extension
+
+A thin CLI wrapper lives in [`vscode-extension/`](vscode-extension/). It runs **`RustZAP: Analyze Workspace`** (native static analysis → **Problems**), **`RustZAP: Scan URL`** (passive DAST by default, with a legal confirmation), and **`RustZAP: Scan Active Directory`** (LDAP/SPN/NTLM relay detection with an authorization prompt; credentials are entered at run time and passed to the CLI via an env var, never stored in settings). Correlated relay attack paths render as an **Attack paths** section in the Findings tree. Reports go to extension storage, not the repo.
+
+```bash
+cd vscode-extension && npm ci && npm run compile   # F5 to debug in VS Code
+```
+
+Requires the `rustzap` binary on `PATH` or `rustzap.path` in settings. See [vscode-extension/README.md](vscode-extension/README.md).
 
 ### Install companion tools (OS-aware)
 
@@ -326,6 +336,37 @@ rustzap audit ~/src/myapp --target https://lab.example.com \
 Scan and analyze/audit JSON reports include a **`modules`** array (per-plugin roll-up) and optional **`correlations`** when `--correlate` is set. With `--tools native`, reports also include a **`static`** object (`inventory`, `risk_score`, `risk_breakdown`, `detection_checks`, `attack_plan`). That field is omitted when native is not selected. The native walk respects `.gitignore` and `.rustzapignore` (and always skips `node_modules`, `target`, `.git`, `vendor`, `dist`).
 
 **GitHub Code Scanning:** build SARIF with `rustzap … --sarif-out rustzap.sarif` (or `scan --output rustzap.sarif`), upload the artifact with `github/codeql-action/upload-sarif` against your default branch or PR; confirm the run appears under the repository **Security** tab (manual check).
+
+### Active Directory / NTLM-relay detection (`ad`)
+
+> **Authorization required.** `rustzap ad` sends LDAP and NTLM authentication
+> traffic to Active Directory hosts. It is **detection only** — it never generates
+> a relay-target list or triggers coercion — but it is intrusive. Only scan AD you
+> own or have **explicit written permission** to test. Like `analyze`, it prompts
+> for authorization (TTY), or requires `--yes` in CI.
+
+Tier A coverage (native Rust): LDAP/LDAPS signing posture, Ghost-SPN detection
+(SPNs whose host has no DNS record), NTLMv1 / NTLM-signing negotiate flags, and
+LDAP domain-computer enumeration. Findings carry stable `ad/*` plugin ids and feed
+the correlation engine, which consolidates per-host weaknesses into a single
+**"NTLM relay exposure on <host>"** attack-path finding.
+
+```bash
+# Anonymous, Ghost-SPN + LDAP posture, against a lab DC you control:
+rustzap ad --domain corp.local --dc-ip 10.0.0.1 --null-auth --checks spn,ldap --yes
+
+# Authenticated + enumerate every domain computer (password read from env, never argv):
+export RZ_AD_PASS='...'
+rustzap ad --domain corp.local --dc-ip 10.0.0.1 -u svc-account --audit \
+           -o ad-report.json --sarif-out ad.sarif --yes
+
+# Only NTLM negotiate-flag checks against explicit targets:
+rustzap ad --domain corp.local --dc-ip 10.0.0.1 --null-auth --checks ntlm \
+           -t win-srv01.corp.local -t win-srv02.corp.local --yes
+```
+
+Pass the bind password via `--password-env` (default `RZ_AD_PASS`), not on the
+command line. `--checks` selects `ldap`, `spn`, `ntlm`, or `all` (default).
 
 ### Spider Only
 

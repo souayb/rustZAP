@@ -5,7 +5,7 @@ export interface ScanSession {
   reportPath: string;
   sarifPath: string;
   workspaceRoot: string | undefined;
-  kind: "analyze" | "scan";
+  kind: "analyze" | "scan" | "ad";
 }
 
 let session: ScanSession | undefined;

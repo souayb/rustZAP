@@ -17,6 +17,15 @@ function testPackageCommands(): void {
   assert.ok(ids.includes("rustzap.scanUrl"));
   assert.ok(ids.includes("rustzap.showReportSummary"));
   assert.ok(ids.includes("rustzap.openLastReport"));
+  assert.ok(ids.includes("rustzap.scanActiveDirectory"), "AD scan command should be contributed");
+
+  // AD config keys should be declared.
+  const pkgFull = pkg as {
+    contributes?: { configuration?: { properties?: Record<string, unknown> } };
+  };
+  const props = pkgFull.contributes?.configuration?.properties ?? {};
+  assert.ok("rustzap.ad.domain" in props, "rustzap.ad.domain config should exist");
+  assert.ok("rustzap.ad.checks" in props, "rustzap.ad.checks config should exist");
 }
 
 function testBinaryPrefersConfiguredPath(): void {

@@ -88,10 +88,18 @@ export interface StaticAnalysis {
   attack_plan: AttackPlanEntry[];
 }
 
+export interface Correlation {
+  id: string;
+  finding_ids: string[];
+  reason: string;
+  elevated_severity?: Severity | null;
+}
+
 export interface Report {
   meta: ReportMeta;
   summary: ReportSummary;
   modules?: ModuleSummary[];
+  correlations?: Correlation[];
   static?: StaticAnalysis;
   findings: Finding[];
 }

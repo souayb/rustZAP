@@ -33,6 +33,11 @@
         "icon": "$(globe)"
       },
       {
+        "command": "rustzap.scanActiveDirectory",
+        "title": "RustZAP: Scan Active Directory",
+        "icon": "$(server)"
+      },
+      {
         "command": "rustzap.clearFindings",
         "title": "RustZAP: Clear Findings",
         "icon": "$(clear-all)"
@@ -98,14 +103,19 @@
           "group": "navigation@2"
         },
         {
-          "command": "rustzap.clearFindings",
+          "command": "rustzap.scanActiveDirectory",
           "when": "view == rustzap.findings",
           "group": "navigation@3"
         },
         {
-          "command": "rustzap.openLastReport",
+          "command": "rustzap.clearFindings",
           "when": "view == rustzap.findings",
           "group": "navigation@4"
+        },
+        {
+          "command": "rustzap.openLastReport",
+          "when": "view == rustzap.findings",
+          "group": "navigation@5"
         }
       ],
       "view/item/context": [
@@ -168,9 +178,32 @@
         },
         "rustzap.problems.infoSeverity": {
           "type": "string",
-          "enum": ["information", "hint"],
+          "enum": [
+            "information",
+            "hint"
+          ],
           "default": "information",
           "description": "How info-level findings appear in Problems (information shows by default; hint is often hidden)."
+        },
+        "rustzap.ad.domain": {
+          "type": "string",
+          "default": "",
+          "description": "Default Active Directory domain FQDN (e.g. corp.local). Pre-fills the AD scan prompt."
+        },
+        "rustzap.ad.dcIp": {
+          "type": "string",
+          "default": "",
+          "description": "Default domain controller IP for AD scans. Pre-fills the AD scan prompt."
+        },
+        "rustzap.ad.checks": {
+          "type": "string",
+          "default": "all",
+          "description": "AD check families to run: all, or a comma list of ldap,spn,ntlm."
+        },
+        "rustzap.ad.insecure": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip TLS verification for LDAPS / WinRM probes during AD scans."
         }
       }
     }

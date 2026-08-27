@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import {
   AttackPlanEntry,
+  Correlation,
   Finding,
   findingLocationLabel,
   formatSummaryLine,
@@ -19,6 +20,7 @@ export type RustZapTreeItem =
   | SectionItem
   | DetailItem
   | AttackPlanItem
+  | CorrelationItem
   | SeverityGroupItem
   | FindingItem;
 
@@ -42,7 +44,7 @@ export class SummaryItem extends vscode.TreeItem {
 export class SectionItem extends vscode.TreeItem {
   constructor(
     label: string,
-    public readonly sectionId: "inventory" | "attackPlan" | "findings",
+    public readonly sectionId: "inventory" | "attackPlan" | "attackPaths" | "findings",
     count: number,
     icon: string
   ) {
@@ -86,6 +88,26 @@ export class AttackPlanItem extends vscode.TreeItem {
         title: "View attack plan context",
       };
     }
+  }
+}
+
+export class CorrelationItem extends vscode.TreeItem {
+  constructor(public readonly correlation: Correlation) {
+    const sev = correlation.elevated_severity ? ` [${correlation.elevated_severity}]` : "";
+    const label = correlation.reason.length > 72
+      ? `${correlation.reason.slice(0, 69)}…`
+      : correlation.reason;
+    super(label, vscode.TreeItemCollapsibleState.None);
+    this.description = `${correlation.finding_ids.length} finding(s)${sev}`;
+    this.contextValue = "correlation";
+    this.iconPath = new vscode.ThemeIcon("git-merge");
+    const md = new vscode.MarkdownString();
+    md.appendMarkdown(`${correlation.reason}\n\n`);
+    if (correlation.elevated_severity) {
+      md.appendMarkdown(`Elevated to: \`${correlation.elevated_severity}\`\n\n`);
+    }
+    md.appendMarkdown(`Correlated findings: ${correlation.finding_ids.length}`);
+    this.tooltip = md;
   }
 }
 
@@ -239,6 +261,11 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<RustZapTree
           roots.push(new SectionItem("Attack plan", "attackPlan", st.attack_plan.length, "target"));
         }
       }
+      if (this.report.correlations?.length) {
+        roots.push(
+          new SectionItem("Attack paths", "attackPaths", this.report.correlations.length, "git-merge")
+        );
+      }
       const findings = sortFindings(this.report.findings);
       if (findings.length) {
         roots.push(new SectionItem("Findings", "findings", findings.length, "bug"));
@@ -254,6 +281,9 @@ export class FindingsTreeProvider implements vscode.TreeDataProvider<RustZapTree
         return this.report.static.attack_plan.map(
           (e) => new AttackPlanItem(e, this.report!.meta.target)
         );
+      }
+      if (element.sectionId === "attackPaths" && this.report.correlations) {
+        return this.report.correlations.map((c) => new CorrelationItem(c));
       }
       if (element.sectionId === "findings") {
         return this.findingsBySeverity();

@@ -1,6 +1,12 @@
 import * as vscode from "vscode";
 import { ensureRustzapBinary, promptInstallRustzap } from "./binary";
-import { ensureAnalyzeConsent, ensureScanLegalConsent, promptScanUrl } from "./consent";
+import {
+  ensureAdAuthConsent,
+  ensureAnalyzeConsent,
+  ensureScanLegalConsent,
+  promptAdInputs,
+  promptScanUrl,
+} from "./consent";
 import { applyDiagnostics, DIAGNOSTIC_SOURCE } from "./diagnostics";
 import { FindingsTreeProvider, openFinding, showFindingDetails } from "./findingsTree";
 import { log, logSection, showOutput } from "./output";
@@ -38,6 +44,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("rustzap.scanUrl", () => scanUrl(context)),
     vscode.commands.registerCommand("rustzap.scanAttackPlanEntry", (url: string) =>
       scanUrl(context, url)
+    ),
+    vscode.commands.registerCommand("rustzap.scanActiveDirectory", () =>
+      scanActiveDirectory(context)
     ),
     vscode.commands.registerCommand("rustzap.clearFindings", () => clearFindings()),
     vscode.commands.registerCommand("rustzap.showOutput", () => showOutput()),
@@ -210,13 +219,72 @@ async function scanUrl(context: vscode.ExtensionContext, presetUrl?: string) {
   });
 }
 
+async function scanActiveDirectory(context: vscode.ExtensionContext) {
+  const config = vscode.workspace.getConfiguration("rustzap");
+  const inputs = await promptAdInputs(
+    String(config.get("ad.domain", "")),
+    String(config.get("ad.dcIp", ""))
+  );
+  if (!inputs) {
+    return;
+  }
+
+  if (!(await ensureAdAuthConsent(inputs.domain, inputs.dcIp))) {
+    return;
+  }
+
+  const checks = String(config.get("ad.checks", "all")).trim() || "all";
+  const insecure = Boolean(config.get("ad.insecure", false));
+  const passwordEnv = "RZ_AD_PASS";
+  const env = inputs.password ? { [passwordEnv]: inputs.password } : undefined;
+
+  await runScan(context, {
+    kind: "ad",
+    workspaceRoot: workspaceRoot(),
+    env,
+    argsBuilder: (paths) => {
+      const args = [
+        "ad",
+        "--domain",
+        inputs.domain,
+        "--dc-ip",
+        inputs.dcIp,
+        "--checks",
+        checks,
+        "--password-env",
+        passwordEnv,
+        "-o",
+        paths.jsonPath,
+        "--sarif-out",
+        paths.sarifPath,
+        "--yes",
+      ];
+      for (const t of inputs.targets) {
+        args.push("--target", t);
+      }
+      if (inputs.nullAuth) {
+        args.push("--null-auth");
+      } else if (inputs.username) {
+        args.push("--username", inputs.username);
+      }
+      if (insecure) {
+        args.push("--insecure");
+      }
+      return args;
+    },
+    progressTitle: "RustZAP: Scanning Active Directory…",
+    logTitle: `AD scan ${inputs.domain}`,
+  });
+}
+
 interface RunScanOptions {
-  kind: "analyze" | "scan";
+  kind: "analyze" | "scan" | "ad";
   workspaceRoot: string | undefined;
   argsBuilder: (paths: { jsonPath: string; sarifPath: string }) => string[];
   progressTitle: string;
   logTitle: string;
   quiet?: boolean;
+  env?: Record<string, string>;
 }
 
 async function runScan(context: vscode.ExtensionContext, opts: RunScanOptions) {
@@ -242,7 +310,8 @@ async function runScan(context: vscode.ExtensionContext, opts: RunScanOptions) {
           opts.argsBuilder(paths),
           paths.jsonPath,
           paths.sarifPath,
-          token
+          token,
+          opts.env
         );
 
         const session: ScanSession = {

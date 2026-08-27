@@ -38,14 +38,17 @@ function readFileUtf8(filePath: string): string {
 export async function runRustzap(
   binary: string,
   args: string[],
-  token: vscode.CancellationToken
+  token: vscode.CancellationToken,
+  envOverlay?: Record<string, string>
 ): Promise<{ stdout: string; stderr: string; code: number | null }> {
   return new Promise((resolve, reject) => {
+    // Secrets (e.g. AD bind password) travel via env, never argv — argv is
+    // world-readable in the process list. Only the command is logged.
     log(`$ ${binary} ${args.join(" ")}`);
 
     const child = spawn(binary, args, {
       cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
-      env: { ...process.env },
+      env: { ...process.env, ...(envOverlay ?? {}) },
       shell: process.platform === "win32",
     });
 
@@ -103,9 +106,10 @@ export async function runAndLoadReport(
   args: string[],
   jsonPath: string,
   sarifPath: string,
-  token: vscode.CancellationToken
+  token: vscode.CancellationToken,
+  envOverlay?: Record<string, string>
 ): Promise<RunResult> {
-  const { stdout, stderr, code } = await runRustzap(binary, args, token);
+  const { stdout, stderr, code } = await runRustzap(binary, args, token, envOverlay);
 
   if (code !== 0 && !fs.existsSync(jsonPath)) {
     throw new Error(

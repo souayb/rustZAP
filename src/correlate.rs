@@ -16,6 +16,7 @@ use crate::types::{uuid_v4, Finding, Severity};
 pub fn correlate_findings(findings: &mut [Finding]) -> Vec<Correlation> {
     let mut out = correlate_sast_sqli_dast(findings);
     out.extend(correlate_trivy_semgrep_web_dast(findings));
+    out.extend(correlate_ad_relay_paths(findings));
     out
 }
 
@@ -158,6 +159,79 @@ fn correlate_trivy_semgrep_web_dast(findings: &mut [Finding]) -> Vec<Correlation
     out
 }
 
+/// **AD relay-path rule.** When a single host shows two or more relay-enabling
+/// weaknesses (LDAP signing off, LDAP channel binding off, NTLMv1, NTLM signing
+/// off), consolidate them into one elevated "NTLM relay exposure on <host>"
+/// finding — the attack-path view instead of four unrelated findings.
+fn correlate_ad_relay_paths(findings: &mut [Finding]) -> Vec<Correlation> {
+    use std::collections::BTreeMap;
+
+    let mut by_host: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, f) in findings.iter().enumerate() {
+        if is_ad_relay_enabler(&f.plugin) {
+            if let Some(host) = ad_host(&f.url) {
+                by_host.entry(host).or_default().push(i);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (host, idxs) in by_host {
+        if idxs.len() < 2 {
+            continue;
+        }
+        let ids: Vec<String> = idxs.iter().map(|&i| findings[i].id.clone()).collect();
+        for &i in &idxs {
+            for id in &ids {
+                if *id != findings[i].id {
+                    findings[i].correlated_with.push(id.clone());
+                }
+            }
+        }
+        // Critical when signing AND channel binding are both off (classic
+        // relay-to-LDAP path); High otherwise.
+        let has_signing = idxs
+            .iter()
+            .any(|&i| findings[i].plugin == "ad/ldap-signing");
+        let has_cbt = idxs
+            .iter()
+            .any(|&i| findings[i].plugin == "ad/ldap-channel-binding");
+        let elevated = if has_signing && has_cbt {
+            Severity::Critical
+        } else {
+            Severity::High
+        };
+        for &i in &idxs {
+            if findings[i].severity < elevated {
+                findings[i].severity = elevated.clone();
+            }
+        }
+        out.push(Correlation {
+            id: format!("corr-{}", uuid_v4()),
+            finding_ids: ids,
+            reason: format!(
+                "NTLM relay exposure on {host}: multiple relay-enabling weaknesses on the same host                  form an actionable attack path"
+            ),
+            elevated_severity: Some(elevated),
+        });
+    }
+    out
+}
+
+fn is_ad_relay_enabler(plugin: &str) -> bool {
+    matches!(
+        plugin,
+        "ad/ldap-signing" | "ad/ldap-channel-binding" | "ad/ntlmv1" | "ad/ntlm-signing"
+    )
+}
+
+/// Host portion of an `ldap://HOST` finding url.
+fn ad_host(url: &str) -> Option<String> {
+    url.strip_prefix("ldap://")
+        .map(|h| h.split(['/', ':']).next().unwrap_or(h).to_string())
+        .filter(|h| !h.is_empty())
+}
+
 fn trivy_pkg_name_chomped(f: &Finding) -> Option<String> {
     if f.plugin != "sca/trivy" {
         return None;
@@ -286,6 +360,46 @@ mod tests {
             f = f.with_parameter(p);
         }
         f
+    }
+
+    #[test]
+    fn ad_relay_paths_consolidate_per_host() {
+        let mut findings = vec![
+            mk(
+                "a1",
+                "ad/ldap-signing",
+                "ldap://dc01.corp.local",
+                Severity::High,
+                None,
+            ),
+            mk(
+                "a2",
+                "ad/ldap-channel-binding",
+                "ldap://dc01.corp.local",
+                Severity::High,
+                None,
+            ),
+            mk(
+                "a3",
+                "ad/ntlmv1",
+                "ldap://other.corp.local",
+                Severity::High,
+                None,
+            ),
+        ];
+        let corr = correlate_findings(&mut findings);
+        let ad_corr: Vec<_> = corr
+            .iter()
+            .filter(|c| c.reason.contains("relay exposure"))
+            .collect();
+        assert_eq!(ad_corr.len(), 1, "one host has 2+ enablers");
+        assert_eq!(ad_corr[0].elevated_severity, Some(Severity::Critical));
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert!(findings[0].correlated_with.contains(&"a2".to_string()));
+        assert!(
+            findings[2].correlated_with.is_empty(),
+            "lone enabler is not correlated"
+        );
     }
 
     #[test]

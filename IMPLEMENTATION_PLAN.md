@@ -510,6 +510,36 @@ When crawl detects LLM-like routes (`/v1/chat/completions`, etc.), optional subt
 
 ---
 
+## Phase 7 — Active Directory / NTLM-relay detection ✅ (Tier A)
+
+Adds a new assessment domain (Windows/AD identity) alongside Web (DAST) and
+Code/IaC (SAST). New `src/ad/` module + `rustzap ad` subcommand.
+
+- **Tier A (shipped):** native LDAP/LDAPS signing posture (`ad/ldap-signing`,
+  `ad/ldap-channel-binding`), Ghost-SPN detection (`ad/ghost-spn`, LDAP SPN query +
+  DNS), NTLM negotiate-flag inspection (`ad/ntlmv1`, `ad/ntlm-signing`, over HTTP/
+  WinRM), and LDAP domain-computer enumeration (`ad/computer`, `--audit`).
+- Network I/O sits behind `LdapDirectory` / `NtlmProbe` / `DnsResolver` traits
+  (`src/ad/probe.rs`) with `ldap3`/`hickory-resolver`/`reqwest` live impls and
+  in-memory mocks, so verdict logic unit-tests with **no live DC**.
+- Findings flow through the existing `Finding` model, `write_report` (`modules`,
+  SARIF/CSV/HTML), and a new `correlate_ad_relay_paths` rule that consolidates
+  per-host weaknesses into one elevated **"NTLM relay exposure on <host>"** finding.
+- **Safety:** detection only (no relay-target list, no coercion), explicit
+  `rustzap ad` subcommand, authorization consent (TTY or `--yes`), bind password
+  via `--password-env` (never argv). VS Code: `RustZAP: Scan Active Directory`
+  command + Attack-paths tree section; credentials prompted, passed via env.
+- **Tier B/C (planned):** native SMB2 signing probe; MS-RPC coercion
+  (PetitPotam/PrinterBug/DFSCoerce), MSSQL/WinRM EPA, CVE-2025-33073 /
+  CVE-2025-54918 / CVE-2019-1040; optional RelayKing shell-out cross-check.
+
+**Acceptance:**
+- [x] `rustzap ad` gated by consent (TTY prompt / `--yes`); refuses non-TTY without `--yes`.
+- [x] AD findings produce `ad/*` module rows and a relay-path correlation in JSON/SARIF.
+- [ ] Validated against a lab DC (GOAD or similar) — manual.
+
+---
+
 ## Phase 6 — Platform and long tail
 
 - Falco webhook ingest (`POST /webhooks/falco`) — extend `serve`.

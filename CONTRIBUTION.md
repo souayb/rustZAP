@@ -56,7 +56,7 @@ On Windows, install [Git for Windows](https://gitforwindows.org/) so hooks run u
 | `pre-commit` | every commit | `cargo fmt --all -- --check`; reject generated reports/secrets; whitespace / conflict markers |
 | `pre-push` | every push | `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace` |
 
-CI (`.github/workflows/ci.yml`) runs `scripts/dev-check.sh ci` on **Ubuntu, macOS, and Windows**.
+CI (`.github/workflows/ci.yml`) runs `scripts/dev-check.sh ci` on **Ubuntu, macOS, and Windows**, plus a separate **vscode-extension** job (`npm ci`, compile, unit tests).
 
 Do not commit scanner output (`report.json`, `rustzap-report.json`, `analyze-report.json`, `*.sarif`, files under `reports/`). Those are produced by the app; write them under `reports/` (gitignored) or outside the repo.
 
@@ -73,6 +73,7 @@ Bypass (local only, not for PRs): `git commit --no-verify` / `git push --no-veri
 | `IMPLEMENTATION_PLAN.md` | Phased implementation specs, JSON/schema, CLI plans, acceptance checklists |
 | `CLAUDE.md` | Architecture notes, plugin wiring traps, verification commands (useful for humans too) |
 | `SOFTWARE_DESIGN_DOCUMENT.md` | Broader platform / orchestration context |
+| `vscode-extension/README.md` | VS Code extension (analyze + scan MVP) |
 
 ---
 
@@ -97,6 +98,85 @@ cargo run -- scan --target https://example.com --passive-only --depth 1 --output
 ```
 
 Use **your own lab targets** for aggressive `--plugins` runs.
+
+### VS Code extension
+
+Changes under `vscode-extension/` should pass:
+
+```bash
+cd vscode-extension && npm ci && npm run compile && npm test
+```
+
+Rust-only contributors are not required to run npm locally; CI runs the extension job on Ubuntu.
+
+#### Testing in VS Code (manual)
+
+The extension is a thin wrapper around the `rustzap` CLI. To try it locally:
+
+**1. Build the CLI** (from the repository root):
+
+```bash
+cargo build --release
+```
+
+**2. Build the extension**:
+
+```bash
+cd vscode-extension
+npm ci
+npm run compile
+npm test
+```
+
+**3. Open the extension folder in VS Code or Cursor** (not the whole repo — `F5` uses `vscode-extension/.vscode/launch.json`):
+
+```bash
+code vscode-extension
+```
+
+**4. Launch the Extension Development Host**
+
+- Open **Run and Debug** (`Cmd+Shift+D` / `Ctrl+Shift+D`)
+- Select **Run Extension**
+- Press **F5**
+
+A second editor window opens (**Extension Development Host**). That is where you exercise the extension.
+
+**5. Run commands in the Extension Development Host**
+
+1. **File → Open Folder…** and pick a project to analyze (e.g. `tests/fixtures/native_app` for a quick smoke test).
+2. Open the **Command Palette** (`Cmd+Shift+P` / `Ctrl+Shift+P`):
+   - **RustZAP: Analyze Workspace** — static analysis (`--tools native` by default)
+   - **RustZAP: Scan URL** — passive DAST (legal confirmation required; use only authorized targets, e.g. `https://example.com`)
+3. On first analyze, confirm **Allow analysis** (one-time per folder).
+4. For scans, read the legal warning and choose **Run scan**.
+
+**6. Where to check results**
+
+| Place | What you should see |
+|-------|---------------------|
+| **Status bar** | `RustZAP: risk N · M finding(s)` — click to focus the sidebar |
+| **RustZAP** activity bar (shield icon) | Summary, **Inventory**, **Attack plan**, **Findings** tree |
+| **Problems** (`Cmd+Shift+M`) | File/line diagnostics (info uses **Information** severity by default) |
+| **Notification actions** | **Open summary**, **View attack plan**, **Open JSON** after each run |
+| **Output → RustZAP** | Exact CLI command and logs |
+
+Toolbar on the findings view: analyze, scan, clear, **open last JSON report**.
+
+Use **RustZAP: Show Report Summary** or click the summary row for a markdown roll-up (inventory, attack plan, modules). Findings without a file location open a **details** tab instead of jumping to code.
+
+**7. If `rustzap` is not on PATH**
+
+In the Extension Development Host, set **rustzap.path** in settings to your built binary, for example:
+
+- macOS/Linux: `<repo>/target/release/rustzap`
+- Windows: `<repo>\target\release\rustzap.exe`
+
+The extension also auto-detects `target/release/rustzap` and `target/debug/rustzap` when the opened workspace is this repository.
+
+**Quick smoke test:** F5 → open `tests/fixtures/native_app` → **RustZAP: Analyze Workspace** → expect findings in the sidebar and Problems (e.g. secrets / DOM sinks).
+
+More detail: [`vscode-extension/README.md`](vscode-extension/README.md).
 
 ### Code style
 

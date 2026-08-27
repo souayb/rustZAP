@@ -62,6 +62,9 @@ that need human follow-up (e.g. dispatched OOB payloads) are `tentative`.
 | **E8** | Repo inventory | `sast/inventory` — languages, frameworks, entrypoints (`src/analyze/inventory.rs`) |
 | **E9** | Native JS / DOM / forms / params | `sast/js-secrets`, `sast/js-urls`, `sast/dom-sinks`, `sast/js-cookies`, `sast/js-storage`, `sast/js-postmessage`, `sast/forms`, `sast/params` + JSON `static{ risk_breakdown, detection_checks, attack_plan }` — Phase 2.5 P0+P1 (parallel analyzers, `.gitignore` / `.rustzapignore` walk) |
 | **E10** | TUI Analyze tab | `src/tui/analyze.rs` — tab 6 / `a`; consent `[Y]/[N]`; default tools `native`; writes `analyze-report.json` |
+| **E11** | VS Code extension | `vscode-extension/` — analyze workspace + scan URL; Problems + findings tree; shells out to CLI |
+| **F1** | Active Directory / NTLM-relay detector (Tier A) | `src/ad/` — `rustzap ad`; native LDAP signing posture, Ghost-SPN, NTLMv1/NTLM-signing flags, computer enumeration; `ad/*` plugin ids; per-host relay-path correlation; detection-only, authorization-gated |
+| **F2** | VS Code AD command + attack-path tree | `vscode-extension/` — `RustZAP: Scan Active Directory`; renders `correlations` as an Attack paths section; creds via env, never settings |
 
 Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPLEMENTATION_PLAN Phases 4–5.
 
@@ -80,6 +83,12 @@ Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPL
 
 4. **A5 refactor (optional)**  
    Extract redirect logic shared with open-redirect checks into something like `src/redirect_helpers.rs` if duplication grows.
+
+5. **F3 — AD Tier B (native SMB signing)**
+   Hand-rolled SMB2 `NEGOTIATE` signing/dialect probe (`ad/smb-signing`), building on the `src/ad/` trait seam.
+
+6. **F4 — AD Tier C (RelayKing parity)**
+   MS-RPC coercion detection (PetitPotam/PrinterBug/DFSCoerce), MSSQL/WinRM EPA, CVE-2025-33073 / CVE-2025-54918 / CVE-2019-1040 logic, and cross-host coercion→relay correlation. Optionally a RelayKing shell-out adapter as a cross-check for uncovered protocols. Large, multi-branch effort.
 
 ---
 

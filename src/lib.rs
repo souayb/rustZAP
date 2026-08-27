@@ -1,6 +1,7 @@
 //! RustZAP library — scanner modules (binary entrypoint: `src/main.rs`).
 
 pub mod active;
+pub mod ad;
 pub mod agent;
 pub mod analyze;
 pub mod correlate;
