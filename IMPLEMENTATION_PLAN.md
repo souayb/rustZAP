@@ -536,7 +536,7 @@ Code/IaC (SAST). New `src/ad/` module + `rustzap ad` subcommand.
 **Acceptance:**
 - [x] `rustzap ad` gated by consent (TTY prompt / `--yes`); refuses non-TTY without `--yes`.
 - [x] AD findings produce `ad/*` module rows and a relay-path correlation in JSON/SARIF.
-- [ ] Validated against a lab DC (GOAD or similar) — manual.
+- [x] Validated against a real Samba AD DC (`tests/ad-lab/`): live LDAP bind, SPN + computer enumeration, DNS-based ghost-SPN, and `ad/ldap-signing` posture all fire; the run also surfaced and fixed a ghost-SPN false-positive class (Kerberos/GUID/short-name SPNs).
 
 ---
 
