@@ -269,6 +269,8 @@ mod tests {
             solution: "s".to_string(),
             cwe: None,
             owasp_category: None,
+            nist_control: None,
+            disa_stig_id: None,
             plugin: "sast/semgrep".to_string(),
             source_tool: Some("semgrep".to_string()),
             location: Some(CodeLocation {
@@ -278,6 +280,7 @@ mod tests {
             }),
             correlated_with: vec![],
             poc_validated: false,
+            poc: None,
             confidence: crate::types::Confidence::Firm,
             found_at: chrono::Utc::now(),
         };

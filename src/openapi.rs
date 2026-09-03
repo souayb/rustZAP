@@ -69,6 +69,9 @@ pub fn parse_openapi_json(json: &str, target: &str) -> Result<(Vec<DiscoveredUrl
             out.push(DiscoveredUrl {
                 url,
                 method: method.to_ascii_uppercase(),
+                headers: Vec::new(),
+                body: None,
+                content_type: None,
                 parameters: params,
                 source: UrlSource::OpenApi,
             });

@@ -53,12 +53,7 @@ where
 }
 
 fn du(url: &str) -> DiscoveredUrl {
-    DiscoveredUrl {
-        url: url.to_string(),
-        method: "GET".to_string(),
-        parameters: vec!["q".to_string()],
-        source: UrlSource::Link,
-    }
+    DiscoveredUrl::new(url, "GET", UrlSource::Link)
 }
 
 fn client() -> reqwest::Client {

@@ -5,7 +5,9 @@
 //! findings + the attack-plan frontier, and finally assembles a `Report`. It
 //! never runs without a scope file. See `IMPLEMENTATION_PLAN.md` Phase 5.
 
+pub mod autofix;
 pub mod brain;
+pub mod poc;
 pub mod privacy;
 pub mod redteam;
 pub mod scope;

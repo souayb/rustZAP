@@ -322,6 +322,10 @@ fn file_stem(name: &str) -> Option<String> {
         .map(|s| s.to_string_lossy().to_string())
 }
 
+const GENERIC_STEMS: &[&str] = &[
+    "index", "main", "mod", "lib", "app", "default", "util", "utils", "server", "common",
+];
+
 fn paths_correlate(sast_http_path: Option<&str>, sast_file: Option<&str>, dast_url: &str) -> bool {
     if let Some(sp) = sast_http_path {
         if let Some(dp) = http_path(dast_url) {
@@ -334,14 +338,17 @@ fn paths_correlate(sast_http_path: Option<&str>, sast_file: Option<&str>, dast_u
             return true;
         }
         if let Some(stem) = file_stem(file) {
-            if !stem.is_empty() && lower.contains(&stem.to_ascii_lowercase()) {
-                return true;
-            }
-            if let Some(dp) = http_path(dast_url) {
-                return dp
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .any(|seg| seg.eq_ignore_ascii_case(&stem));
+            let stem_lc = stem.to_ascii_lowercase();
+            if !stem.is_empty() && !GENERIC_STEMS.contains(&stem_lc.as_str()) {
+                if lower.contains(&stem_lc) {
+                    return true;
+                }
+                if let Some(dp) = http_path(dast_url) {
+                    return dp
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .any(|seg| seg.eq_ignore_ascii_case(&stem));
+                }
             }
         }
     }

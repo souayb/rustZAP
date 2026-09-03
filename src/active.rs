@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use colored::*;
 use indicatif::ProgressBar;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use tracing::debug;
 use url::Url;
 
@@ -38,7 +38,7 @@ pub trait ScanPlugin: Send + Sync {
 pub struct ActiveScanner {
     client: Arc<reqwest::Client>,
     plugins: Vec<Box<dyn ScanPlugin>>,
-    semaphore: Arc<Semaphore>,
+    concurrency: usize,
     /// When true, run plugins on URLs without query parameters too.
     all_paths: bool,
 }
@@ -92,7 +92,7 @@ impl ActiveScanner {
         ActiveScanner {
             client,
             plugins,
-            semaphore: Arc::new(Semaphore::new(concurrency)),
+            concurrency: concurrency.max(1),
             all_paths,
         }
     }
@@ -108,51 +108,83 @@ impl ActiveScanner {
     }
 
     pub async fn scan_all(&self, urls: &[DiscoveredUrl], pb: &ProgressBar) -> Result<Vec<Finding>> {
-        let mut all_findings = Vec::new();
+        use futures::stream::{self, StreamExt};
 
-        for du in urls {
-            pb.inc(1);
-            pb.set_message(format!("Scanning {}", &du.url[..du.url.len().min(50)]));
-
-            // `--active-all-paths` forces plugins to run even on paramless URLs.
+        let mut tasks = Vec::new();
+        let mut remaining = vec![0usize; urls.len()];
+        for (url_idx, du) in urls.iter().enumerate() {
             let has_params = self.all_paths || !du.parameters.is_empty() || du.url.contains('?');
-            let any_always_run = self.plugins.iter().any(|p| p.always_run());
-
-            // Skip URLs with no parameters for active scanning, unless at
-            // least one selected plugin opts to run on any URL.
-            if !has_params && !any_always_run {
-                continue;
-            }
-
-            let _permit = self.semaphore.acquire().await?;
-
-            for plugin in &self.plugins {
+            for (idx, plugin) in self.plugins.iter().enumerate() {
                 if !has_params && !plugin.always_run() {
                     continue;
                 }
-                debug!("Running {} on {}", plugin.name(), du.url);
-                let findings = plugin.scan(&self.client, du).await;
-                if !findings.is_empty() {
-                    for f in &findings {
-                        let tag = if f.poc_validated {
-                            "[confirmed]".green().to_string()
-                        } else {
-                            format!("[{}]", f.confidence.to_string().to_lowercase())
-                                .dimmed()
-                                .to_string()
-                        };
-                        println!(
-                            "  {} {} {} — {}",
-                            f.severity.color_str(),
-                            tag,
-                            f.title.bright_white().bold(),
-                            f.url.dimmed()
-                        );
-                    }
-                    all_findings.extend(findings);
-                }
+                remaining[url_idx] += 1;
+                tasks.push((url_idx, du.clone(), idx));
             }
         }
+
+        // URLs with no plugin work still count toward the bar (same as passive).
+        for (url_idx, count) in remaining.iter().enumerate() {
+            if *count == 0 {
+                pb.inc(1);
+                let preview = &urls[url_idx].url[..urls[url_idx].url.len().min(50)];
+                pb.set_message(format!("Scanning {preview}"));
+            }
+        }
+
+        let client = self.client.clone();
+        let plugins_arc = Arc::new(
+            self.plugins
+                .iter()
+                .map(|p| p.as_ref() as &dyn ScanPlugin)
+                .collect::<Vec<_>>(),
+        );
+        let remaining = Arc::new(Mutex::new(remaining));
+        let pb = pb.clone();
+
+        let findings_stream = stream::iter(tasks)
+            .map(|(url_idx, du, plugin_idx)| {
+                let client = client.clone();
+                let plugins_ref = plugins_arc.clone();
+                let remaining = remaining.clone();
+                let pb = pb.clone();
+                async move {
+                    let plugin = plugins_ref[plugin_idx];
+                    debug!("Running {} on {}", plugin.name(), du.url);
+                    let findings = plugin.scan(&client, &du).await;
+                    if !findings.is_empty() {
+                        for f in &findings {
+                            let tag = if f.poc_validated {
+                                "[confirmed]".green().to_string()
+                            } else {
+                                format!("[{}]", f.confidence.to_string().to_lowercase())
+                                    .dimmed()
+                                    .to_string()
+                            };
+                            println!(
+                                "  {} {} {} — {}",
+                                f.severity.color_str(),
+                                tag,
+                                f.title.bright_white().bold(),
+                                f.url.dimmed()
+                            );
+                        }
+                    }
+
+                    let mut rem = remaining.lock().await;
+                    rem[url_idx] = rem[url_idx].saturating_sub(1);
+                    if rem[url_idx] == 0 {
+                        pb.inc(1);
+                        let preview = &du.url[..du.url.len().min(50)];
+                        pb.set_message(format!("Scanning {preview}"));
+                    }
+                    findings
+                }
+            })
+            .buffer_unordered(self.concurrency);
+
+        let results: Vec<Vec<Finding>> = findings_stream.collect().await;
+        let all_findings = results.into_iter().flatten().collect();
 
         Ok(all_findings)
     }
@@ -180,7 +212,7 @@ pub fn list_plugins() {
 pub fn build_injection_urls_adv(target: &DiscoveredUrl, payload: &str) -> Vec<(String, String)> {
     let mut variants = Vec::new();
 
-    // Inject into query string params
+    // 1. Inject into query string params
     if let Ok(parsed) = url::Url::parse(&target.url) {
         let params: Vec<(String, String)> = parsed
             .query_pairs()
@@ -206,6 +238,23 @@ pub fn build_injection_urls_adv(target: &DiscoveredUrl, payload: &str) -> Vec<(S
                 }
             }
             variants.push((key.clone(), modified.to_string()));
+        }
+
+        // 2. Inject into REST path segments (numeric or uuid-like segments)
+        if let Some(segments) = parsed.path_segments() {
+            let seg_list: Vec<&str> = segments.collect();
+            for (i, seg) in seg_list.iter().enumerate() {
+                let is_numeric = !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit());
+                let is_uuid = seg.len() >= 32 && seg.contains('-');
+                if is_numeric || is_uuid {
+                    let mut new_segs = seg_list.clone();
+                    new_segs[i] = payload;
+                    let mut modified = parsed.clone();
+                    modified.set_path(&new_segs.join("/"));
+                    let param_name = format!("path_seg_{i}");
+                    variants.push((param_name, modified.to_string()));
+                }
+            }
         }
     }
 
@@ -1417,5 +1466,3 @@ mod tests {
         assert!(findings.iter().any(|f| f.title.contains("Excessive")));
     }
 }
-
-// je veux maintenant ajouter un aurtre test pour

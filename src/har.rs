@@ -91,6 +91,9 @@ pub fn parse_har_json(json: &str, target: &str) -> Result<Vec<DiscoveredUrl>> {
         out.push(DiscoveredUrl {
             url: entry.request.url,
             method,
+            headers: Vec::new(),
+            body: None,
+            content_type: None,
             parameters,
             source: UrlSource::Har,
         });

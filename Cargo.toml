@@ -54,6 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Async traits
 async-trait = "0.1"
+futures = "0.3"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -70,6 +71,8 @@ tokio-channel = "0.1"
 ratatui = "0.30.0"
 crossterm = "0.29.0"
 base64 = "0.22.1"
+sha2 = "0.10"
+hex = "0.4"
 
 # C1: TLS certificate inspection (parses peer certs returned by rustls)
 x509-parser = "0.16"

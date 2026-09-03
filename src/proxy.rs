@@ -132,6 +132,38 @@ async fn handle_request(
 
     // Handle CONNECT (HTTPS tunneling)
     if method == "CONNECT" {
+        let host_port = req
+            .uri()
+            .authority()
+            .map(|a| a.to_string())
+            .or_else(|| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k.to_lowercase() == "host")
+                    .map(|(_, v)| v.clone())
+            })
+            .unwrap_or_else(|| uri.clone());
+
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(mut upgraded) => match tokio::net::TcpStream::connect(&host_port).await {
+                    Ok(mut server) => {
+                        if let Err(e) =
+                            tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
+                        {
+                            tracing::debug!("CONNECT tunnel closed for {}: {}", host_port, e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to connect to target {}: {}", host_port, e);
+                    }
+                },
+                Err(e) => {
+                    warn!("CONNECT upgrade failed for {}: {}", host_port, e);
+                }
+            }
+        });
+
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .body(Body::empty())

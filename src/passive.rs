@@ -35,6 +35,16 @@ impl PassiveScanner {
 
     /// Run all passive checks against discovered URLs
     pub async fn scan_all(&self, urls: &[DiscoveredUrl], pb: &ProgressBar) -> Result<Vec<Finding>> {
+        self.scan_all_with_cache(urls, pb, None).await
+    }
+
+    /// Run all passive checks, utilizing cached responses from spidering when available.
+    pub async fn scan_all_with_cache(
+        &self,
+        urls: &[DiscoveredUrl],
+        pb: &ProgressBar,
+        cache: Option<&crate::types::HttpResponseCache>,
+    ) -> Result<Vec<Finding>> {
         let mut all_findings = Vec::new();
 
         for du in urls {
@@ -46,7 +56,25 @@ impl PassiveScanner {
                 continue;
             }
 
-            let findings = self.check_url(&du.url).await;
+            let findings = if let Some(c) = cache {
+                if let Some(cached) = c.get(&du.url).await {
+                    let mut hmap = reqwest::header::HeaderMap::new();
+                    for (k, v) in &cached.headers {
+                        if let (Ok(name), Ok(val)) = (
+                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(v),
+                        ) {
+                            hmap.insert(name, val);
+                        }
+                    }
+                    check_response_passive(&du.url, cached.status, &hmap, &cached.body)
+                } else {
+                    self.check_url(&du.url).await
+                }
+            } else {
+                self.check_url(&du.url).await
+            };
+
             if !findings.is_empty() {
                 debug!("Passive findings at {}: {}", du.url, findings.len());
                 all_findings.extend(findings);
@@ -1275,6 +1303,9 @@ pub async fn run_passive_cli(input: &str, output: &str) -> Result<()> {
     let urls = vec![crate::types::DiscoveredUrl {
         url: input.to_string(),
         method: "GET".to_string(),
+        headers: Vec::new(),
+        body: None,
+        content_type: None,
         parameters: vec![],
         source: crate::types::UrlSource::Seed,
     }];

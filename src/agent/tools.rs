@@ -501,6 +501,9 @@ async fn run_plugin(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             .and_then(|v| v.as_str())
             .unwrap_or("GET")
             .to_string(),
+        headers: Vec::new(),
+        body: None,
+        content_type: None,
         parameters,
         source: UrlSource::Seed,
     };

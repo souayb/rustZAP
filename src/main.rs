@@ -4,7 +4,8 @@ use colored::*;
 use rustzap::scanner::ScanConfig;
 use rustzap::stress::StressCliArgs;
 use rustzap::{
-    active, ad, agent, analyze, installer, mcp, passive, proxy, scanner, spider, stress, tui,
+    active, ad, agent, analyze, installer, mcp, passive, proxy, replay, safety, scanner, spider,
+    stress, tui,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -38,6 +39,9 @@ enum Commands {
         passive_only: bool,
         #[arg(short, long, default_value = "rustzap-report.json")]
         output: String,
+        /// Enable aggressive Attack Mode for dedicated lab/dev testing (intrusive mutations)
+        #[arg(long, visible_alias = "attack-mode")]
+        attack: bool,
         /// Additional SARIF 2.1 file (GitHub Code Scanning). `--output foo.sarif` also works.
         #[arg(long)]
         sarif_out: Option<String>,
@@ -248,6 +252,10 @@ enum Commands {
         /// Opt-in: run passive checks on non-GET discovered requests too
         #[arg(long)]
         passive_all_methods: bool,
+
+        /// Enable aggressive Attack Mode for dedicated lab/dev testing (intrusive mutations)
+        #[arg(long, visible_alias = "attack-mode")]
+        attack: bool,
     },
 
     /// Detect Active Directory / NTLM-relay attack vectors (LDAP + SPN + NTLM).
@@ -483,6 +491,9 @@ enum Commands {
         sarif_out: Option<String>,
         #[arg(long, default_value = "agent-trace.jsonl")]
         trace: String,
+        /// Enable aggressive Attack Mode for dedicated lab/dev testing
+        #[arg(long, visible_alias = "attack-mode")]
+        attack: bool,
     },
 
     /// Run as an MCP server on stdio, exposing RustZAP's tools to external
@@ -493,6 +504,25 @@ enum Commands {
         scope: Option<String>,
         #[arg(long, default_value = "agent-trace.jsonl")]
         trace: String,
+    },
+
+    /// Replay an HTTP transaction capture file for CI/CD regression verification
+    Replay {
+        /// Path to captured transactions JSON file
+        #[arg(value_name = "CAPTURE_FILE")]
+        file: String,
+
+        /// Override target host (e.g. http://localhost:8080)
+        #[arg(short, long)]
+        target: Option<String>,
+
+        /// Request timeout in seconds
+        #[arg(long, default_value = "10")]
+        timeout: u64,
+
+        /// Verbose diff output
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -547,7 +577,11 @@ async fn main() -> anyhow::Result<()> {
             nuclei_jsonl,
             active_all_paths,
             passive_all_methods,
+            attack,
         } => {
+            if attack {
+                safety::print_attack_mode_warning(&target);
+            }
             let config = ScanConfig {
                 target_url: target,
                 max_depth: depth,
@@ -657,7 +691,13 @@ async fn main() -> anyhow::Result<()> {
             follow_symlinks,
             active_all_paths,
             passive_all_methods,
+            attack,
         } => {
+            if attack {
+                if let Some(ref t) = target {
+                    safety::print_attack_mode_warning(t);
+                }
+            }
             let tools_explicit = tools.is_some();
             let tools = tools.unwrap_or_else(|| analyze::DEFAULT_AUDIT_TOOLS.to_string());
             let repo = analyze::resolve_repo_path(path, repo, yes)?;
@@ -707,7 +747,12 @@ async fn main() -> anyhow::Result<()> {
             output,
             sarif_out,
             trace,
+            attack,
         } => {
+            if attack {
+                let target_str = target.as_deref().unwrap_or("configured target");
+                safety::print_attack_mode_warning(target_str);
+            }
             if let Some(path) = init_scope {
                 let p = std::path::Path::new(&path);
                 agent::scope::write_template(p)?;
@@ -858,6 +903,22 @@ async fn main() -> anyhow::Result<()> {
                 requests,
             };
             stress::run_stress_cli(args).await?;
+        }
+        Commands::Replay {
+            file,
+            target,
+            timeout,
+            verbose,
+        } => {
+            let config = replay::ReplayConfig {
+                target_override: target,
+                timeout_secs: timeout,
+                verbose,
+            };
+            let summary = replay::run_replay_file(std::path::Path::new(&file), &config).await?;
+            if summary.failed > 0 || summary.status_diverged > 0 {
+                std::process::exit(1);
+            }
         }
     }
 

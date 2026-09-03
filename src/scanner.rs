@@ -125,7 +125,10 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         config.max_depth,
         config.concurrency,
     );
-    let mut discovered = spider.crawl(&spider_pb).await?;
+    let response_cache = crate::types::HttpResponseCache::new();
+    let mut discovered = spider
+        .crawl_with_cache(&spider_pb, Some(&response_cache))
+        .await?;
     spider_pb.finish();
 
     // Phase 3: OpenAPI / HAR surface expansion (merged into discovered set).
@@ -152,7 +155,9 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         ProgressBar::with_draw_target(Some(discovered.len() as u64), ProgressDrawTarget::hidden());
     let passive_scanner =
         PassiveScanner::new(client.clone()).with_all_methods(config.passive_all_methods);
-    let passive_findings = passive_scanner.scan_all(&discovered, &passive_pb).await?;
+    let passive_findings = passive_scanner
+        .scan_all_with_cache(&discovered, &passive_pb, Some(&response_cache))
+        .await?;
     passive_pb.finish();
     {
         let mut f = findings.lock().await;
@@ -782,12 +787,7 @@ mod tests {
     use crate::types::UrlSource;
 
     fn du(url: &str) -> DiscoveredUrl {
-        DiscoveredUrl {
-            url: url.into(),
-            method: "GET".into(),
-            parameters: vec![],
-            source: UrlSource::Seed,
-        }
+        DiscoveredUrl::new(url, "GET", UrlSource::Seed)
     }
 
     #[test]
