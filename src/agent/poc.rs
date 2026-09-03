@@ -84,28 +84,35 @@ print(response.text[:500])
     )
 }
 
+/// HTTP request fields used to synthesize a PoC script and `raw_request`.
+pub struct PocHttpRequest<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub headers: &'a [(String, String)],
+    pub body: Option<&'a str>,
+}
+
 /// Construct a `PocProof` record from execution results.
 pub fn build_poc_proof(
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: Option<&str>,
+    request: &PocHttpRequest<'_>,
     canary_sent: impl Into<String>,
     canary_received: impl Into<String>,
     raw_response: impl Into<String>,
     execution_time_ms: u64,
 ) -> PocProof {
-    let script_content = synthesize_curl_poc(method, url, headers, body);
+    let script_content =
+        synthesize_curl_poc(request.method, request.url, request.headers, request.body);
     let raw_request = format!(
         "{} {}\n{}\n\n{}",
-        method.to_uppercase(),
-        url,
-        headers
+        request.method.to_uppercase(),
+        request.url,
+        request
+            .headers
             .iter()
             .map(|(k, v)| format!("{k}: {v}"))
             .collect::<Vec<_>>()
             .join("\n"),
-        body.unwrap_or_default()
+        request.body.unwrap_or_default()
     );
 
     PocProof {

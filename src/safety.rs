@@ -121,7 +121,7 @@ impl CircuitBreaker {
         self.total_latency_ms
             .fetch_add(latency_ms, Ordering::SeqCst);
 
-        if status >= 500 && status <= 599 {
+        if (500..=599).contains(&status) {
             let errors = self.error_5xx_count.fetch_add(1, Ordering::SeqCst) + 1;
             if total >= 20 {
                 let error_rate = errors as f64 / total as f64;
@@ -170,12 +170,10 @@ pub fn is_request_safe(
 ) -> Result<(), &'static str> {
     let method_upper = method.to_uppercase();
 
-    if policy.read_only_safe {
-        if !matches!(method_upper.as_str(), "GET" | "HEAD" | "OPTIONS") {
-            return Err(
-                "Mutating HTTP verb (POST/PUT/DELETE/PATCH) blocked by --read-only-safe policy",
-            );
-        }
+    if policy.read_only_safe && !matches!(method_upper.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        return Err(
+            "Mutating HTTP verb (POST/PUT/DELETE/PATCH) blocked by --read-only-safe policy",
+        );
     }
 
     if !policy.attack_mode {
