@@ -340,7 +340,11 @@ async fn post_response_body(
     body: &str,
 ) -> Option<(u16, String)> {
     if let Some(gate) = active_gate() {
-        if gate.before_url_request("POST", url, Some(body)).await.is_err() {
+        if gate
+            .before_url_request("POST", url, Some(body))
+            .await
+            .is_err()
+        {
             return None;
         }
     }
@@ -843,7 +847,9 @@ impl ScanPlugin for XxePlugin {
 <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
 <root><param>&xxe;</param></root>"#;
 
-        if let Some((_, body)) = post_response_body(client, &target.url, "application/xml", xxe_payload).await {
+        if let Some((_, body)) =
+            post_response_body(client, &target.url, "application/xml", xxe_payload).await
+        {
             if body.contains("root:x:0:0:") {
                 findings.push(
                     Finding::new(

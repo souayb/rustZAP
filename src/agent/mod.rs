@@ -288,7 +288,10 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
             .map(|l| format!("{}:{}", l.file, l.line_start))
             .unwrap_or_default();
         let param = f.parameter.as_deref().unwrap_or_default();
-        seen.insert(format!("{}|{}|{}|{}|{}", f.plugin, f.title, f.url, param, loc))
+        seen.insert(format!(
+            "{}|{}|{}|{}|{}",
+            f.plugin, f.title, f.url, param, loc
+        ))
     });
 }
 
@@ -529,8 +532,10 @@ mod tests {
     #[test]
     fn dedup_preserves_different_parameters() {
         use crate::types::{Finding, Severity};
-        let f1 = Finding::new("XSS", Severity::High, "http://x/a", "d", "s", "active/xss").with_parameter("q");
-        let f2 = Finding::new("XSS", Severity::High, "http://x/a", "d", "s", "active/xss").with_parameter("name");
+        let f1 = Finding::new("XSS", Severity::High, "http://x/a", "d", "s", "active/xss")
+            .with_parameter("q");
+        let f2 = Finding::new("XSS", Severity::High, "http://x/a", "d", "s", "active/xss")
+            .with_parameter("name");
         let mut v = vec![f1, f2];
         dedup_findings(&mut v);
         assert_eq!(v.len(), 2);

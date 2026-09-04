@@ -49,7 +49,10 @@ impl PassiveScanner {
 
         for du in urls {
             pb.inc(1);
-            pb.set_message(format!("Checking {}", crate::types::safe_truncate(&du.url, 50)));
+            pb.set_message(format!(
+                "Checking {}",
+                crate::types::safe_truncate(&du.url, 50)
+            ));
 
             // Only check GET URLs for passive scanning, unless all methods opted in.
             if !self.all_methods && du.method != "GET" {
