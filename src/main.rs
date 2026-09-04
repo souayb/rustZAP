@@ -85,6 +85,12 @@ enum Commands {
         /// Opt-in: run passive checks on non-GET discovered requests too
         #[arg(long)]
         passive_all_methods: bool,
+        /// Block mutating HTTP verbs (POST/PUT/DELETE/PATCH) during active scan
+        #[arg(long)]
+        read_only_safe: bool,
+        /// Cap outbound HTTP requests per second (0 = unlimited). Default 50.
+        #[arg(long)]
+        max_rps: Option<u32>,
     },
 
     /// Run spider only
@@ -256,6 +262,14 @@ enum Commands {
         /// Enable aggressive Attack Mode for dedicated lab/dev testing (intrusive mutations)
         #[arg(long, visible_alias = "attack-mode")]
         attack: bool,
+
+        /// Block mutating HTTP verbs during DAST portion of audit
+        #[arg(long)]
+        read_only_safe: bool,
+
+        /// Cap outbound HTTP requests per second (0 = unlimited)
+        #[arg(long)]
+        max_rps: Option<u32>,
     },
 
     /// Detect Active Directory / NTLM-relay attack vectors (LDAP + SPN + NTLM).
@@ -494,6 +508,25 @@ enum Commands {
         /// Enable aggressive Attack Mode for dedicated lab/dev testing
         #[arg(long, visible_alias = "attack-mode")]
         attack: bool,
+        /// Block mutating HTTP verbs (POST/PUT/DELETE/PATCH) in agent probes
+        #[arg(long)]
+        read_only_safe: bool,
+        /// Cap outbound HTTP requests per second (0 = unlimited). Default 50.
+        #[arg(long)]
+        max_rps: Option<u32>,
+        /// Directory for autofix prompt/patch exports (optional)
+        #[arg(long)]
+        autofix_dir: Option<String>,
+    },
+
+    /// Export autofix prompts from a JSON report (findings with file locations)
+    Autofix {
+        /// Path to a rustzap JSON report
+        #[arg(long)]
+        report: String,
+        /// Output directory for `{finding-id}.md` prompt files
+        #[arg(short, long, default_value = "patches")]
+        out: String,
     },
 
     /// Run as an MCP server on stdio, exposing RustZAP's tools to external
@@ -578,8 +611,10 @@ async fn main() -> anyhow::Result<()> {
             active_all_paths,
             passive_all_methods,
             attack,
+            read_only_safe,
+            max_rps,
         } => {
-            if attack {
+            if attack && !read_only_safe {
                 safety::print_attack_mode_warning(&target);
             }
             let config = ScanConfig {
@@ -604,6 +639,7 @@ async fn main() -> anyhow::Result<()> {
                 nuclei_jsonl,
                 active_all_paths,
                 passive_all_methods,
+                safety: safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
             };
             scanner::run_scan(config).await?;
         }
@@ -692,8 +728,10 @@ async fn main() -> anyhow::Result<()> {
             active_all_paths,
             passive_all_methods,
             attack,
+            read_only_safe,
+            max_rps,
         } => {
-            if attack {
+            if attack && !read_only_safe {
                 if let Some(ref t) = target {
                     safety::print_attack_mode_warning(t);
                 }
@@ -724,6 +762,7 @@ async fn main() -> anyhow::Result<()> {
                 follow_symlinks,
                 active_all_paths,
                 passive_all_methods,
+                safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
             )
             .await?;
         }
@@ -748,8 +787,11 @@ async fn main() -> anyhow::Result<()> {
             sarif_out,
             trace,
             attack,
+            read_only_safe,
+            max_rps,
+            autofix_dir,
         } => {
-            if attack {
+            if attack && !read_only_safe {
                 let target_str = target.as_deref().unwrap_or("configured target");
                 safety::print_attack_mode_warning(target_str);
             }
@@ -783,8 +825,15 @@ async fn main() -> anyhow::Result<()> {
                 llm,
                 ai_redteam,
                 ai_redteam_marker,
+                safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
+                autofix_dir,
             )
             .await?;
+        }
+
+        Commands::Autofix { report, out } => {
+            agent::autofix::export_from_report(&report, &out)?;
+            println!("Wrote autofix prompts → {out}");
         }
 
         Commands::Mcp { scope, trace } => {
@@ -839,7 +888,7 @@ async fn main() -> anyhow::Result<()> {
             };
             if username.is_some() && !null_auth && password.is_none() {
                 anyhow::bail!(
-                    "No password found in ${password_env}. Set it (e.g. `export {password_env}=...`)                      or use --null-auth."
+                    "No password found in ${password_env}. Set it (e.g. `export {password_env}=...`) or use --null-auth."
                 );
             }
             let config = ad::AdConfig {

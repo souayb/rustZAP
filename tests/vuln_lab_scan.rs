@@ -33,6 +33,7 @@ fn scan_config(target: &str) -> ScanConfig {
         nuclei_jsonl: None,
         active_all_paths: true,
         passive_all_methods: false,
+        safety: rustzap::safety::SafetyPolicy::default(),
     }
 }
 

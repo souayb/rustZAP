@@ -126,6 +126,31 @@ pub fn build_poc_proof(
     }
 }
 
+/// Attach a curl GET PoC to a finding (confirmed + `poc` field).
+pub fn attach_get_poc(
+    finding: crate::types::Finding,
+    exploit_url: &str,
+    canary_sent: impl Into<String>,
+    canary_received: impl Into<String>,
+    raw_response: impl Into<String>,
+    execution_time_ms: u64,
+) -> crate::types::Finding {
+    let req = PocHttpRequest {
+        method: "GET",
+        url: exploit_url,
+        headers: &[],
+        body: None,
+    };
+    let poc = build_poc_proof(
+        &req,
+        canary_sent,
+        canary_received,
+        raw_response,
+        execution_time_ms,
+    );
+    finding.with_poc(poc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +179,17 @@ mod tests {
         let py = synthesize_python_poc("GET", "http://example.com/api", &headers, None);
         assert!(py.contains("requests.request"));
         assert!(py.contains("http://example.com/api"));
+    }
+
+    #[test]
+    fn attach_get_poc_sets_curl_and_confirmed() {
+        use crate::types::{Finding, Severity};
+        let f = Finding::new("t", Severity::High, "http://x/", "d", "s", "active/xss");
+        let out = attach_get_poc(f, "http://x/?q=1", "canary", "canary", "body", 12);
+        assert!(out.poc_validated);
+        let poc = out.poc.expect("poc");
+        assert!(poc.script_content.starts_with("curl"));
+        assert!(poc.script_content.contains("http://x/?q=1"));
+        assert_eq!(poc.canary_sent, "canary");
     }
 }

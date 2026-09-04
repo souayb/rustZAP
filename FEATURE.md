@@ -65,8 +65,12 @@ that need human follow-up (e.g. dispatched OOB payloads) are `tentative`.
 | **E11** | VS Code extension | `vscode-extension/` — analyze workspace + scan URL; Problems + findings tree; shells out to CLI |
 | **F1** | Active Directory / NTLM-relay detector (Tier A) | `src/ad/` — `rustzap ad`; native LDAP signing posture, Ghost-SPN, NTLMv1/NTLM-signing flags, computer enumeration; `ad/*` plugin ids; per-host relay-path correlation; detection-only, authorization-gated |
 | **F2** | VS Code AD command + attack-path tree | `vscode-extension/` — `RustZAP: Scan Active Directory`; renders `correlations` as an Attack paths section; creds via env, never settings |
+| **G1** | Safety gate (wired) | `src/safety.rs` `HttpSafetyGate` — `--read-only-safe`, `--max-rps`, `--attack` → `SafetyPolicy` on scan/agent HTTP; RPS throttle + circuit breaker on active `get_response_body` + agent `send_and_capture` |
+| **G2** | Curl PoC on confirmed findings | `src/agent/poc.rs` `attach_get_poc` / `build_poc_proof` — SQLi / XSS / path-traversal + AI red-team confirmed findings ship `poc` in JSON |
+| **G3** | Agent explore-first + Exploit classes | `run_plugin` / `scan_target` / `replay_request` = Exploit; mutating `http_probe` elevated; recon-before-exploit gate; `export_autofix` tool + `rustzap autofix` |
+| **G4** | Windows TUI key doubling fix | `src/tui/mod.rs` — only `KeyEventKind::Press` (Press+Release no longer doubles chars) |
 
-Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPLEMENTATION_PLAN Phases 4–5.
+Tier **E** tracks **E6** (`serve`) remains **planned**. Agentic tester (**E7**) is shipped with G1–G3 hardening — see IMPLEMENTATION_PLAN Phase 5.
 
 ---
 
@@ -75,20 +79,20 @@ Tier **E** tracks **E6–E7** (`serve`, agentic) remain **planned** — see IMPL
 1. **E6 — `rustzap serve` HTTP worker**  
    IMPLEMENTATION_PLAN Phase 4.
 
-2. **E7 — Agentic `rustzap agent`**  
-   IMPLEMENTATION_PLAN Phase 5 (opt-in only).
-
-3. **B2 enhancement (optional)**  
+2. **B2 enhancement (optional)**
    User-supplied `--wordlist` for sensitive paths beyond the curated `SENSITIVE_PATHS` (still opt-in and rate-limited).
 
-4. **A5 refactor (optional)**  
+3. **A5 refactor (optional)**
    Extract redirect logic shared with open-redirect checks into something like `src/redirect_helpers.rs` if duplication grows.
 
-5. **F3 — AD Tier B (native SMB signing)**
+4. **F3 — AD Tier B (native SMB signing)**
    Hand-rolled SMB2 `NEGOTIATE` signing/dialect probe (`ad/smb-signing`), building on the `src/ad/` trait seam.
 
-6. **F4 — AD Tier C (RelayKing parity)**
+5. **F4 — AD Tier C (RelayKing parity)**
    MS-RPC coercion detection (PetitPotam/PrinterBug/DFSCoerce), MSSQL/WinRM EPA, CVE-2025-33073 / CVE-2025-54918 / CVE-2019-1040 logic, and cross-host coercion→relay correlation. Optionally a RelayKing shell-out adapter as a cross-check for uncovered protocols. Large, multi-branch effort.
+
+6. **G5 — Strix Docker sandbox / multi-agent** (not planned in-tree)
+   External Strix CLI parity (sandbox exploit runtime, graph-of-agents) remains out of scope; prefer wiring RustZAP’s native gates and PoCs.
 
 ---
 

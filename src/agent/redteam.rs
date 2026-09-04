@@ -161,7 +161,21 @@ pub fn to_finding(probe: &Probe, url: &str, evidence: &str) -> Finding {
     .with_cwe(probe.cwe)
     .with_evidence(snippet(evidence, 400));
     if probe.confirmed_on_hit {
-        f.confirmed()
+        let headers = vec![("Content-Type".into(), "application/json".into())];
+        let req = crate::agent::poc::PocHttpRequest {
+            method: "POST",
+            url,
+            headers: &headers,
+            body: Some(probe.prompt.as_str()),
+        };
+        let poc = crate::agent::poc::build_poc_proof(
+            &req,
+            probe.id,
+            snippet(evidence, 120),
+            snippet(evidence, 400),
+            0,
+        );
+        f.with_poc(poc)
     } else {
         f.tentative()
     }

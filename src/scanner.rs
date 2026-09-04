@@ -54,6 +54,8 @@ pub struct ScanConfig {
     pub active_all_paths: bool,
     /// Opt-in: run passive checks on non-GET discovered requests too.
     pub passive_all_methods: bool,
+    /// Do-no-harm / attack-mode / RPS policy for active HTTP.
+    pub safety: crate::safety::SafetyPolicy,
 }
 
 /// Shared HTTP client factory
@@ -175,6 +177,7 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
             config.plugins.clone(),
             config.concurrency,
             config.active_all_paths,
+            config.safety.clone(),
         );
         active_module_names = active_scanner.enabled_module_names();
         let af = active_scanner.scan_all(&discovered, &active_pb).await?;
@@ -490,6 +493,7 @@ pub async fn run_scan_with_events(
             config.plugins.clone(),
             config.concurrency,
             config.active_all_paths,
+            config.safety.clone(),
         );
         active_module_names = active_scanner.enabled_module_names();
         let active_findings = active_scanner.scan_all(&discovered, &active_pb).await?;

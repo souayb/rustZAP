@@ -4,7 +4,7 @@
 //! SAST/DAST evidence, preparing merge-ready pull request files.
 
 use crate::types::Finding;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -98,9 +98,54 @@ pub fn save_patch_file(
     Ok(patch_path)
 }
 
+/// Export remediation prompt files for findings that have a `location`.
+/// Writes `{id}.md` under `out_dir`. Returns paths written.
+pub fn export_findings(
+    findings: &[Finding],
+    out_dir: impl AsRef<Path>,
+    only_ids: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let out_dir = out_dir.as_ref();
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create autofix dir {}", out_dir.display()))?;
+    let mut written = Vec::new();
+    for f in findings {
+        if let Some(ids) = only_ids {
+            if !ids.iter().any(|id| id == &f.id) {
+                continue;
+            }
+        }
+        let Some(loc) = f.location.as_ref() else {
+            continue;
+        };
+        let path = &loc.file;
+        let code = fs::read_to_string(path).unwrap_or_else(|_| {
+            format!(
+                "// (source unavailable at export time — path was {path})\n\
+                 // Apply the solution guideline from the finding manually.\n"
+            )
+        });
+        let prompt = generate_patch_prompt(f, path, &code);
+        let file_path = out_dir.join(format!("{}.md", f.id));
+        fs::write(&file_path, prompt)?;
+        written.push(file_path.display().to_string());
+    }
+    Ok(written)
+}
+
+/// Load a rustzap JSON report and export autofix prompts for findings with locations.
+pub fn export_from_report(report_path: &str, out_dir: &str) -> Result<Vec<String>> {
+    let raw =
+        fs::read_to_string(report_path).with_context(|| format!("read report {report_path}"))?;
+    let report: crate::report::Report =
+        serde_json::from_str(&raw).with_context(|| format!("parse report JSON {report_path}"))?;
+    export_findings(&report.findings, out_dir, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{CodeLocation, Severity};
 
     #[test]
     fn test_unified_diff_generation() {
@@ -111,5 +156,27 @@ mod tests {
         assert!(diff.contains("+++ b/src/main.rs"));
         assert!(diff.contains("-    let q = format!(\"SELECT * FROM u WHERE id={}\", id);"));
         assert!(diff.contains("+    let q = \"SELECT * FROM u WHERE id = $1\";"));
+    }
+
+    #[test]
+    fn export_findings_writes_prompt_for_located() {
+        let dir = std::env::temp_dir().join(format!("rz-autofix-{}", crate::types::uuid_v4()));
+        let src = dir.join("vuln.rs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&src, "fn bad() { let _ = 1; }\n").unwrap();
+        let f = Finding::new("t", Severity::High, "http://x", "d", "s", "sast/x").with_location(
+            CodeLocation {
+                file: src.display().to_string(),
+                line_start: 1,
+                line_end: None,
+            },
+        );
+        let out = dir.join("patches");
+        let written = export_findings(&[f], &out, None).unwrap();
+        assert_eq!(written.len(), 1);
+        let body = fs::read_to_string(&written[0]).unwrap();
+        assert!(body.contains("principal security engineer"));
+        assert!(body.contains("fn bad()"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

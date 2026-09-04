@@ -632,6 +632,7 @@ pub async fn run_audit_cli(
     follow_symlinks: bool,
     active_all_paths: bool,
     passive_all_methods: bool,
+    safety: crate::safety::SafetyPolicy,
 ) -> Result<()> {
     let start = Instant::now();
     let parsed_tools = parse_tools(&tools)?;
@@ -687,6 +688,7 @@ pub async fn run_audit_cli(
             nuclei_jsonl: None,
             active_all_paths,
             passive_all_methods,
+            safety,
         };
         let collected = collect_scan(scan_config).await?;
         findings.extend(collected.findings);
@@ -1319,6 +1321,7 @@ mod tests {
             false,
             false,
             false,
+            crate::safety::SafetyPolicy::default(),
         )
         .await
         .expect("audit static");

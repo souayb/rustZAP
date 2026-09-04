@@ -210,7 +210,7 @@ fn correlate_ad_relay_paths(findings: &mut [Finding]) -> Vec<Correlation> {
             id: format!("corr-{}", uuid_v4()),
             finding_ids: ids,
             reason: format!(
-                "NTLM relay exposure on {host}: multiple relay-enabling weaknesses on the same host                  form an actionable attack path"
+                "NTLM relay exposure on {host}: multiple relay-enabling weaknesses on the same host form an actionable attack path"
             ),
             elevated_severity: Some(elevated),
         });

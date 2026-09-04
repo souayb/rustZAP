@@ -105,6 +105,7 @@ In `active.rs`, URLs **without** query parameters are **skipped** for active sca
 ### HTTP client
 
 - Built via `scanner::build_client` / `ScanConfig`: timeouts, TLS verify (`insecure`), cookies, auth headers, redirects (limited).
+- Active + agent HTTP go through `safety::HttpSafetyGate` (`--read-only-safe`, `--max-rps`, `--attack` → `SafetyPolicy`). Circuit breaker aborts on 5xx/latency spikes.
 
 ---
 

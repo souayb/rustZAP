@@ -180,6 +180,7 @@ fn system_prompt() -> String {
          - to call a tool: {{\"tool\": \"<name>\", \"args\": {{...}}}}\n\
          - to stop: {{\"finish\": \"<short summary of findings>\"}}\n\n\
          Rules:\n\
+         - Explore first: call recon tools (analyze_repo, list_plugins, GET http_probe, get_attack_plan) before exploit-class tools (run_plugin, scan_target, replay_request, mutating http_probe, ai_redteam).\n\
          - Do NOT repeat a tool call you already made — the result will not change.\n\
          - Once you have gathered the information the goal needs, reply with {{\"finish\": ...}}.\n\
          - Only target hosts that are in scope. Prefer read-only recon; validate before concluding.",

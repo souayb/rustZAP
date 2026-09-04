@@ -10,7 +10,35 @@ use tokio::sync::Mutex;
 use tracing::debug;
 use url::Url;
 
+use crate::safety::{HttpSafetyGate, SafetyPolicy};
 use crate::types::{DiscoveredUrl, Finding, Severity};
+
+/// Process-wide gate for active plugin HTTP helpers (`get_response_body`).
+/// Set for the duration of `ActiveScanner::scan_all`.
+static ACTIVE_GATE: std::sync::Mutex<Option<Arc<HttpSafetyGate>>> = std::sync::Mutex::new(None);
+
+fn install_active_gate(gate: Arc<HttpSafetyGate>) {
+    if let Ok(mut g) = ACTIVE_GATE.lock() {
+        *g = Some(gate);
+    }
+}
+
+fn clear_active_gate() {
+    if let Ok(mut g) = ACTIVE_GATE.lock() {
+        *g = None;
+    }
+}
+
+fn active_gate() -> Option<Arc<HttpSafetyGate>> {
+    ACTIVE_GATE.lock().ok().and_then(|g| g.clone())
+}
+
+struct ActiveGateGuard;
+impl Drop for ActiveGateGuard {
+    fn drop(&mut self) {
+        clear_active_gate();
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Plugin trait
@@ -41,6 +69,7 @@ pub struct ActiveScanner {
     concurrency: usize,
     /// When true, run plugins on URLs without query parameters too.
     all_paths: bool,
+    gate: Arc<HttpSafetyGate>,
 }
 
 /// Every active plugin RustZAP ships, freshly constructed. Single source of
@@ -78,6 +107,7 @@ impl ActiveScanner {
         enabled: Vec<String>,
         concurrency: usize,
         all_paths: bool,
+        safety: SafetyPolicy,
     ) -> Self {
         let plugins = all_active_plugins()
             .into_iter()
@@ -94,6 +124,7 @@ impl ActiveScanner {
             plugins,
             concurrency: concurrency.max(1),
             all_paths,
+            gate: HttpSafetyGate::shared(safety),
         }
     }
 
@@ -109,6 +140,9 @@ impl ActiveScanner {
 
     pub async fn scan_all(&self, urls: &[DiscoveredUrl], pb: &ProgressBar) -> Result<Vec<Finding>> {
         use futures::stream::{self, StreamExt};
+
+        install_active_gate(self.gate.clone());
+        let _clear = ActiveGateGuard;
 
         let mut tasks = Vec::new();
         let mut remaining = vec![0usize; urls.len()];
@@ -250,7 +284,9 @@ pub fn build_injection_urls_adv(target: &DiscoveredUrl, payload: &str) -> Vec<(S
                     let mut new_segs = seg_list.clone();
                     new_segs[i] = payload;
                     let mut modified = parsed.clone();
-                    modified.set_path(&new_segs.join("/"));
+                    // `Url::set_path` requires a leading `/`; joining segments alone
+                    // yields a relative path that breaks the URL.
+                    modified.set_path(&format!("/{}", new_segs.join("/")));
                     let param_name = format!("path_seg_{i}");
                     variants.push((param_name, modified.to_string()));
                 }
@@ -277,10 +313,20 @@ pub async fn timed_get(client: &reqwest::Client, url: &str) -> (u64, bool) {
 }
 
 async fn get_response_body(client: &reqwest::Client, url: &str) -> Option<(u16, String)> {
+    if let Some(gate) = active_gate() {
+        if gate.before_request("GET", None).await.is_err() {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
     match client.get(url).timeout(Duration::from_secs(8)).send().await {
         Ok(r) => {
             let status = r.status().as_u16();
             let body = r.text().await.unwrap_or_default();
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
             Some((status, body))
         }
         Err(_) => None,
@@ -333,23 +379,30 @@ impl ScanPlugin for XssPlugin {
             for (param, url) in variants {
                 if let Some((_, body)) = get_response_body(client, &url).await {
                     if crate::verify::reflected_raw(&body, raw_marker) {
+                        let snippet: String = body.chars().take(500).collect();
                         findings.push(
-                            Finding::new(
-                                "Reflected Cross-Site Scripting (XSS)",
-                                Severity::High,
-                                &target.url,
-                                "A unique probe injected into this parameter is reflected in the response with its HTML metacharacters unencoded, allowing arbitrary markup/script to execute in the victim's browser.",
-                                "Contextually encode all user input on output. Deploy a strict Content-Security-Policy as defense in depth.",
-                                "active/xss",
-                            )
-                            .with_parameter(&param)
-                            .with_evidence(format!(
-                                "Probe `{}` reflected unencoded as `{}`",
-                                payload, raw_marker
-                            ))
-                            .with_cwe(79)
-                            .with_owasp("A03:2021 – Injection")
-                            .confirmed(),
+                            crate::agent::poc::attach_get_poc(
+                                Finding::new(
+                                    "Reflected Cross-Site Scripting (XSS)",
+                                    Severity::High,
+                                    &target.url,
+                                    "A unique probe injected into this parameter is reflected in the response with its HTML metacharacters unencoded, allowing arbitrary markup/script to execute in the victim's browser.",
+                                    "Contextually encode all user input on output. Deploy a strict Content-Security-Policy as defense in depth.",
+                                    "active/xss",
+                                )
+                                .with_parameter(&param)
+                                .with_evidence(format!(
+                                    "Probe `{}` reflected unencoded as `{}`",
+                                    payload, raw_marker
+                                ))
+                                .with_cwe(79)
+                                .with_owasp("A03:2021 – Injection"),
+                                &url,
+                                token.as_str(),
+                                raw_marker.as_str(),
+                                snippet,
+                                0,
+                            ),
                         );
                         return findings; // one confirmed is enough
                     }
@@ -419,23 +472,30 @@ impl ScanPlugin for SqlInjectionPlugin {
                         // Require the DB error to be NEW vs the baseline — i.e.
                         // actually provoked by our payload.
                         if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
+                            let snippet: String = body.chars().take(500).collect();
                             findings.push(
-                                Finding::new(
-                                    "SQL Injection (Error-Based)",
-                                    Severity::Critical,
-                                    &target.url,
-                                    "A malformed SQL payload provoked a database error that is absent from the baseline response, confirming that user input reaches a SQL query unsanitized.",
-                                    "Use parameterized queries or prepared statements. Never interpolate user input into SQL.",
-                                    "active/sqli",
-                                )
-                                .with_parameter(&param)
-                                .with_evidence(format!(
-                                    "Payload `{}` produced DB error signature `{}` not present in baseline",
-                                    payload, sig
-                                ))
-                                .with_cwe(89)
-                                .with_owasp("A03:2021 – Injection")
-                                .confirmed(),
+                                crate::agent::poc::attach_get_poc(
+                                    Finding::new(
+                                        "SQL Injection (Error-Based)",
+                                        Severity::Critical,
+                                        &target.url,
+                                        "A malformed SQL payload provoked a database error that is absent from the baseline response, confirming that user input reaches a SQL query unsanitized.",
+                                        "Use parameterized queries or prepared statements. Never interpolate user input into SQL.",
+                                        "active/sqli",
+                                    )
+                                    .with_parameter(&param)
+                                    .with_evidence(format!(
+                                        "Payload `{}` produced DB error signature `{}` not present in baseline",
+                                        payload, sig
+                                    ))
+                                    .with_cwe(89)
+                                    .with_owasp("A03:2021 – Injection"),
+                                    &url,
+                                    payload,
+                                    *sig,
+                                    snippet,
+                                    0,
+                                ),
                             );
                             return findings;
                         }
@@ -488,20 +548,27 @@ impl ScanPlugin for PathTraversalPlugin {
                     let body_lower = body.to_lowercase();
                     for sig in &signatures {
                         if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
+                            let snippet: String = body.chars().take(500).collect();
                             findings.push(
-                                Finding::new(
-                                    "Path Traversal — /etc/passwd Readable",
-                                    Severity::Critical,
-                                    &target.url,
-                                    "The application is vulnerable to path traversal, allowing access to arbitrary files on the server filesystem.",
-                                    "Validate and sanitize file path inputs. Use an allowlist of permitted paths.",
-                                    "active/path-traversal",
-                                )
-                                .with_parameter(&param)
-                                .with_evidence(format!("Payload: {} — Response contains '{}' (absent from baseline)", payload, sig))
-                                .with_cwe(22)
-                                .with_owasp("A01:2021 – Broken Access Control")
-                                .confirmed(),
+                                crate::agent::poc::attach_get_poc(
+                                    Finding::new(
+                                        "Path Traversal — /etc/passwd Readable",
+                                        Severity::Critical,
+                                        &target.url,
+                                        "The application is vulnerable to path traversal, allowing access to arbitrary files on the server filesystem.",
+                                        "Validate and sanitize file path inputs. Use an allowlist of permitted paths.",
+                                        "active/path-traversal",
+                                    )
+                                    .with_parameter(&param)
+                                    .with_evidence(format!("Payload: {} — Response contains '{}' (absent from baseline)", payload, sig))
+                                    .with_cwe(22)
+                                    .with_owasp("A01:2021 – Broken Access Control"),
+                                    &url,
+                                    payload,
+                                    *sig,
+                                    snippet,
+                                    0,
+                                ),
                             );
                             return findings;
                         }
@@ -1464,5 +1531,22 @@ mod tests {
         hops.push(hop("https://example.com/6", 200, None));
         let findings = analyze_redirect_chain(&hops, 5);
         assert!(findings.iter().any(|f| f.title.contains("Excessive")));
+    }
+
+    #[test]
+    fn path_segment_injection_keeps_leading_slash() {
+        let target = DiscoveredUrl::new(
+            "https://example.com/api/123/items",
+            "GET",
+            crate::types::UrlSource::Link,
+        );
+        let variants = build_injection_urls_adv(&target, "PAYLOAD");
+        let path_hit = variants
+            .iter()
+            .find(|(name, _)| name == "path_seg_1")
+            .expect("numeric path segment should be injectable");
+        let parsed = url::Url::parse(&path_hit.1).unwrap();
+        assert_eq!(parsed.path(), "/api/PAYLOAD/items");
+        assert!(parsed.as_str().starts_with("https://example.com/api/"));
     }
 }

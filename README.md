@@ -235,6 +235,12 @@ rustzap scan \
 # Passive-only (no attack payloads sent)
 rustzap scan --target https://example.com --passive-only
 
+# Do-no-harm: block mutating verbs; cap request rate (default 50 RPS)
+rustzap scan --target https://example.com --read-only-safe --max-rps 20
+
+# Lab-only attack mode (raises circuit-breaker tolerances; still requires authorization)
+rustzap scan --target https://lab.example.com --attack-mode --plugins xss,sqli
+
 # Skip SSL verification (e.g. staging with self-signed cert)
 rustzap scan --target https://staging.example.com --insecure
 
@@ -571,9 +577,9 @@ model:                         # LLM brain (all fields optional / CLI-overridabl
 
 | Mode | Behavior |
 |------|----------|
-| `assisted` *(default, safest)* | Read-only recon (spider/scan/analyze/verify) runs freely; **every** intrusive action needs approval |
+| `assisted` *(default, safest)* | True recon (analyze/list/GET probe) runs freely; **Exploit-class** tools (`run_plugin`, `scan_target`, `replay_request`, mutating `http_probe`, `ai_redteam`) need approval; explore-first blocks Exploit until recon succeeds |
 | `semi` | Runs autonomously; only the classes in `approval_for` (e.g. `exploit`, `rce`, `exfil`) need approval |
-| `auto` | Runs the whole loop with no prompts — scope + budget are the only guardrails |
+| `auto` | Runs the whole loop with no prompts — scope + budget + explore-first (unless auto-approve) are the guardrails |
 
 Approval is a TTY prompt. In CI / headless (`-n` / `--non-interactive`, or no
 TTY) gated actions are **auto-denied**, never blocked waiting on input.
@@ -598,6 +604,13 @@ LLM_API_KEY=sk-... rustzap agent --scope scope.yaml \
 # Override the scope's autonomy for one run, and turn on privacy tokenization
 rustzap agent --scope scope.yaml --target http://localhost:3000 \
   --autonomy semi --privacy
+
+# Safety gates on agent HTTP (same flags as scan)
+rustzap agent --scope scope.yaml --target http://localhost:3000 \
+  --read-only-safe --max-rps 10 -n
+
+# Export remediation prompts from a JSON report (findings with file locations)
+rustzap autofix --report analyze-report.json --out patches/
 ```
 
 CLI flags override the scope file (`--model`, `--base-url`, `--api-key-env`,
@@ -623,16 +636,17 @@ available to both the native brain and MCP clients:
 
 | Tool | Class | What it does |
 |------|-------|--------------|
-| `scan_target` | recon | DAST (spider + passive + active plugins) against an in-scope URL |
+| `scan_target` | **exploit** | DAST (spider + passive + active) against an in-scope URL |
 | `analyze_repo` | recon | Static analysis (native, or semgrep/trivy/gitleaks/checkov) over a repo |
 | `get_attack_plan` | recon | The native attack-plan frontier (endpoints + params + reason) |
 | `list_plugins` | recon | List available active scan plugins |
-| `run_plugin` | recon | Run one active plugin against one in-scope URL |
-| `http_probe` | recon | One bounded HTTP request; returns a `capture_id` |
+| `run_plugin` | **exploit** | Run one active plugin against one in-scope URL |
+| `http_probe` | recon / **exploit** | Bounded HTTP request; GET/HEAD/OPTIONS = recon; mutating methods = exploit |
 | `list_captures` | recon | List captured HTTP transactions available to replay |
-| `replay_request` | recon | Re-send a captured request with mutations (method/url/body/headers) + diff |
-| `spawn_subtask` | recon | Delegate a focused plan of recon calls to a bounded sub-agent; findings merge up |
-| `ai_redteam` | **exploit** | OWASP LLM Top-10 battery against an in-scope chat endpoint (gated by approval) |
+| `replay_request` | **exploit** | Re-send a captured request with mutations + diff |
+| `spawn_subtask` | recon | Delegate recon-only steps to a bounded sub-agent |
+| `export_autofix` | recon | Write remediation prompt `.md` files for findings with locations |
+| `ai_redteam` | **exploit** | OWASP LLM Top-10 battery against an in-scope chat endpoint |
 
 ### Capture / replay
 

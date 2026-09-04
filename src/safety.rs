@@ -4,6 +4,10 @@
 //! throttling, and emergency aborts to prevent disruption to sensitive systems.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Safety policy applied across scanning and agent execution.
 #[derive(Debug, Clone)]
@@ -46,6 +50,24 @@ impl SafetyPolicy {
             latency_abort_threshold_ms: 30000,
             max_error_rate: 0.50,
         }
+    }
+
+    /// Build a policy from CLI flags. `--attack` wins over defaults; `--read-only-safe`
+    /// and `--max-rps` still apply on top when set.
+    pub fn from_flags(attack: bool, read_only_safe: bool, max_rps: Option<u32>) -> Self {
+        let mut policy = if attack {
+            Self::attack_mode_policy()
+        } else {
+            Self::default()
+        };
+        if read_only_safe {
+            policy.read_only_safe = true;
+            policy.attack_mode = false;
+        }
+        if let Some(rps) = max_rps {
+            policy.max_rps = rps;
+        }
+        policy
     }
 }
 
@@ -162,6 +184,104 @@ impl CircuitBreaker {
     }
 }
 
+/// Shared HTTP safety gate: policy checks, RPS throttle, circuit breaker.
+#[derive(Debug)]
+pub struct HttpSafetyGate {
+    pub policy: SafetyPolicy,
+    breaker: CircuitBreaker,
+    /// Timestamps of recent request starts (for RPS window).
+    recent: AsyncMutex<Vec<Instant>>,
+}
+
+impl HttpSafetyGate {
+    pub fn new(policy: SafetyPolicy) -> Self {
+        Self {
+            policy,
+            breaker: CircuitBreaker::new(),
+            recent: AsyncMutex::new(Vec::new()),
+        }
+    }
+
+    pub fn shared(policy: SafetyPolicy) -> Arc<Self> {
+        Arc::new(Self::new(policy))
+    }
+
+    pub fn is_tripped(&self) -> bool {
+        self.breaker.is_tripped()
+    }
+
+    /// Reject if circuit is open or the request violates policy; then wait for RPS.
+    pub async fn before_request(
+        &self,
+        method: &str,
+        body: Option<&str>,
+    ) -> Result<(), SafetyAbort> {
+        if self.breaker.is_tripped() {
+            return Err(SafetyAbort::CircuitOpen);
+        }
+        is_request_safe(method, body, &self.policy).map_err(SafetyAbort::Policy)?;
+        self.wait_for_rps().await;
+        Ok(())
+    }
+
+    /// Record metrics; returns `Err(CircuitOpen)` if the breaker just tripped.
+    pub fn after_response(&self, status: u16, latency_ms: u64) -> Result<(), SafetyAbort> {
+        if !self
+            .breaker
+            .record_response(status, latency_ms, &self.policy)
+            || self.breaker.is_tripped()
+        {
+            return Err(SafetyAbort::CircuitOpen);
+        }
+        Ok(())
+    }
+
+    async fn wait_for_rps(&self) {
+        let max = self.policy.max_rps;
+        if max == 0 {
+            return;
+        }
+        let window = Duration::from_secs(1);
+        loop {
+            let mut recent = self.recent.lock().await;
+            let now = Instant::now();
+            recent.retain(|t| now.duration_since(*t) < window);
+            if (recent.len() as u32) < max {
+                recent.push(now);
+                return;
+            }
+            let oldest = recent.first().copied().unwrap_or(now);
+            let sleep_for = window
+                .checked_sub(now.duration_since(oldest))
+                .unwrap_or(Duration::from_millis(5))
+                .max(Duration::from_millis(1));
+            drop(recent);
+            tokio::time::sleep(sleep_for).await;
+        }
+    }
+}
+
+/// Why an HTTP send was aborted by the safety gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyAbort {
+    Policy(&'static str),
+    CircuitOpen,
+}
+
+impl std::fmt::Display for SafetyAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SafetyAbort::Policy(msg) => write!(f, "{msg}"),
+            SafetyAbort::CircuitOpen => write!(
+                f,
+                "circuit breaker open — target unhealthy; aborting further HTTP"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SafetyAbort {}
+
 /// Verify whether an HTTP request complies with safe non-destructive policies.
 pub fn is_request_safe(
     method: &str,
@@ -243,5 +363,27 @@ mod tests {
         }
 
         assert!(cb.is_tripped());
+    }
+
+    #[test]
+    fn from_flags_attack_and_read_only() {
+        let p = SafetyPolicy::from_flags(true, false, Some(10));
+        assert!(p.attack_mode);
+        assert_eq!(p.max_rps, 10);
+
+        let ro = SafetyPolicy::from_flags(true, true, None);
+        assert!(ro.read_only_safe);
+        assert!(!ro.attack_mode);
+    }
+
+    #[tokio::test]
+    async fn gate_blocks_post_when_read_only() {
+        let gate = HttpSafetyGate::new(SafetyPolicy {
+            read_only_safe: true,
+            ..Default::default()
+        });
+        assert!(gate.before_request("GET", None).await.is_ok());
+        let err = gate.before_request("POST", Some("x")).await.unwrap_err();
+        assert!(matches!(err, SafetyAbort::Policy(_)));
     }
 }
