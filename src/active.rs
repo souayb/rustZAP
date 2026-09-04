@@ -161,7 +161,7 @@ impl ActiveScanner {
         for (url_idx, count) in remaining.iter().enumerate() {
             if *count == 0 {
                 pb.inc(1);
-                let preview = &urls[url_idx].url[..urls[url_idx].url.len().min(50)];
+                let preview = crate::types::safe_truncate(&urls[url_idx].url, 50);
                 pb.set_message(format!("Scanning {preview}"));
             }
         }
@@ -209,7 +209,7 @@ impl ActiveScanner {
                     rem[url_idx] = rem[url_idx].saturating_sub(1);
                     if rem[url_idx] == 0 {
                         pb.inc(1);
-                        let preview = &du.url[..du.url.len().min(50)];
+                        let preview = crate::types::safe_truncate(&du.url, 50);
                         pb.set_message(format!("Scanning {preview}"));
                     }
                     findings
@@ -314,7 +314,7 @@ pub async fn timed_get(client: &reqwest::Client, url: &str) -> (u64, bool) {
 
 async fn get_response_body(client: &reqwest::Client, url: &str) -> Option<(u16, String)> {
     if let Some(gate) = active_gate() {
-        if gate.before_request("GET", None).await.is_err() {
+        if gate.before_url_request("GET", url, None).await.is_err() {
             return None;
         }
     }
@@ -328,6 +328,94 @@ async fn get_response_body(client: &reqwest::Client, url: &str) -> Option<(u16, 
                 let _ = gate.after_response(status, latency);
             }
             Some((status, body))
+        }
+        Err(_) => None,
+    }
+}
+
+async fn post_response_body(
+    client: &reqwest::Client,
+    url: &str,
+    content_type: &str,
+    body: &str,
+) -> Option<(u16, String)> {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("POST", url, Some(body)).await.is_err() {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
+    match client
+        .post(url)
+        .header("Content-Type", content_type)
+        .body(body.to_string())
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+    {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body_text = r.text().await.unwrap_or_default();
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
+            Some((status, body_text))
+        }
+        Err(_) => None,
+    }
+}
+
+async fn get_no_redirect(client: &reqwest::Client, url: &str) -> Option<(u16, Option<String>)> {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("GET", url, None).await.is_err() {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
+    match client.get(url).timeout(Duration::from_secs(8)).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
+            Some((status, location))
+        }
+        Err(_) => None,
+    }
+}
+
+async fn options_response(client: &reqwest::Client, url: &str) -> Option<(u16, Option<String>)> {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("OPTIONS", url, None).await.is_err() {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
+    match client
+        .request(reqwest::Method::OPTIONS, url)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let allow = resp
+                .headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
+            Some((status, allow))
         }
         Err(_) => None,
     }
@@ -609,36 +697,24 @@ impl ScanPlugin for OpenRedirectPlugin {
         for payload in payloads {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
-                // Use no-redirect policy to catch the 3xx
-                if let Ok(resp) = client
-                    .get(&url)
-                    .timeout(Duration::from_secs(8))
-                    .send()
-                    .await
-                {
-                    let status = resp.status().as_u16();
-                    if (300..=399).contains(&status) {
-                        if let Some(loc) = resp.headers().get("location") {
-                            let loc_str = loc.to_str().unwrap_or("");
-                            if loc_str.contains("rustzap-canary") {
-                                findings.push(
-                                    Finding::new(
-                                        "Open Redirect",
-                                        Severity::Medium,
-                                        &target.url,
-                                        "The application redirects to a user-supplied URL without validation, enabling phishing attacks.",
-                                        "Validate redirect targets against an allowlist of permitted domains.",
-                                        "active/open-redirect",
-                                    )
-                                    .with_parameter(&param)
-                                    .with_evidence(format!("HTTP {} Location: {}", status, loc_str))
-                                    .with_cwe(601)
-                                    .with_owasp("A01:2021 – Broken Access Control")
-                                    .confirmed(),
-                                );
-                                return findings;
-                            }
-                        }
+                if let Some((status, Some(loc_str))) = get_no_redirect(client, &url).await {
+                    if (300..=399).contains(&status) && loc_str.contains("rustzap-canary") {
+                        findings.push(
+                            Finding::new(
+                                "Open Redirect",
+                                Severity::Medium,
+                                &target.url,
+                                "The application redirects to a user-supplied URL without validation, enabling phishing attacks.",
+                                "Validate redirect targets against an allowlist of permitted domains.",
+                                "active/open-redirect",
+                            )
+                            .with_parameter(&param)
+                            .with_evidence(format!("HTTP {} Location: {}", status, loc_str))
+                            .with_cwe(601)
+                            .with_owasp("A01:2021 – Broken Access Control")
+                            .confirmed(),
+                        );
+                        return findings;
                     }
                 }
             }
@@ -767,15 +843,7 @@ impl ScanPlugin for XxePlugin {
 <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
 <root><param>&xxe;</param></root>"#;
 
-        if let Ok(resp) = client
-            .post(&target.url)
-            .header("Content-Type", "application/xml")
-            .body(xxe_payload)
-            .timeout(Duration::from_secs(8))
-            .send()
-            .await
-        {
-            let body = resp.text().await.unwrap_or_default();
+        if let Some((_, body)) = post_response_body(client, &target.url, "application/xml", xxe_payload).await {
             if body.contains("root:x:0:0:") {
                 findings.push(
                     Finding::new(
@@ -999,54 +1067,41 @@ impl ScanPlugin for GraphqlIntrospectionPlugin {
         let mut findings = Vec::new();
 
         // Gate by path/content-type so we don't POST to arbitrary endpoints.
-        let probe_ct = match client
-            .get(&target.url)
-            .timeout(Duration::from_secs(6))
-            .send()
-            .await
-        {
-            Ok(r) => r
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string()),
-            Err(_) => None,
+        let probe_body = get_response_body(client, &target.url).await;
+        let probe_ct = if probe_body.is_some() {
+            Some("application/json")
+        } else {
+            None
         };
 
-        if !looks_like_graphql(&target.url, probe_ct.as_deref()) {
+        if !looks_like_graphql(&target.url, probe_ct) {
             return findings;
         }
 
-        let resp = match client
-            .post(&target.url)
-            .header("Content-Type", "application/json")
-            .body(GRAPHQL_INTROSPECTION_QUERY)
-            .timeout(Duration::from_secs(8))
-            .send()
-            .await
+        if let Some((status, body)) = post_response_body(
+            client,
+            &target.url,
+            "application/json",
+            GRAPHQL_INTROSPECTION_QUERY,
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(_) => return findings,
-        };
-
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-
-        if status == 200 && looks_like_introspection_response(&body) {
-            let snippet = body[..body.len().min(120)].to_string();
-            findings.push(
-                Finding::new(
-                    "GraphQL Introspection Enabled",
-                    Severity::Medium,
-                    &target.url,
-                    "The GraphQL endpoint answers introspection queries, exposing the full schema. Attackers can enumerate types, fields, and arguments.",
-                    "Disable introspection in production (e.g. set introspection: false in Apollo Server) or require authentication for the /graphql endpoint.",
-                    "active/graphql-introspection",
-                )
-                .with_evidence(snippet)
-                .with_cwe(200)
-                .with_owasp("A05:2021 – Security Misconfiguration"),
-            );
+            if status == 200 && looks_like_introspection_response(&body) {
+                let snippet = crate::types::safe_truncate(&body, 120).to_string();
+                findings.push(
+                    Finding::new(
+                        "GraphQL Introspection Enabled",
+                        Severity::Medium,
+                        &target.url,
+                        "The GraphQL endpoint answers introspection queries, exposing the full schema. Attackers can enumerate types, fields, and arguments.",
+                        "Disable introspection in production (e.g. set introspection: false in Apollo Server) or require authentication for the /graphql endpoint.",
+                        "active/graphql-introspection",
+                    )
+                    .with_evidence(snippet)
+                    .with_cwe(200)
+                    .with_owasp("A05:2021 – Security Misconfiguration"),
+                );
+            }
         }
 
         findings
@@ -1134,23 +1189,7 @@ impl ScanPlugin for HttpMethodsPlugin {
             }
         }
 
-        let resp = match client
-            .request(reqwest::Method::OPTIONS, &target.url)
-            .timeout(Duration::from_secs(6))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return findings,
-        };
-
-        let allow = resp
-            .headers()
-            .get("allow")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let Some(allow_value) = allow else {
+        let Some((_, Some(allow_value))) = options_response(client, &target.url).await else {
             return findings;
         };
 
@@ -1185,12 +1224,18 @@ impl ScanPlugin for HttpMethodsPlugin {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct RedirectChainPlugin {
+    insecure: bool,
     nofollow: std::sync::OnceLock<reqwest::Client>,
 }
 
 impl RedirectChainPlugin {
     pub fn new() -> Self {
+        Self::with_insecure(false)
+    }
+
+    pub fn with_insecure(insecure: bool) -> Self {
         Self {
+            insecure,
             nofollow: std::sync::OnceLock::new(),
         }
     }
@@ -1200,7 +1245,7 @@ impl RedirectChainPlugin {
             reqwest::Client::builder()
                 .timeout(Duration::from_secs(8))
                 .redirect(reqwest::redirect::Policy::none())
-                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_certs(self.insecure)
                 .user_agent("RustZAP/0.1 RedirectChain")
                 .build()
                 .expect("redirect-chain client")

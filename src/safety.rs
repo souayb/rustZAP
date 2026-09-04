@@ -224,6 +224,24 @@ impl HttpSafetyGate {
         Ok(())
     }
 
+    /// Reject if circuit is open or either URL/body violates policy; then wait for RPS.
+    pub async fn before_url_request(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&str>,
+    ) -> Result<(), SafetyAbort> {
+        if self.breaker.is_tripped() {
+            return Err(SafetyAbort::CircuitOpen);
+        }
+        is_request_safe(method, Some(url), &self.policy).map_err(SafetyAbort::Policy)?;
+        if let Some(b) = body {
+            is_request_safe(method, Some(b), &self.policy).map_err(SafetyAbort::Policy)?;
+        }
+        self.wait_for_rps().await;
+        Ok(())
+    }
+
     /// Record metrics; returns `Err(CircuitOpen)` if the breaker just tripped.
     pub fn after_response(&self, status: u16, latency_ms: u64) -> Result<(), SafetyAbort> {
         if !self
@@ -297,8 +315,8 @@ pub fn is_request_safe(
     }
 
     if !policy.attack_mode {
-        if let Some(body) = payload {
-            let body_upper = body.to_uppercase();
+        if let Some(text) = payload {
+            let text_upper = text.to_uppercase().replace('+', " ").replace("%20", " ");
             let destructive_patterns = [
                 "DROP TABLE",
                 "DROP DATABASE",
@@ -311,7 +329,7 @@ pub fn is_request_safe(
             ];
 
             for pattern in destructive_patterns {
-                if body_upper.contains(pattern) {
+                if text_upper.contains(pattern) {
                     return Err("Destructive command/SQL payload blocked by safety guardrail");
                 }
             }

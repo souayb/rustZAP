@@ -1,6 +1,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Truncate a string to at most `max_chars` characters safely on UTF-8 character boundaries.
+pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 /// Severity levels for findings
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -10,6 +18,21 @@ pub enum Severity {
     Medium,
     High,
     Critical,
+}
+
+impl std::str::FromStr for Severity {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "info" | "informational" => Ok(Severity::Info),
+            "low" => Ok(Severity::Low),
+            "medium" | "med" => Ok(Severity::Medium),
+            "high" => Ok(Severity::High),
+            "critical" | "crit" => Ok(Severity::Critical),
+            _ => Err("unknown severity: must be info, low, medium, high, or critical"),
+        }
+    }
 }
 
 /// How much trust to place in a finding. This is what stops the scanner from

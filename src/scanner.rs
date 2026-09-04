@@ -126,7 +126,7 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         config.target_url.clone(),
         config.max_depth,
         config.concurrency,
-    );
+    )?;
     let response_cache = crate::types::HttpResponseCache::new();
     let mut discovered = spider
         .crawl_with_cache(&spider_pb, Some(&response_cache))
@@ -242,7 +242,7 @@ fn merge_discovered(into: &mut Vec<DiscoveredUrl>, extra: Vec<DiscoveredUrl>) {
 }
 
 /// Entry point for a full scan
-pub async fn run_scan(config: ScanConfig) -> Result<()> {
+pub async fn run_scan(config: ScanConfig) -> Result<Report> {
     let start = Instant::now();
 
     println!(
@@ -311,7 +311,7 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(report)
 }
 
 /// TUI-friendly scan: identical phases to `run_scan`, but emits events through
@@ -347,7 +347,7 @@ pub async fn run_scan_with_events(
         config.target_url.clone(),
         config.max_depth,
         config.concurrency,
-    );
+    )?;
 
     // Tick task forwards spider progress as it crawls
     let tick_tx = tx.clone();

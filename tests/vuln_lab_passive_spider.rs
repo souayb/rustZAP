@@ -83,7 +83,7 @@ async fn passive_matrix_fires_expected_checks() {
 async fn spider_discovers_links_form_script_and_sitemap() {
     let base = serve_full(vulnerable_app).await;
     let client = Arc::new(reqwest::Client::new());
-    let spider = Spider::new(client, base.clone(), 2, 4);
+    let spider = Spider::new(client, base.clone(), 2, 4).unwrap();
     let discovered = spider.crawl(&ProgressBar::hidden()).await.unwrap();
 
     // The POST login form with its named inputs.

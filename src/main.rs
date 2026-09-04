@@ -91,6 +91,9 @@ enum Commands {
         /// Cap outbound HTTP requests per second (0 = unlimited). Default 50.
         #[arg(long)]
         max_rps: Option<u32>,
+        /// Exit with non-zero status code if findings at or above this severity are detected (info, low, medium, high, critical)
+        #[arg(long, value_name = "SEVERITY")]
+        fail_on: Option<String>,
     },
 
     /// Run spider only
@@ -613,6 +616,7 @@ async fn main() -> anyhow::Result<()> {
             attack,
             read_only_safe,
             max_rps,
+            fail_on,
         } => {
             if attack && !read_only_safe {
                 safety::print_attack_mode_warning(&target);
@@ -641,7 +645,28 @@ async fn main() -> anyhow::Result<()> {
                 passive_all_methods,
                 safety: safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
             };
-            scanner::run_scan(config).await?;
+            let report = scanner::run_scan(config).await?;
+
+            if let Some(ref fail_severity) = fail_on {
+                if let Ok(threshold) = fail_severity.parse::<rustzap::types::Severity>() {
+                    let matching = report
+                        .findings
+                        .iter()
+                        .filter(|f| f.severity >= threshold)
+                        .count();
+                    if matching > 0 {
+                        eprintln!(
+                            "\n{} CI/CD Gate Failed: Detected {} finding(s) with severity >= {:?}",
+                            "❌".bright_red(),
+                            matching,
+                            threshold
+                        );
+                        std::process::exit(1);
+                    }
+                } else {
+                    eprintln!("Warning: unknown --fail-on severity value '{fail_severity}'");
+                }
+            }
         }
 
         Commands::Spider {

@@ -49,7 +49,7 @@ impl PassiveScanner {
 
         for du in urls {
             pb.inc(1);
-            pb.set_message(format!("Checking {}", &du.url[..du.url.len().min(50)]));
+            pb.set_message(format!("Checking {}", crate::types::safe_truncate(&du.url, 50)));
 
             // Only check GET URLs for passive scanning, unless all methods opted in.
             if !self.all_methods && du.method != "GET" {
@@ -386,7 +386,12 @@ fn check_information_disclosure(
     // Stack traces / error messages in body
     let stack_indicators = [
         (
-            "at ",
+            "\tat ",
+            "Stack trace detected",
+            "Java/Node.js stack trace may leak internal paths",
+        ),
+        (
+            "    at ",
             "Stack trace detected",
             "Java/Node.js stack trace may leak internal paths",
         ),
@@ -413,9 +418,8 @@ fn check_information_disclosure(
     ];
 
     for (pattern, title, desc) in &stack_indicators {
-        if body.contains(pattern) {
-            let idx = body.find(pattern).unwrap_or(0);
-            let snippet = &body[idx..body.len().min(idx + 200)];
+        if let Some(idx) = body.find(pattern) {
+            let snippet = crate::types::safe_truncate(&body[idx..], 200);
             findings.push(
                 Finding::new(
                     *title,

@@ -31,17 +31,18 @@ impl Spider {
         base_url: String,
         max_depth: usize,
         concurrency: usize,
-    ) -> Self {
-        let parsed = Url::parse(&base_url).expect("Invalid base URL");
+    ) -> anyhow::Result<Self> {
+        let parsed = Url::parse(&base_url)
+            .map_err(|e| anyhow::anyhow!("Invalid target URL {:?}: {}", base_url, e))?;
         let base_host = parsed.host_str().unwrap_or("").to_string();
 
-        Spider {
+        Ok(Spider {
             client,
             base_url,
             base_host,
             max_depth,
             concurrency,
-        }
+        })
     }
 
     /// Crawl the target and return all discovered URLs
@@ -130,7 +131,7 @@ impl Spider {
                 pb.set_message(format!(
                     "depth={} {}",
                     depth,
-                    &du.url[..du.url.len().min(60)]
+                    crate::types::safe_truncate(&du.url, 60)
                 ));
                 if let Some((status, headers, body, extracted)) = maybe_data {
                     if let Some(c) = cache {
@@ -529,7 +530,7 @@ pub async fn run_spider_cli(target: &str, depth: usize, output: Option<String>) 
     pb.set_prefix("SPIDER");
     pb.enable_steady_tick(Duration::from_millis(100));
 
-    let spider = Spider::new(client, target.to_string(), depth, 10);
+    let spider = Spider::new(client, target.to_string(), depth, 10)?;
     let results = spider.crawl(&pb).await?;
     pb.finish_with_message(format!("✓ {} URLs", results.len()));
 

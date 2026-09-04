@@ -888,12 +888,6 @@ dependencies = [
 
 [[package]]
 name = "futures"
-version = "0.1.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a471a38ef8ed83cd6e40aa59c1ffe17db6855c18e3604d9c4ed8c08ebc28678"
-
-[[package]]
-name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
@@ -1523,7 +1517,7 @@ checksum = "166199a8207874a275144c8a94ff6eed5fcbf5c52303e4d9b4d53a0c7ac76554"
 dependencies = [
  "async-trait",
  "bytes",
- "futures 0.3.32",
+ "futures",
  "futures-util",
  "lazy_static",
  "lber",
@@ -2441,7 +2435,7 @@ dependencies = [
  "clap",
  "colored",
  "crossterm",
- "futures 0.3.32",
+ "futures",
  "hex",
  "hickory-resolver",
  "hyper",
@@ -2460,7 +2454,6 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
- "tokio-channel",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
@@ -3085,15 +3078,6 @@ dependencies = [
  "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-channel"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "530d0fb87416dd531600f7cccc438bb35c5b91883065c9e6dca7cdecee991cfa"
-dependencies = [
- "futures 0.1.31",
 ]
 
 [[package]]
