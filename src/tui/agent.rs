@@ -297,6 +297,8 @@ pub fn spawn_agent(
             trace_path: AGENT_TRACE_PATH.to_string(),
             non_interactive: true,
             auto_approve,
+            safety: crate::safety::SafetyPolicy::default(),
+            autofix_dir: None,
         };
 
         match run_agent(cfg, brain).await {

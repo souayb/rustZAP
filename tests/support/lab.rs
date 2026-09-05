@@ -254,21 +254,15 @@ pub fn pct_decode(s: &str) -> String {
 // ── DiscoveredUrl builders ──────────────────────────────────────────────────
 
 pub fn du_get(url: &str, params: &[&str]) -> DiscoveredUrl {
-    DiscoveredUrl {
-        url: url.to_string(),
-        method: "GET".to_string(),
-        parameters: params.iter().map(|s| s.to_string()).collect(),
-        source: UrlSource::Link,
-    }
+    let mut du = DiscoveredUrl::new(url, "GET", UrlSource::Link);
+    du.parameters = params.iter().map(|s| s.to_string()).collect();
+    du
 }
 
 pub fn du_post(url: &str, params: &[&str]) -> DiscoveredUrl {
-    DiscoveredUrl {
-        url: url.to_string(),
-        method: "POST".to_string(),
-        parameters: params.iter().map(|s| s.to_string()).collect(),
-        source: UrlSource::Form,
-    }
+    let mut du = DiscoveredUrl::new(url, "POST", UrlSource::Form);
+    du.parameters = params.iter().map(|s| s.to_string()).collect();
+    du
 }
 
 /// A reqwest client with redirects disabled (open-redirect / redirect-chain).

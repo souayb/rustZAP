@@ -54,6 +54,8 @@ pub struct ScanConfig {
     pub active_all_paths: bool,
     /// Opt-in: run passive checks on non-GET discovered requests too.
     pub passive_all_methods: bool,
+    /// Do-no-harm / attack-mode / RPS policy for active HTTP.
+    pub safety: crate::safety::SafetyPolicy,
 }
 
 /// Shared HTTP client factory
@@ -124,8 +126,11 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         config.target_url.clone(),
         config.max_depth,
         config.concurrency,
-    );
-    let mut discovered = spider.crawl(&spider_pb).await?;
+    )?;
+    let response_cache = crate::types::HttpResponseCache::new();
+    let mut discovered = spider
+        .crawl_with_cache(&spider_pb, Some(&response_cache))
+        .await?;
     spider_pb.finish();
 
     // Phase 3: OpenAPI / HAR surface expansion (merged into discovered set).
@@ -152,7 +157,9 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         ProgressBar::with_draw_target(Some(discovered.len() as u64), ProgressDrawTarget::hidden());
     let passive_scanner =
         PassiveScanner::new(client.clone()).with_all_methods(config.passive_all_methods);
-    let passive_findings = passive_scanner.scan_all(&discovered, &passive_pb).await?;
+    let passive_findings = passive_scanner
+        .scan_all_with_cache(&discovered, &passive_pb, Some(&response_cache))
+        .await?;
     passive_pb.finish();
     {
         let mut f = findings.lock().await;
@@ -170,6 +177,7 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
             config.plugins.clone(),
             config.concurrency,
             config.active_all_paths,
+            config.safety.clone(),
         );
         active_module_names = active_scanner.enabled_module_names();
         let af = active_scanner.scan_all(&discovered, &active_pb).await?;
@@ -234,7 +242,7 @@ fn merge_discovered(into: &mut Vec<DiscoveredUrl>, extra: Vec<DiscoveredUrl>) {
 }
 
 /// Entry point for a full scan
-pub async fn run_scan(config: ScanConfig) -> Result<()> {
+pub async fn run_scan(config: ScanConfig) -> Result<Report> {
     let start = Instant::now();
 
     println!(
@@ -303,7 +311,7 @@ pub async fn run_scan(config: ScanConfig) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(report)
 }
 
 /// TUI-friendly scan: identical phases to `run_scan`, but emits events through
@@ -339,7 +347,7 @@ pub async fn run_scan_with_events(
         config.target_url.clone(),
         config.max_depth,
         config.concurrency,
-    );
+    )?;
 
     // Tick task forwards spider progress as it crawls
     let tick_tx = tx.clone();
@@ -485,6 +493,7 @@ pub async fn run_scan_with_events(
             config.plugins.clone(),
             config.concurrency,
             config.active_all_paths,
+            config.safety.clone(),
         );
         active_module_names = active_scanner.enabled_module_names();
         let active_findings = active_scanner.scan_all(&discovered, &active_pb).await?;
@@ -782,12 +791,7 @@ mod tests {
     use crate::types::UrlSource;
 
     fn du(url: &str) -> DiscoveredUrl {
-        DiscoveredUrl {
-            url: url.into(),
-            method: "GET".into(),
-            parameters: vec![],
-            source: UrlSource::Seed,
-        }
+        DiscoveredUrl::new(url, "GET", UrlSource::Seed)
     }
 
     #[test]

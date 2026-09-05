@@ -184,16 +184,16 @@ impl Report {
             String::from("ID,Title,Severity,Confidence,Validated,URL,Parameter,CWE,Plugin\n");
         for f in &self.findings {
             let row = format!(
-                "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"\n",
-                f.id,
-                f.title.replace('"', "\"\""),
+                "{},{},\"{}\",\"{}\",\"{}\",{},{},\"{}\",{}\n",
+                csv_cell(&f.id),
+                csv_cell(&f.title),
                 f.severity,
                 f.confidence,
                 f.poc_validated,
-                f.url.replace('"', "\"\""),
-                f.parameter.as_deref().unwrap_or(""),
+                csv_cell(&f.url),
+                csv_cell(f.parameter.as_deref().unwrap_or("")),
                 f.cwe.unwrap_or(0),
-                f.plugin
+                csv_cell(&f.plugin),
             );
             csv.push_str(&row);
         }
@@ -202,10 +202,12 @@ impl Report {
     }
 
     pub async fn save_html(&self, path: &str) -> Result<()> {
-        let mut html = String::from("<html><head><title>RustZAP Report</title><style>body { font-family: sans-serif; } table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #ddd; padding: 8px; }</style></head><body>");
+        let mut html = String::from(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline';\"><title>RustZAP Report</title><style>body { font-family: sans-serif; } table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #ddd; padding: 8px; }</style></head><body>"
+        );
         html.push_str(&format!(
             "<h1>RustZAP Scan Report: {}</h1>",
-            self.meta.target
+            html_escape(&self.meta.target)
         ));
         html.push_str(&format!(
             "<p>Total Findings: {} | Risk Score: {}</p>",
@@ -229,12 +231,12 @@ impl Report {
             html.push_str(&format!(
                 "<tr><td style='color: {}'><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 color,
-                f.severity,
-                confidence,
-                f.title,
-                f.url,
-                f.parameter.as_deref().unwrap_or("-"),
-                f.description
+                html_escape(&f.severity.to_string()),
+                html_escape(&confidence),
+                html_escape(&f.title),
+                html_escape(&f.url),
+                html_escape(f.parameter.as_deref().unwrap_or("-")),
+                html_escape(&f.description)
             ));
         }
         html.push_str("</table></body></html>");
@@ -242,6 +244,38 @@ impl Report {
         tokio::fs::write(path, html).await?;
         Ok(())
     }
+}
+
+/// Escape text for safe embedding in HTML documents.
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Sanitize and format a CSV cell value, preventing formula injection (DDE).
+pub fn csv_cell(s: &str) -> String {
+    let mut text = s.replace('"', "\"\"");
+    // Neutralize formula characters if present at the start
+    if text.starts_with('=')
+        || text.starts_with('+')
+        || text.starts_with('-')
+        || text.starts_with('@')
+        || text.starts_with('\t')
+        || text.starts_with('\r')
+    {
+        text.insert(0, '\'');
+    }
+    format!("\"{text}\"")
 }
 
 #[cfg(test)]
@@ -269,6 +303,8 @@ mod tests {
             solution: "s".to_string(),
             cwe: None,
             owasp_category: None,
+            nist_control: None,
+            disa_stig_id: None,
             plugin: "sast/semgrep".to_string(),
             source_tool: Some("semgrep".to_string()),
             location: Some(CodeLocation {
@@ -278,6 +314,7 @@ mod tests {
             }),
             correlated_with: vec![],
             poc_validated: false,
+            poc: None,
             confidence: crate::types::Confidence::Firm,
             found_at: chrono::Utc::now(),
         };
@@ -399,5 +436,27 @@ mod tests {
         assert!(json.contains("/login"));
         let decoded: Report = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(decoded.static_analysis.unwrap().risk_score, 12);
+    }
+
+    #[test]
+    fn html_escape_neutralizes_script_and_markup() {
+        let raw = "<script>alert('xss')</script>&\"test\"";
+        let escaped = html_escape(raw);
+        assert_eq!(
+            escaped,
+            "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;&amp;&quot;test&quot;"
+        );
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+    }
+
+    #[test]
+    fn csv_cell_neutralizes_formula_injection() {
+        assert_eq!(csv_cell("=1+1"), "\"'=1+1\"");
+        assert_eq!(csv_cell("+cmd|' /C calc'!A0"), "\"'+cmd|' /C calc'!A0\"");
+        assert_eq!(csv_cell("-5"), "\"'-5\"");
+        assert_eq!(csv_cell("@SUM(A1:A10)"), "\"'@SUM(A1:A10)\"");
+        assert_eq!(csv_cell("normal text"), "\"normal text\"");
+        assert_eq!(csv_cell("quote \"test\""), "\"quote \"\"test\"\"\"");
     }
 }

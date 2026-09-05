@@ -477,36 +477,70 @@ rustzap serve --listen 127.0.0.1:8090 [--auth-token ENV]
 
 ---
 
-## Phase 5 — Agentic security
+## Phase 5 — Agentic security ✅ (core + Strix-inspired hardening)
 
 ### 5.1 Principles
 
 - **Opt-in**: `rustzap agent ...` never implied by bare `rustzap`.
 - **Scope file**: YAML/JSON listing allowed schemes, hosts, max requests/min, forbidden paths regex.
-- **Approval gates**: `--require-approval-for exploit|rce|exfil`.
+- **Approval gates**: autonomy matrix + Exploit-class tools (`run_plugin`, `scan_target`, `replay_request`, mutating `http_probe`, `ai_redteam`).
+- **Explore-first**: Exploit tools denied until a successful recon tool (or non-empty frontier), unless `--ai-redteam` / `auto_approve`.
+- **Safety**: `--read-only-safe`, `--max-rps`, `--attack` wire into `SafetyPolicy` / `HttpSafetyGate` on agent HTTP.
 - **Trace**: append-only `agent-trace.jsonl` with tool calls + redacted headers.
 
-Reference UX: non-interactive CI flag (`-n`) pattern from **Strix** docs; multi-agent decomposition from **PentAGI**.
+Reference UX: non-interactive CI flag (`-n`) pattern from **Strix** docs.
 
-### 5.2 `AgentTool` registry (**Planned**)
+### 5.2 `AgentTool` registry (**Shipped**)
 
-Wrap without duplicating scanner logic:
+Wrap without duplicating scanner logic: `scan_target`, `analyze_repo`, `run_plugin`, `http_probe`, `list_captures`, `replay_request`, `ai_redteam`, `spawn_subtask`, `export_autofix`.
 
-- `SpiderCrawl`
-- `RunPlugin { plugin, url_hint }`
-- `HttpProbe { req }` — bounded
-- Future: `RunSemgrepPath`
+Planner: `AgentBrain` with `LlmBrain` and `ScriptedBrain`.
 
-Planner: pluggable trait `AgentBrain` with two impls: `LlmBrain` (HTTP to OpenAI-compatible API) and `ScriptedBrain` (tests).
+### 5.3 AI red team module (**Shipped**)
 
-### 5.3 AI red team module (**Planned**)
+`--ai-redteam` runs OWASP LLM Top-10 probes; confirmed hits attach curl `PocProof`.
 
-When crawl detects LLM-like routes (`/v1/chat/completions`, etc.), optional subtree `agentic/*` plugins (see OWASP LLM Top 10 / Agentic Top 10) — **behind `--agent-ai-redteam`** flag.
+### 5.4 Autofix export (**Shipped MVP**)
 
-### 5.4 Phase 5 acceptance checklist
+`rustzap autofix --report report.json --out patches/` and agent tool `export_autofix` write remediation prompt `.md` files for findings with `location` (no in-process LLM patch apply).
 
-- [ ] Agent cannot run without scope file (--scope required).
-- [ ] README “Ethics” section mentions LLM misuse and MCP risks (Crucible-style).
+### 5.5 Phase 5 acceptance checklist
+
+- [x] Agent cannot run without scope file (--scope required).
+- [x] README “Ethics” section mentions LLM misuse and MCP risks.
+- [x] SafetyPolicy wired to scan + agent HTTP; curl PoC on key confirmed findings.
+- [x] Explore-first + Exploit reclassification.
+- [ ] Docker sandbox / multi-agent Graph (explicitly out of scope — see FEATURE G5).
+
+---
+
+## Phase 7 — Active Directory / NTLM-relay detection ✅ (Tier A)
+
+Adds a new assessment domain (Windows/AD identity) alongside Web (DAST) and
+Code/IaC (SAST). New `src/ad/` module + `rustzap ad` subcommand.
+
+- **Tier A (shipped):** native LDAP/LDAPS signing posture (`ad/ldap-signing`,
+  `ad/ldap-channel-binding`), Ghost-SPN detection (`ad/ghost-spn`, LDAP SPN query +
+  DNS), NTLM negotiate-flag inspection (`ad/ntlmv1`, `ad/ntlm-signing`, over HTTP/
+  WinRM), and LDAP domain-computer enumeration (`ad/computer`, `--audit`).
+- Network I/O sits behind `LdapDirectory` / `NtlmProbe` / `DnsResolver` traits
+  (`src/ad/probe.rs`) with `ldap3`/`hickory-resolver`/`reqwest` live impls and
+  in-memory mocks, so verdict logic unit-tests with **no live DC**.
+- Findings flow through the existing `Finding` model, `write_report` (`modules`,
+  SARIF/CSV/HTML), and a new `correlate_ad_relay_paths` rule that consolidates
+  per-host weaknesses into one elevated **"NTLM relay exposure on <host>"** finding.
+- **Safety:** detection only (no relay-target list, no coercion), explicit
+  `rustzap ad` subcommand, authorization consent (TTY or `--yes`), bind password
+  via `--password-env` (never argv). VS Code: `RustZAP: Scan Active Directory`
+  command + Attack-paths tree section; credentials prompted, passed via env.
+- **Tier B/C (planned):** native SMB2 signing probe; MS-RPC coercion
+  (PetitPotam/PrinterBug/DFSCoerce), MSSQL/WinRM EPA, CVE-2025-33073 /
+  CVE-2025-54918 / CVE-2019-1040; optional RelayKing shell-out cross-check.
+
+**Acceptance:**
+- [x] `rustzap ad` gated by consent (TTY prompt / `--yes`); refuses non-TTY without `--yes`.
+- [x] AD findings produce `ad/*` module rows and a relay-path correlation in JSON/SARIF.
+- [x] Validated against a real Samba AD DC (`tests/ad-lab/`): live LDAP bind, SPN + computer enumeration, DNS-based ghost-SPN, and `ad/ldap-signing` posture all fire; the run also surfaced and fixed a ghost-SPN false-positive class (Kerberos/GUID/short-name SPNs).
 
 ---
 

@@ -106,8 +106,44 @@ pub fn redact(v: &Value) -> Value {
             Value::Object(out)
         }
         Value::Array(arr) => Value::Array(arr.iter().map(redact).collect()),
+        Value::String(s) => Value::String(redact_string(s)),
         other => other.clone(),
     }
+}
+
+/// Redact embedded secrets (Bearer tokens, passwords, api keys) within arbitrary text.
+pub fn redact_string(s: &str) -> String {
+    let mut result = s.to_string();
+    let patterns = [
+        "bearer ",
+        "password=",
+        "api_key=",
+        "apikey=",
+        "token=",
+        "secret=",
+    ];
+    for p in patterns {
+        let mut start_idx = 0;
+        while let Some(pos) = result[start_idx..].to_lowercase().find(p) {
+            let actual_pos = start_idx + pos + p.len();
+            let end_pos = result[actual_pos..]
+                .find(|c: char| {
+                    c.is_whitespace() || c == '&' || c == '"' || c == '\'' || c == ',' || c == ';'
+                })
+                .map(|e| actual_pos + e)
+                .unwrap_or(result.len());
+            if end_pos > actual_pos {
+                result.replace_range(actual_pos..end_pos, "[REDACTED]");
+                start_idx = actual_pos + "[REDACTED]".len();
+            } else {
+                start_idx = actual_pos;
+            }
+            if start_idx >= result.len() {
+                break;
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -141,5 +177,17 @@ mod tests {
         assert!(lines[0].contains("tool_call"));
         assert!(lines[1].contains("finish"));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn redacts_embedded_secrets_in_strings() {
+        assert_eq!(
+            redact_string("GET /login?password=mysecretpassword123&user=admin"),
+            "GET /login?password=[REDACTED]&user=admin"
+        );
+        assert_eq!(
+            redact_string("Header: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.xyz token"),
+            "Header: Bearer [REDACTED] token"
+        );
     }
 }

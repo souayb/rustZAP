@@ -1,9 +1,11 @@
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use colored::*;
 use rustzap::scanner::ScanConfig;
 use rustzap::stress::StressCliArgs;
 use rustzap::{
-    active, agent, analyze, installer, mcp, passive, proxy, scanner, spider, stress, tui,
+    active, ad, agent, analyze, installer, mcp, passive, proxy, replay, safety, scanner, spider,
+    stress, tui,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -37,6 +39,9 @@ enum Commands {
         passive_only: bool,
         #[arg(short, long, default_value = "rustzap-report.json")]
         output: String,
+        /// Enable aggressive Attack Mode for dedicated lab/dev testing (intrusive mutations)
+        #[arg(long, visible_alias = "attack-mode")]
+        attack: bool,
         /// Additional SARIF 2.1 file (GitHub Code Scanning). `--output foo.sarif` also works.
         #[arg(long)]
         sarif_out: Option<String>,
@@ -80,6 +85,15 @@ enum Commands {
         /// Opt-in: run passive checks on non-GET discovered requests too
         #[arg(long)]
         passive_all_methods: bool,
+        /// Block mutating HTTP verbs (POST/PUT/DELETE/PATCH) during active scan
+        #[arg(long)]
+        read_only_safe: bool,
+        /// Cap outbound HTTP requests per second (0 = unlimited). Default 50.
+        #[arg(long)]
+        max_rps: Option<u32>,
+        /// Exit with non-zero status code if findings at or above this severity are detected (info, low, medium, high, critical)
+        #[arg(long, value_name = "SEVERITY")]
+        fail_on: Option<String>,
     },
 
     /// Run spider only
@@ -247,6 +261,82 @@ enum Commands {
         /// Opt-in: run passive checks on non-GET discovered requests too
         #[arg(long)]
         passive_all_methods: bool,
+
+        /// Enable aggressive Attack Mode for dedicated lab/dev testing (intrusive mutations)
+        #[arg(long, visible_alias = "attack-mode")]
+        attack: bool,
+
+        /// Block mutating HTTP verbs during DAST portion of audit
+        #[arg(long)]
+        read_only_safe: bool,
+
+        /// Cap outbound HTTP requests per second (0 = unlimited)
+        #[arg(long)]
+        max_rps: Option<u32>,
+    },
+
+    /// Detect Active Directory / NTLM-relay attack vectors (LDAP + SPN + NTLM).
+    ///
+    /// Detection only: enumerates the directory and reads relay posture; it never
+    /// generates a relay-target list or triggers coercion. Intrusive — requires
+    /// authorization consent (TTY prompt, or --yes in CI). Only scan AD you own or
+    /// are explicitly authorized to test.
+    Ad {
+        /// AD domain FQDN, e.g. corp.local
+        #[arg(long)]
+        domain: String,
+
+        /// Domain controller IP (used for LDAP bind + domain DNS)
+        #[arg(long)]
+        dc_ip: String,
+
+        /// Explicit target host(s); repeat for several. Defaults to the DC.
+        #[arg(short = 't', long = "target")]
+        targets: Vec<String>,
+
+        /// File of target hosts, one per line
+        #[arg(short = 'f', long)]
+        targets_file: Option<String>,
+
+        /// Username for an authenticated bind (UPN built as user@domain)
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+
+        /// Env var holding the bind password (never pass the password on argv)
+        #[arg(long, default_value = "RZ_AD_PASS")]
+        password_env: String,
+
+        /// Unauthenticated (anonymous) bind
+        #[arg(long)]
+        null_auth: bool,
+
+        /// Use Kerberos authentication (reserved; not yet wired for Tier A)
+        #[arg(short = 'k', long)]
+        kerberos: bool,
+
+        /// Enumerate domain computers from AD and scan each (needs creds)
+        #[arg(long)]
+        audit: bool,
+
+        /// Which check families to run: all, or a comma list of ldap,spn,ntlm
+        #[arg(long, default_value = "all")]
+        checks: String,
+
+        /// Skip TLS verification for LDAPS / WinRM probes
+        #[arg(long)]
+        insecure: bool,
+
+        /// Output report path (.json/.sarif/.csv/.html by extension)
+        #[arg(short, long, default_value = "ad-report.json")]
+        output: String,
+
+        /// Also write a SARIF report to this path
+        #[arg(long)]
+        sarif_out: Option<String>,
+
+        /// Confirm authorization non-interactively (CI)
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Stress test / load test an API endpoint
@@ -418,6 +508,28 @@ enum Commands {
         sarif_out: Option<String>,
         #[arg(long, default_value = "agent-trace.jsonl")]
         trace: String,
+        /// Enable aggressive Attack Mode for dedicated lab/dev testing
+        #[arg(long, visible_alias = "attack-mode")]
+        attack: bool,
+        /// Block mutating HTTP verbs (POST/PUT/DELETE/PATCH) in agent probes
+        #[arg(long)]
+        read_only_safe: bool,
+        /// Cap outbound HTTP requests per second (0 = unlimited). Default 50.
+        #[arg(long)]
+        max_rps: Option<u32>,
+        /// Directory for autofix prompt/patch exports (optional)
+        #[arg(long)]
+        autofix_dir: Option<String>,
+    },
+
+    /// Export autofix prompts from a JSON report (findings with file locations)
+    Autofix {
+        /// Path to a rustzap JSON report
+        #[arg(long)]
+        report: String,
+        /// Output directory for `{finding-id}.md` prompt files
+        #[arg(short, long, default_value = "patches")]
+        out: String,
     },
 
     /// Run as an MCP server on stdio, exposing RustZAP's tools to external
@@ -428,6 +540,25 @@ enum Commands {
         scope: Option<String>,
         #[arg(long, default_value = "agent-trace.jsonl")]
         trace: String,
+    },
+
+    /// Replay an HTTP transaction capture file for CI/CD regression verification
+    Replay {
+        /// Path to captured transactions JSON file
+        #[arg(value_name = "CAPTURE_FILE")]
+        file: String,
+
+        /// Override target host (e.g. http://localhost:8080)
+        #[arg(short, long)]
+        target: Option<String>,
+
+        /// Request timeout in seconds
+        #[arg(long, default_value = "10")]
+        timeout: u64,
+
+        /// Verbose diff output
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -482,7 +613,14 @@ async fn main() -> anyhow::Result<()> {
             nuclei_jsonl,
             active_all_paths,
             passive_all_methods,
+            attack,
+            read_only_safe,
+            max_rps,
+            fail_on,
         } => {
+            if attack && !read_only_safe {
+                safety::print_attack_mode_warning(&target);
+            }
             let config = ScanConfig {
                 target_url: target,
                 max_depth: depth,
@@ -505,8 +643,30 @@ async fn main() -> anyhow::Result<()> {
                 nuclei_jsonl,
                 active_all_paths,
                 passive_all_methods,
+                safety: safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
             };
-            scanner::run_scan(config).await?;
+            let report = scanner::run_scan(config).await?;
+
+            if let Some(ref fail_severity) = fail_on {
+                if let Ok(threshold) = fail_severity.parse::<rustzap::types::Severity>() {
+                    let matching = report
+                        .findings
+                        .iter()
+                        .filter(|f| f.severity >= threshold)
+                        .count();
+                    if matching > 0 {
+                        eprintln!(
+                            "\n{} CI/CD Gate Failed: Detected {} finding(s) with severity >= {:?}",
+                            "❌".bright_red(),
+                            matching,
+                            threshold
+                        );
+                        std::process::exit(1);
+                    }
+                } else {
+                    eprintln!("Warning: unknown --fail-on severity value '{fail_severity}'");
+                }
+            }
         }
 
         Commands::Spider {
@@ -592,7 +752,15 @@ async fn main() -> anyhow::Result<()> {
             follow_symlinks,
             active_all_paths,
             passive_all_methods,
+            attack,
+            read_only_safe,
+            max_rps,
         } => {
+            if attack && !read_only_safe {
+                if let Some(ref t) = target {
+                    safety::print_attack_mode_warning(t);
+                }
+            }
             let tools_explicit = tools.is_some();
             let tools = tools.unwrap_or_else(|| analyze::DEFAULT_AUDIT_TOOLS.to_string());
             let repo = analyze::resolve_repo_path(path, repo, yes)?;
@@ -619,6 +787,7 @@ async fn main() -> anyhow::Result<()> {
                 follow_symlinks,
                 active_all_paths,
                 passive_all_methods,
+                safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
             )
             .await?;
         }
@@ -642,7 +811,15 @@ async fn main() -> anyhow::Result<()> {
             output,
             sarif_out,
             trace,
+            attack,
+            read_only_safe,
+            max_rps,
+            autofix_dir,
         } => {
+            if attack && !read_only_safe {
+                let target_str = target.as_deref().unwrap_or("configured target");
+                safety::print_attack_mode_warning(target_str);
+            }
             if let Some(path) = init_scope {
                 let p = std::path::Path::new(&path);
                 agent::scope::write_template(p)?;
@@ -673,8 +850,15 @@ async fn main() -> anyhow::Result<()> {
                 llm,
                 ai_redteam,
                 ai_redteam_marker,
+                safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
+                autofix_dir,
             )
             .await?;
+        }
+
+        Commands::Autofix { report, out } => {
+            agent::autofix::export_from_report(&report, &out)?;
+            println!("Wrote autofix prompts → {out}");
         }
 
         Commands::Mcp { scope, trace } => {
@@ -692,6 +876,62 @@ async fn main() -> anyhow::Result<()> {
             yes,
         } => {
             installer::run(dry_run, tool, yes, list).await?;
+        }
+
+        Commands::Ad {
+            domain,
+            dc_ip,
+            targets,
+            targets_file,
+            username,
+            password_env,
+            null_auth,
+            kerberos,
+            audit,
+            checks,
+            insecure,
+            output,
+            sarif_out,
+            yes,
+        } => {
+            let mut targets = targets;
+            if let Some(file) = targets_file {
+                let contents = std::fs::read_to_string(&file)
+                    .with_context(|| format!("read targets file {file}"))?;
+                targets.extend(
+                    contents
+                        .lines()
+                        .map(|l| l.trim())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(|l| l.to_string()),
+                );
+            }
+            let password = if null_auth {
+                None
+            } else {
+                std::env::var(&password_env).ok().filter(|v| !v.is_empty())
+            };
+            if username.is_some() && !null_auth && password.is_none() {
+                anyhow::bail!(
+                    "No password found in ${password_env}. Set it (e.g. `export {password_env}=...`) or use --null-auth."
+                );
+            }
+            let config = ad::AdConfig {
+                domain,
+                dc_ip,
+                targets,
+                username,
+                password,
+                null_auth,
+                kerberos,
+                audit,
+                checks: ad::AdChecks::parse(&checks),
+                insecure,
+                output,
+                sarif_out,
+                assume_yes: yes,
+            };
+            ad::run_ad_cli(config).await?;
         }
 
         Commands::Stress {
@@ -737,6 +977,22 @@ async fn main() -> anyhow::Result<()> {
                 requests,
             };
             stress::run_stress_cli(args).await?;
+        }
+        Commands::Replay {
+            file,
+            target,
+            timeout,
+            verbose,
+        } => {
+            let config = replay::ReplayConfig {
+                target_override: target,
+                timeout_secs: timeout,
+                verbose,
+            };
+            let summary = replay::run_replay_file(std::path::Path::new(&file), &config).await?;
+            if summary.failed > 0 || summary.status_diverged > 0 {
+                std::process::exit(1);
+            }
         }
     }
 
