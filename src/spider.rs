@@ -6,7 +6,6 @@ use anyhow::Result;
 use colored::*;
 use indicatif::ProgressBar;
 use scraper::{Html, Selector};
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 use url::Url;
 
@@ -32,143 +31,128 @@ impl Spider {
         base_url: String,
         max_depth: usize,
         concurrency: usize,
-    ) -> Self {
-        let parsed = Url::parse(&base_url).expect("Invalid base URL");
+    ) -> anyhow::Result<Self> {
+        let parsed = Url::parse(&base_url)
+            .map_err(|e| anyhow::anyhow!("Invalid target URL {:?}: {}", base_url, e))?;
         let base_host = parsed.host_str().unwrap_or("").to_string();
 
-        Spider {
+        Ok(Spider {
             client,
             base_url,
             base_host,
             max_depth,
             concurrency,
-        }
+        })
     }
 
     /// Crawl the target and return all discovered URLs
     pub async fn crawl(&self, pb: &ProgressBar) -> Result<Vec<DiscoveredUrl>> {
-        let visited: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let results: Arc<Mutex<Vec<DiscoveredUrl>>> = Arc::new(Mutex::new(Vec::new()));
+        self.crawl_with_cache(pb, None).await
+    }
 
-        // Seed URL
-        let seed = DiscoveredUrl {
-            url: self.base_url.clone(),
-            method: "GET".to_string(),
-            parameters: vec![],
-            source: UrlSource::Seed,
-        };
+    /// Crawl the target with optional response caching for zero-network passive scanning.
+    pub async fn crawl_with_cache(
+        &self,
+        pb: &ProgressBar,
+        cache: Option<&crate::types::HttpResponseCache>,
+    ) -> Result<Vec<DiscoveredUrl>> {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut results: Vec<DiscoveredUrl> = Vec::new();
+        let mut queue: VecDeque<(DiscoveredUrl, usize)> = VecDeque::new();
 
-        {
-            let mut vis = visited.lock().await;
-            vis.insert(self.base_url.clone());
-        }
+        let seed = DiscoveredUrl::new(self.base_url.clone(), "GET", UrlSource::Seed);
+        visited.insert(self.base_url.clone());
+        results.push(seed.clone());
+        queue.push_back((seed, 0));
 
-        let queue: Arc<Mutex<VecDeque<(DiscoveredUrl, usize)>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
-        {
-            let mut q = queue.lock().await;
-            q.push_back((seed.clone(), 0));
-        }
-
-        results.lock().await.push(seed);
-
-        // ── A2: robots.txt + sitemap enrichment ───────────────────────
-        // Pull additional URLs from /robots.txt and any declared sitemaps
-        // before the main BFS so they get the same per-depth treatment.
+        // A2: robots.txt + sitemap enrichment
         if let Ok(base) = Url::parse(&self.base_url) {
             let enriched = self.fetch_robots_and_sitemaps(&base, &self.base_host).await;
-            if !enriched.is_empty() {
-                let mut vis = visited.lock().await;
-                let mut res = results.lock().await;
-                let mut q = queue.lock().await;
-                for du in enriched {
-                    if vis.insert(du.url.clone()) {
-                        res.push(du.clone());
-                        q.push_back((du, 0));
-                    }
+            for du in enriched {
+                if visited.insert(du.url.clone()) {
+                    results.push(du.clone());
+                    queue.push_back((du, 0));
                 }
-                info!("robots/sitemap added {} URLs", res.len() - 1);
             }
         }
 
+        use futures::stream::FuturesUnordered;
+        use futures::StreamExt;
+        let mut in_flight = FuturesUnordered::new();
+
         loop {
-            // Drain up to `concurrency` items
-            let batch: Vec<(DiscoveredUrl, usize)> = {
-                let mut q = queue.lock().await;
-                let take = self.concurrency.min(q.len());
-                q.drain(..take).collect()
-            };
-
-            if batch.is_empty() {
-                break;
-            }
-
-            let tasks: Vec<_> = batch
-                .into_iter()
-                .map(|(du, depth)| {
+            // Fill in-flight pool up to concurrency limit
+            while in_flight.len() < self.concurrency && !queue.is_empty() {
+                if let Some((du, depth)) = queue.pop_front() {
+                    if depth >= self.max_depth {
+                        continue;
+                    }
                     let client = self.client.clone();
-                    let visited = visited.clone();
-                    let results = results.clone();
-                    let queue = queue.clone();
                     let base_host = self.base_host.clone();
-                    let max_depth = self.max_depth;
-                    let pb = pb.clone();
-
-                    tokio::spawn(async move {
-                        if depth >= max_depth {
-                            return;
-                        }
-
-                        pb.set_message(format!(
-                            "depth={} {}",
-                            depth,
-                            &du.url[..du.url.len().min(60)]
-                        ));
-
-                        let body = match client.get(&du.url).send().await {
+                    in_flight.push(async move {
+                        let resp_result = client.get(&du.url).send().await;
+                        match resp_result {
                             Ok(resp) => {
+                                let status = resp.status().as_u16();
                                 if !resp.status().is_success() {
-                                    return;
+                                    return (du, depth, None);
                                 }
+                                let headers: Vec<(String, String)> = resp
+                                    .headers()
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        (k.to_string(), v.to_str().unwrap_or("").to_string())
+                                    })
+                                    .collect();
                                 match resp.text().await {
-                                    Ok(t) => t,
-                                    Err(_) => return,
+                                    Ok(body) => {
+                                        let base_url = Url::parse(&du.url).ok();
+                                        let extracted =
+                                            extract_urls(&body, base_url.as_ref(), &base_host);
+                                        (du, depth, Some((status, headers, body, extracted)))
+                                    }
+                                    Err(_) => (du, depth, None),
                                 }
                             }
                             Err(e) => {
                                 warn!("Failed to fetch {}: {}", du.url, e);
-                                return;
-                            }
-                        };
-
-                        let base_url = Url::parse(&du.url).ok();
-                        let extracted = extract_urls(&body, base_url.as_ref(), &base_host);
-
-                        for discovered in extracted {
-                            let url_str = discovered.url.clone();
-                            let mut vis = visited.lock().await;
-                            if !vis.contains(&url_str) {
-                                vis.insert(url_str);
-                                results.lock().await.push(discovered.clone());
-                                queue.lock().await.push_back((discovered, depth + 1));
-                                pb.set_message(format!(
-                                    "Found {} URLs",
-                                    results.lock().await.len()
-                                ));
+                                (du, depth, None)
                             }
                         }
-                    })
-                })
-                .collect();
+                    });
+                }
+            }
 
-            for t in tasks {
-                let _ = t.await;
+            if in_flight.is_empty() && queue.is_empty() {
+                break;
+            }
+
+            if let Some((du, depth, maybe_data)) = in_flight.next().await {
+                pb.set_message(format!(
+                    "depth={} {}",
+                    depth,
+                    crate::types::safe_truncate(&du.url, 60)
+                ));
+                if let Some((status, headers, body, extracted)) = maybe_data {
+                    if let Some(c) = cache {
+                        c.insert(du.url.clone(), status, headers, body).await;
+                    }
+                    for discovered in extracted {
+                        let url_str = discovered.url.clone();
+                        if visited.insert(url_str) {
+                            results.push(discovered.clone());
+                            if depth + 1 < self.max_depth {
+                                queue.push_back((discovered, depth + 1));
+                            }
+                            pb.set_message(format!("Found {} URLs", results.len()));
+                        }
+                    }
+                }
             }
         }
 
-        let final_results = results.lock().await.clone();
-        info!("Spider finished: {} URLs discovered", final_results.len());
-        Ok(final_results)
+        info!("Spider finished: {} URLs discovered", results.len());
+        Ok(results)
     }
 
     /// Fetch `{origin}/robots.txt`, parse it, then fetch any declared sitemaps
@@ -199,6 +183,9 @@ impl Spider {
                     out.push(DiscoveredUrl {
                         url: normalize_url(&resolved),
                         method: "GET".to_string(),
+                        headers: Vec::new(),
+                        body: None,
+                        content_type: None,
                         parameters: params,
                         source: UrlSource::Robots,
                     });
@@ -222,6 +209,9 @@ impl Spider {
                         out.push(DiscoveredUrl {
                             url: normalize_url(&parsed_url),
                             method: "GET".to_string(),
+                            headers: Vec::new(),
+                            body: None,
+                            content_type: None,
                             parameters: params,
                             source: UrlSource::Sitemap,
                         });
@@ -362,6 +352,9 @@ fn extract_urls(html: &str, base: Option<&Url>, base_host: &str) -> Vec<Discover
                         found.push(DiscoveredUrl {
                             url: normalize_url(&url),
                             method: "GET".to_string(),
+                            headers: Vec::new(),
+                            body: None,
+                            content_type: None,
                             parameters: params,
                             source: UrlSource::Link,
                         });
@@ -403,6 +396,9 @@ fn extract_urls(html: &str, base: Option<&Url>, base_host: &str) -> Vec<Discover
                     found.push(DiscoveredUrl {
                         url: target_url,
                         method,
+                        headers: Vec::new(),
+                        body: None,
+                        content_type: None,
                         parameters: params,
                         source: UrlSource::Form,
                     });
@@ -420,6 +416,9 @@ fn extract_urls(html: &str, base: Option<&Url>, base_host: &str) -> Vec<Discover
                         found.push(DiscoveredUrl {
                             url: normalize_url(&url),
                             method: "GET".to_string(),
+                            headers: Vec::new(),
+                            body: None,
+                            content_type: None,
                             parameters: vec![],
                             source: UrlSource::Script,
                         });
@@ -456,6 +455,9 @@ fn extract_js_urls(html: &str, base: Option<&Url>, base_host: &str) -> Vec<Disco
                             found.push(DiscoveredUrl {
                                 url: normalize_url(&url),
                                 method: "GET".to_string(),
+                                headers: Vec::new(),
+                                body: None,
+                                content_type: None,
                                 parameters: vec![],
                                 source: UrlSource::Script,
                             });
@@ -528,7 +530,7 @@ pub async fn run_spider_cli(target: &str, depth: usize, output: Option<String>) 
     pb.set_prefix("SPIDER");
     pb.enable_steady_tick(Duration::from_millis(100));
 
-    let spider = Spider::new(client, target.to_string(), depth, 10);
+    let spider = Spider::new(client, target.to_string(), depth, 10)?;
     let results = spider.crawl(&pb).await?;
     pb.finish_with_message(format!("✓ {} URLs", results.len()));
 

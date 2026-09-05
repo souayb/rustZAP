@@ -25,7 +25,9 @@ use analyze::{
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -209,6 +211,7 @@ impl ConfigForm {
             nuclei_jsonl: None,
             active_all_paths: false,
             passive_all_methods: false,
+            safety: crate::safety::SafetyPolicy::default(),
         }
     }
 }
@@ -1027,7 +1030,12 @@ async fn event_loop(
 
         if event::poll(Duration::from_millis(80))? {
             if let Event::Key(key) = event::read()? {
-                handle_key(app, key.code, key.modifiers);
+                // Windows emits Press+Release (and sometimes Repeat) for each
+                // physical key. Handling only Press avoids doubled chars in
+                // edit buffers (h→hh, ://→::////) and double-firing shortcuts.
+                if should_handle_key(key.kind) {
+                    handle_key(app, key.code, key.modifiers);
+                }
             }
         }
         if app.should_quit {
@@ -1044,6 +1052,11 @@ async fn event_loop(
             return Ok(());
         }
     }
+}
+
+/// Only process key *presses*. Crossterm on Windows also emits Release/Repeat.
+fn should_handle_key(kind: KeyEventKind) -> bool {
+    kind == KeyEventKind::Press
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
@@ -2373,6 +2386,13 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_handle_key_press_only() {
+        assert!(should_handle_key(KeyEventKind::Press));
+        assert!(!should_handle_key(KeyEventKind::Release));
+        assert!(!should_handle_key(KeyEventKind::Repeat));
+    }
 
     #[test]
     fn tab_cycle_includes_analyze_and_agent() {

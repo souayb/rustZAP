@@ -69,6 +69,7 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 | `src/tools.rs` | External tool detection + execution |
 | `src/installer.rs` | OS-aware companion tool installs |
 | `src/analyze/` | `analyze`/`audit`: Semgrep/Trivy/Gitleaks/Checkov parsers + **native** inventory/JS/forms (`inventory.rs`, `gitignore.rs`, `native/`, `static_report.rs`) |
+| `src/ad/` | `ad`: native Active Directory / NTLM-relay detector (Tier A) — LDAP posture (`ldap.rs`), Ghost-SPN (`spn.rs`), NTLM flags (`ntlm.rs`), computer enumeration (`enumerate.rs`); I/O behind traits in `probe.rs` (`directory.rs`/`dns.rs` live impls). Detection-only, authorization-gated. |
 | `FEATURE.md` | Implemented passive/active items + backlog; platform detail in `IMPLEMENTATION_PLAN.md` |
 | `IMPLEMENTATION_PLAN.md` | **Detailed specs** for analyze/audit, JSON `modules`/`static`, SARIF, `serve`, agentic mode |
 | `SOFTWARE_DESIGN_DOCUMENT.md` | Platform / SDD context (orchestration, UFF, workers) |
@@ -104,6 +105,7 @@ In `active.rs`, URLs **without** query parameters are **skipped** for active sca
 ### HTTP client
 
 - Built via `scanner::build_client` / `ScanConfig`: timeouts, TLS verify (`insecure`), cookies, auth headers, redirects (limited).
+- Active + agent HTTP go through `safety::HttpSafetyGate` (`--read-only-safe`, `--max-rps`, `--attack` → `SafetyPolicy`). Circuit breaker aborts on 5xx/latency spikes.
 
 ---
 
@@ -182,6 +184,7 @@ If README and binary disagree, **fix README or wire the module** — do not leav
 | Analyze / audit | `cargo run -- analyze . --tools native --yes -o a.json` · `cargo run -- analyze ~/src/myapp --tools semgrep,trivy,gitleaks,native,checkov --yes` · `cargo run -- audit . --target URL --yes …` (positional `REPO` overrides `--repo`; TTY prompts for path if omitted; consent: TTY prompt, or `--yes` in CI; missing Semgrep falls back to native unless `--tools` was set; `--checkov-json` skips spawn) |
 | OpenAPI / HAR / Nuclei | `cargo run -- scan --target URL --openapi-path oas.json` · `--har-path rec.har` · `--nuclei` / `--nuclei-jsonl` (opt-in) |
 | Spider only | `cargo run -- spider --target URL` |
+| Active Directory (AD) | `cargo run -- ad --domain corp.local --dc-ip 10.0.0.1 --null-auth --checks spn,ldap --yes` (detection-only; authorization-gated; password via `--password-env RZ_AD_PASS`) |
 | TUI | `cargo run -- tui` or bare `cargo run` (tab 2 = Scan URL, tab 6 / `a` = Analyze repo, tab 7 = Agent) |
 
 ---

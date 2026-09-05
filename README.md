@@ -45,7 +45,7 @@ A fast, fearless web application security scanner written in Rust, inspired by [
 | [CLAUDE.md](CLAUDE.md) | Contributor / AI assistant guardrails |
 | [CONTRIBUTION.md](CONTRIBUTION.md) | PR workflow + dev expectations |
 
-> **Note:** `rustzap analyze` (including `--tools native`), `rustzap audit`, JSON `"modules"` / `"static"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2.5. OpenAPI/HAR/Nuclei are Phase 3. The **agentic tester** (`rustzap agent` + `rustzap mcp`) is implemented — see [Agentic Tester](#agentic-tester-agent--mcp) below. The hosted `serve` viewer remains planned.
+> **Note:** `rustzap analyze` (including `--tools native`), `rustzap audit`, JSON `"modules"` / `"static"`, `"correlations"`, and SARIF export are implemented per **`IMPLEMENTATION_PLAN.md`** Phases 1–2.5. OpenAPI/HAR/Nuclei are Phase 3. The **agentic tester** (`rustzap agent` + `rustzap mcp`) is implemented — see [Agentic Tester](#agentic-tester-agent--mcp) below. Native **Active Directory / NTLM-relay detection** (`rustzap ad`, Tier A) is implemented — see [Active Directory](#active-directory--ntlm-relay-detection-ad) below. The hosted `serve` viewer remains planned.
 
 ---
 
@@ -96,6 +96,16 @@ cargo build --release
 ```
 
 Contribution checks (fmt, clippy, tests) and how to install hooks on Windows are in [CONTRIBUTION.md](CONTRIBUTION.md).
+
+### VS Code extension
+
+A thin CLI wrapper lives in [`vscode-extension/`](vscode-extension/). It runs **`RustZAP: Analyze Workspace`** (native static analysis → **Problems**), **`RustZAP: Scan URL`** (passive DAST by default, with a legal confirmation), and **`RustZAP: Scan Active Directory`** (LDAP/SPN/NTLM relay detection with an authorization prompt; credentials are entered at run time and passed to the CLI via an env var, never stored in settings). Correlated relay attack paths render as an **Attack paths** section in the Findings tree. Reports go to extension storage, not the repo.
+
+```bash
+cd vscode-extension && npm ci && npm run compile   # F5 to debug in VS Code
+```
+
+Requires the `rustzap` binary on `PATH` or `rustzap.path` in settings. See [vscode-extension/README.md](vscode-extension/README.md).
 
 ### Install companion tools (OS-aware)
 
@@ -225,6 +235,12 @@ rustzap scan \
 # Passive-only (no attack payloads sent)
 rustzap scan --target https://example.com --passive-only
 
+# Do-no-harm: block mutating verbs; cap request rate (default 50 RPS)
+rustzap scan --target https://example.com --read-only-safe --max-rps 20
+
+# Lab-only attack mode (raises circuit-breaker tolerances; still requires authorization)
+rustzap scan --target https://lab.example.com --attack-mode --plugins xss,sqli
+
 # Skip SSL verification (e.g. staging with self-signed cert)
 rustzap scan --target https://staging.example.com --insecure
 
@@ -326,6 +342,37 @@ rustzap audit ~/src/myapp --target https://lab.example.com \
 Scan and analyze/audit JSON reports include a **`modules`** array (per-plugin roll-up) and optional **`correlations`** when `--correlate` is set. With `--tools native`, reports also include a **`static`** object (`inventory`, `risk_score`, `risk_breakdown`, `detection_checks`, `attack_plan`). That field is omitted when native is not selected. The native walk respects `.gitignore` and `.rustzapignore` (and always skips `node_modules`, `target`, `.git`, `vendor`, `dist`).
 
 **GitHub Code Scanning:** build SARIF with `rustzap … --sarif-out rustzap.sarif` (or `scan --output rustzap.sarif`), upload the artifact with `github/codeql-action/upload-sarif` against your default branch or PR; confirm the run appears under the repository **Security** tab (manual check).
+
+### Active Directory / NTLM-relay detection (`ad`)
+
+> **Authorization required.** `rustzap ad` sends LDAP and NTLM authentication
+> traffic to Active Directory hosts. It is **detection only** — it never generates
+> a relay-target list or triggers coercion — but it is intrusive. Only scan AD you
+> own or have **explicit written permission** to test. Like `analyze`, it prompts
+> for authorization (TTY), or requires `--yes` in CI.
+
+Tier A coverage (native Rust): LDAP/LDAPS signing posture, Ghost-SPN detection
+(SPNs whose host has no DNS record), NTLMv1 / NTLM-signing negotiate flags, and
+LDAP domain-computer enumeration. Findings carry stable `ad/*` plugin ids and feed
+the correlation engine, which consolidates per-host weaknesses into a single
+**"NTLM relay exposure on <host>"** attack-path finding.
+
+```bash
+# Anonymous, Ghost-SPN + LDAP posture, against a lab DC you control:
+rustzap ad --domain corp.local --dc-ip 10.0.0.1 --null-auth --checks spn,ldap --yes
+
+# Authenticated + enumerate every domain computer (password read from env, never argv):
+export RZ_AD_PASS='...'
+rustzap ad --domain corp.local --dc-ip 10.0.0.1 -u svc-account --audit \
+           -o ad-report.json --sarif-out ad.sarif --yes
+
+# Only NTLM negotiate-flag checks against explicit targets:
+rustzap ad --domain corp.local --dc-ip 10.0.0.1 --null-auth --checks ntlm \
+           -t win-srv01.corp.local -t win-srv02.corp.local --yes
+```
+
+Pass the bind password via `--password-env` (default `RZ_AD_PASS`), not on the
+command line. `--checks` selects `ldap`, `spn`, `ntlm`, or `all` (default).
 
 ### Spider Only
 
@@ -530,9 +577,9 @@ model:                         # LLM brain (all fields optional / CLI-overridabl
 
 | Mode | Behavior |
 |------|----------|
-| `assisted` *(default, safest)* | Read-only recon (spider/scan/analyze/verify) runs freely; **every** intrusive action needs approval |
+| `assisted` *(default, safest)* | True recon (analyze/list/GET probe) runs freely; **Exploit-class** tools (`run_plugin`, `scan_target`, `replay_request`, mutating `http_probe`, `ai_redteam`) need approval; explore-first blocks Exploit until recon succeeds |
 | `semi` | Runs autonomously; only the classes in `approval_for` (e.g. `exploit`, `rce`, `exfil`) need approval |
-| `auto` | Runs the whole loop with no prompts — scope + budget are the only guardrails |
+| `auto` | Runs the whole loop with no prompts — scope + budget + explore-first (unless auto-approve) are the guardrails |
 
 Approval is a TTY prompt. In CI / headless (`-n` / `--non-interactive`, or no
 TTY) gated actions are **auto-denied**, never blocked waiting on input.
@@ -557,6 +604,13 @@ LLM_API_KEY=sk-... rustzap agent --scope scope.yaml \
 # Override the scope's autonomy for one run, and turn on privacy tokenization
 rustzap agent --scope scope.yaml --target http://localhost:3000 \
   --autonomy semi --privacy
+
+# Safety gates on agent HTTP (same flags as scan)
+rustzap agent --scope scope.yaml --target http://localhost:3000 \
+  --read-only-safe --max-rps 10 -n
+
+# Export remediation prompts from a JSON report (findings with file locations)
+rustzap autofix --report analyze-report.json --out patches/
 ```
 
 ### Safety profiles
@@ -598,12 +652,12 @@ available to both the native brain and MCP clients:
 
 | Tool | Class | What it does |
 |------|-------|--------------|
-| `scan_target` | recon | DAST (spider + passive + active plugins) against an in-scope URL |
+| `scan_target` | **exploit** | DAST (spider + passive + active) against an in-scope URL |
 | `analyze_repo` | recon | Static analysis (native, or semgrep/trivy/gitleaks/checkov) over a repo |
 | `get_attack_plan` | recon | The native attack-plan frontier (endpoints + params + reason) |
 | `list_plugins` | recon | List available active scan plugins |
-| `run_plugin` | recon | Run one active plugin against one in-scope URL |
-| `http_probe` | recon | One bounded HTTP request; returns a `capture_id` |
+| `run_plugin` | **exploit** | Run one active plugin against one in-scope URL |
+| `http_probe` | recon / **exploit** | Bounded HTTP request; GET/HEAD/OPTIONS = recon; mutating methods = exploit |
 | `list_captures` | recon | List captured HTTP transactions available to replay |
 | `replay_request` | recon | Re-send a captured request with mutations (method/url/body/headers) + diff |
 | `spawn_subtask` | recon | Delegate a focused plan of recon calls to a bounded sub-agent; findings merge up |

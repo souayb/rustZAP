@@ -45,6 +45,8 @@ fn cfg(base: &str, output: String, auto_approve: bool) -> AgentConfig {
         trace_path: trace,
         non_interactive: true,
         auto_approve,
+        safety: rustzap::safety::SafetyPolicy::default(),
+        autofix_dir: None,
     }
 }
 
@@ -61,6 +63,10 @@ async fn agent_runs_a_plugin_and_reports_confirmed_finding() {
     let base = serve_full(vulnerable_app).await;
     let out = tmp("runplugin");
     let brain = Box::new(ScriptedBrain::new(vec![
+        AgentAction::CallTool {
+            tool: "list_plugins".into(),
+            args: json!({}),
+        },
         AgentAction::CallTool {
             tool: "run_plugin".into(),
             args: json!({ "plugin": "sqli", "url": format!("{base}/dast/sqli?id=1") }),

@@ -31,7 +31,25 @@ struct HarRequest {
     method: String,
     url: String,
     #[serde(default)]
+    headers: Vec<HarHeader>,
+    #[serde(default, rename = "postData")]
+    post_data: Option<HarPostData>,
+    #[serde(default)]
     query_string: Vec<HarQueryParam>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HarHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HarPostData {
+    #[serde(default, rename = "mimeType")]
+    mime_type: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,9 +106,24 @@ pub fn parse_har_json(json: &str, target: &str) -> Result<Vec<DiscoveredUrl>> {
             continue;
         }
 
+        let headers: Vec<(String, String)> = entry
+            .request
+            .headers
+            .into_iter()
+            .map(|h| (h.name, h.value))
+            .collect();
+
+        let (content_type, body) = match entry.request.post_data {
+            Some(pd) => (pd.mime_type, pd.text),
+            None => (None, None),
+        };
+
         out.push(DiscoveredUrl {
             url: entry.request.url,
             method,
+            headers,
+            body,
+            content_type,
             parameters,
             source: UrlSource::Har,
         });

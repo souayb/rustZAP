@@ -624,7 +624,7 @@ async fn run_ramp_load(
     let total_secs = ramp_secs + hold_secs;
     let start = Instant::now();
 
-    let sem = Arc::new(Semaphore::new(peak_users));
+    let active_users = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut handles = Vec::new();
 
     loop {
@@ -634,27 +634,31 @@ async fn run_ramp_load(
         }
 
         // Compute current target concurrency
-        let _current_users = if elapsed < ramp_secs as f64 {
+        let current_users = if ramp_secs > 0 && elapsed < ramp_secs as f64 {
             let t = elapsed / ramp_secs as f64;
-            (start_users as f64 + t * (peak_users - start_users) as f64) as usize
+            (start_users as f64 + t * (peak_users.saturating_sub(start_users)) as f64) as usize
         } else {
             peak_users
-        };
-        // TODO: Use _current_users to dynamically adjust concurrency
+        }
+        .max(1);
 
-        // Acquire slot up to current users
-        if let Ok(permit) = sem.clone().try_acquire_owned() {
+        let current_active = active_users.load(std::sync::atomic::Ordering::Relaxed);
+        if current_active < current_users {
+            active_users.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let config = ctx.config.clone();
             let stats = ctx.stats.clone();
             let results = ctx.results.clone();
             let errors = ctx.errors.clone();
             let client = ctx.client.clone();
+            let active = active_users.clone();
             let h = tokio::spawn(async move {
                 let r = fire_request(&client, &config).await;
                 record_result(r, &stats, &results, &errors).await;
-                drop(permit);
+                active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             });
             handles.push(h);
+        } else {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
         tokio::task::yield_now().await;

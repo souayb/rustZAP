@@ -48,10 +48,24 @@ pub struct ToolCtx {
     /// brain can list past requests and replay them with mutations. Reuses the
     /// `proxy.rs` transaction record so both share one on-disk format.
     captures: Mutex<Vec<HttpTransaction>>,
+    gate: Arc<crate::safety::HttpSafetyGate>,
+    /// Findings accumulated during this agent run (for export_autofix).
+    pub run_findings: Mutex<Vec<Finding>>,
 }
 
 impl ToolCtx {
     pub fn new(scope: Arc<ScopeConfig>, trace: Arc<Trace>) -> Result<Self> {
+        Self::with_safety(scope, trace, crate::safety::SafetyPolicy::default())
+    }
+
+    pub fn with_safety(
+        scope: Arc<ScopeConfig>,
+        trace: Arc<Trace>,
+        mut safety: crate::safety::SafetyPolicy,
+    ) -> Result<Self> {
+        if scope.max_requests_per_min > 0 {
+            safety.max_rps = (scope.max_requests_per_min / 60).max(1);
+        }
         let client = scanner::build_client(&default_scan_config("http://placeholder.invalid"))?;
         Ok(Self {
             scope,
@@ -59,7 +73,15 @@ impl ToolCtx {
             client,
             requests: AtomicU32::new(0),
             captures: Mutex::new(Vec::new()),
+            gate: crate::safety::HttpSafetyGate::shared(safety),
+            run_findings: Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn push_findings(&self, findings: &[Finding]) {
+        if let Ok(mut g) = self.run_findings.lock() {
+            g.extend(findings.iter().cloned());
+        }
     }
 
     fn charge_request(&self) -> Result<()> {
@@ -111,6 +133,10 @@ impl ToolCtx {
     ) -> Result<(HttpTransaction, bool)> {
         self.enforce_scope(url)?;
         self.charge_request()?;
+        self.gate
+            .before_url_request(method, url, body.as_deref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let m = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| anyhow::anyhow!("bad HTTP method: {method}"))?;
         let mut req = self
@@ -125,6 +151,8 @@ impl ToolCtx {
         }
         let start = Instant::now();
         let resp = req.send().await?;
+        let final_url = resp.url().as_str().to_string();
+        self.enforce_scope(&final_url)?;
         let status = resp.status().as_u16();
         let resp_headers: Vec<(String, String)> = resp
             .headers()
@@ -133,6 +161,9 @@ impl ToolCtx {
             .collect();
         let full = resp.text().await.unwrap_or_default();
         let elapsed_ms = start.elapsed().as_millis() as u64;
+        self.gate
+            .after_response(status, elapsed_ms)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let truncated = full.len() > HTTP_PROBE_MAX_BODY;
         let snippet: String = full.chars().take(HTTP_PROBE_MAX_BODY).collect();
         let txn = HttpTransaction {
@@ -194,8 +225,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "scan_target",
-            description: "Run RustZAP DAST (spider + passive + active plugins) against an in-scope URL and return findings.",
-            action_class: ActionClass::Recon,
+            description: "Run RustZAP DAST (spider + passive + active plugins) against an in-scope URL and return findings. Intrusive when active plugins run — requires approval in assisted mode.",
+            action_class: ActionClass::Exploit,
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -240,7 +271,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "run_plugin",
             description: "Run one active plugin against one in-scope URL.",
-            action_class: ActionClass::Recon,
+            action_class: ActionClass::Exploit,
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -254,7 +285,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "http_probe",
-            description: "Send one bounded HTTP request to an in-scope URL and return status/headers/body-snippet. The request/response is captured (returns a capture_id) for later replay.",
+            description: "Send one bounded HTTP request to an in-scope URL and return status/headers/body-snippet. The request/response is captured (returns a capture_id) for later replay. GET/HEAD/OPTIONS are recon; mutating methods are exploit-class.",
             action_class: ActionClass::Recon,
             input_schema: json!({
                 "type": "object",
@@ -327,7 +358,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "replay_request",
             description: "Re-send a captured request (by capture_id) with optional mutations, or a fresh request. Overrides: method/url/body, and headers (object of name→value). Returns the new response plus a diff vs the original (status change, body-length delta).",
-            action_class: ActionClass::Recon,
+            action_class: ActionClass::Exploit,
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -337,6 +368,23 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "body": {"type": "string", "description": "Override the request body."},
                     "headers": {"type": "object", "description": "Header name→value overrides merged onto the captured request."}
                 }
+            }),
+        },
+        ToolSpec {
+            name: "export_autofix",
+            description: "Write remediation prompt files for findings that have a source file location into a directory (Strix-style autofix export).",
+            action_class: ActionClass::Recon,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "out_dir": {"type": "string", "description": "Directory for {id}.md prompt files"},
+                    "finding_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional subset of finding ids; default = all findings with locations from this run"
+                    }
+                },
+                "required": ["out_dir"]
             }),
         },
     ]
@@ -349,6 +397,22 @@ pub fn action_class_of(name: &str) -> ActionClass {
         .find(|s| s.name == name)
         .map(|s| s.action_class)
         .unwrap_or(ActionClass::Recon)
+}
+
+/// Effective class for a call, elevating mutating `http_probe` to Exploit.
+pub fn effective_action_class(name: &str, args: &Value) -> ActionClass {
+    let base = action_class_of(name);
+    if name == "http_probe" {
+        let method = args
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("GET")
+            .to_uppercase();
+        if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+            return ActionClass::Exploit;
+        }
+    }
+    base
 }
 
 /// Dispatch a tool call. `args` is the JSON object of arguments.
@@ -366,6 +430,7 @@ pub async fn execute(name: &str, args: &Value, ctx: &ToolCtx) -> Result<ToolOutp
         "ai_redteam" => ai_redteam(args, ctx).await,
         "vector_probes" => vector_probes(args),
         "spawn_subtask" => spawn_subtask(args, ctx).await,
+        "export_autofix" => export_autofix_tool(args, ctx),
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -417,20 +482,33 @@ async fn scan_target(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     config.passive_only = passive_only;
     config.max_depth = depth;
     config.plugins = plugins.split(',').map(|s| s.trim().to_string()).collect();
+    config.safety = ctx.gate.policy.clone();
 
+    ctx.charge_request()?;
     let collected = scanner::collect_scan(config).await?;
+    let in_scope_discovered: Vec<DiscoveredUrl> = collected
+        .discovered
+        .into_iter()
+        .filter(|d| ctx.scope.check_url(&d.url).is_allowed())
+        .collect();
+    let in_scope_findings: Vec<Finding> = collected
+        .findings
+        .into_iter()
+        .filter(|f| ctx.scope.check_url(&f.url).is_allowed())
+        .collect();
+
     let value = json!({
         "target": target,
-        "findings": summarize_findings(&collected.findings),
-        "discovered_urls": collected.discovered.len(),
+        "findings": summarize_findings(&in_scope_findings),
+        "discovered_urls": in_scope_discovered.len(),
         "modules": collected.modules.iter().map(|m| json!({
             "name": m.name, "findings": m.findings, "quiet": m.quiet
         })).collect::<Vec<_>>(),
     });
     Ok(ToolOutput {
         value,
-        findings: collected.findings,
-        discovered: collected.discovered,
+        findings: in_scope_findings,
+        discovered: in_scope_discovered,
         ..Default::default()
     })
 }
@@ -514,6 +592,28 @@ fn list_plugins_tool() -> ToolOutput {
     ToolOutput::value_only(json!({ "plugins": plugins }))
 }
 
+fn export_autofix_tool(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+    let out_dir = arg_str(args, "out_dir")?;
+    let ids: Option<Vec<String>> = args.get("finding_ids").and_then(|v| {
+        v.as_array().map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+    });
+    let findings = ctx
+        .run_findings
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let written = crate::agent::autofix::export_findings(&findings, &out_dir, ids.as_deref())?;
+    Ok(ToolOutput::value_only(json!({
+        "out_dir": out_dir,
+        "files": written,
+        "count": written.len(),
+    })))
+}
+
 async fn run_plugin(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     let plugin_name = arg_str(args, "plugin")?;
     let url = arg_str(args, "url")?;
@@ -538,9 +638,13 @@ async fn run_plugin(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             .and_then(|v| v.as_str())
             .unwrap_or("GET")
             .to_string(),
+        headers: Vec::new(),
+        body: None,
+        content_type: None,
         parameters,
         source: UrlSource::Seed,
     };
+    let _gate_guard = crate::active::install_active_gate(ctx.gate.clone());
     let findings = plugin.scan(&ctx.client, &du).await;
     let value = json!({
         "plugin": plugin_name,
@@ -803,7 +907,7 @@ async fn spawn_subtask(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
                 .push(json!({"step": i, "tool": tool, "error": "nested subtasks are not allowed"}));
             continue;
         }
-        if action_class_of(tool) != ActionClass::Recon {
+        if effective_action_class(tool, &sargs) != ActionClass::Recon {
             results.push(json!({"step": i, "tool": tool, "error": "sub-tasks may only call recon-class tools"}));
             continue;
         }
@@ -893,6 +997,7 @@ pub fn default_scan_config(target: &str) -> ScanConfig {
         nuclei_jsonl: None,
         active_all_paths: false,
         passive_all_methods: false,
+        safety: crate::safety::SafetyPolicy::default(),
     }
 }
 
@@ -948,11 +1053,22 @@ mod tests {
     }
 
     #[test]
-    fn tool_specs_are_nonempty_and_recon() {
+    fn tool_specs_classify_intrusive_as_exploit() {
         let specs = tool_specs();
         assert!(specs.len() >= 6);
-        assert_eq!(action_class_of("scan_target"), ActionClass::Recon);
-        assert_eq!(action_class_of("replay_request"), ActionClass::Recon);
+        assert_eq!(action_class_of("scan_target"), ActionClass::Exploit);
+        assert_eq!(action_class_of("run_plugin"), ActionClass::Exploit);
+        assert_eq!(action_class_of("replay_request"), ActionClass::Exploit);
+        assert_eq!(action_class_of("http_probe"), ActionClass::Recon);
+        assert_eq!(
+            effective_action_class("http_probe", &json!({"method": "POST"})),
+            ActionClass::Exploit
+        );
+        assert_eq!(
+            effective_action_class("http_probe", &json!({"method": "GET"})),
+            ActionClass::Recon
+        );
+        assert_eq!(action_class_of("export_autofix"), ActionClass::Recon);
     }
 
     #[test]
@@ -1128,6 +1244,7 @@ mod tests {
             &json!({
                 "steps": [
                     { "tool": "ai_redteam", "args": { "endpoint": "http://127.0.0.1/v1" } },
+                    { "tool": "http_probe", "args": { "url": "http://127.0.0.1/api", "method": "POST" } },
                     { "tool": "spawn_subtask", "args": { "steps": [] } }
                 ]
             }),
@@ -1136,13 +1253,17 @@ mod tests {
         .await
         .unwrap();
 
-        // Both steps are rejected before any request is made → no findings.
+        // All steps are rejected before any request is made → no findings.
         assert!(out.findings.is_empty());
         assert!(out.value["results"][0]["error"]
             .as_str()
             .unwrap()
             .contains("recon-class"));
         assert!(out.value["results"][1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("recon-class"));
+        assert!(out.value["results"][2]["error"]
             .as_str()
             .unwrap()
             .contains("nested"));

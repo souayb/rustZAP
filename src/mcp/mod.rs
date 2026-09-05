@@ -110,6 +110,17 @@ async fn tools_call(id: Value, params: Option<&Value>, ctx: &ToolCtx) -> Value {
     let empty = json!({});
     let args = params.get("arguments").unwrap_or(&empty);
 
+    let class = tools::effective_action_class(name, args);
+    if ctx.scope.requires_approval(class) {
+        return success(
+            id,
+            json!({
+                "content": [{"type": "text", "text": format!("approval required for action class {class:?}; denied under current scope autonomy")}],
+                "isError": true
+            }),
+        );
+    }
+
     match tools::execute(name, args, ctx).await {
         Ok(out) => {
             let text = serde_json::to_string_pretty(&out.value).unwrap_or_default();
@@ -207,5 +218,25 @@ mod tests {
         let req = json!({"jsonrpc":"2.0","id":9,"method":"bogus"});
         let resp = handle_message(&req, &ctx).await.unwrap();
         assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn tools_call_exploit_denied_when_approval_required() {
+        let mut s: ScopeConfig =
+            serde_yaml::from_str("allowed_hosts: ['127.0.0.1']\nautonomy: assisted\n").unwrap();
+        s.compile().unwrap();
+        let trace = Arc::new(Trace::new(
+            std::env::temp_dir().join(format!("rz-mcp-deny-{}.jsonl", crate::types::uuid_v4())),
+        ));
+        let ctx = ToolCtx::new(Arc::new(s), trace).unwrap();
+
+        let req = json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params": {"name":"run_plugin","arguments":{"plugin":"xss","url":"http://127.0.0.1/search"}}
+        });
+        let resp = handle_message(&req, &ctx).await.unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("approval required"));
     }
 }

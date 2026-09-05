@@ -35,18 +35,49 @@ impl PassiveScanner {
 
     /// Run all passive checks against discovered URLs
     pub async fn scan_all(&self, urls: &[DiscoveredUrl], pb: &ProgressBar) -> Result<Vec<Finding>> {
+        self.scan_all_with_cache(urls, pb, None).await
+    }
+
+    /// Run all passive checks, utilizing cached responses from spidering when available.
+    pub async fn scan_all_with_cache(
+        &self,
+        urls: &[DiscoveredUrl],
+        pb: &ProgressBar,
+        cache: Option<&crate::types::HttpResponseCache>,
+    ) -> Result<Vec<Finding>> {
         let mut all_findings = Vec::new();
 
         for du in urls {
             pb.inc(1);
-            pb.set_message(format!("Checking {}", &du.url[..du.url.len().min(50)]));
+            pb.set_message(format!(
+                "Checking {}",
+                crate::types::safe_truncate(&du.url, 50)
+            ));
 
             // Only check GET URLs for passive scanning, unless all methods opted in.
             if !self.all_methods && du.method != "GET" {
                 continue;
             }
 
-            let findings = self.check_url(&du.url).await;
+            let findings = if let Some(c) = cache {
+                if let Some(cached) = c.get(&du.url).await {
+                    let mut hmap = reqwest::header::HeaderMap::new();
+                    for (k, v) in &cached.headers {
+                        if let (Ok(name), Ok(val)) = (
+                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(v),
+                        ) {
+                            hmap.insert(name, val);
+                        }
+                    }
+                    check_response_passive(&du.url, cached.status, &hmap, &cached.body)
+                } else {
+                    self.check_url(&du.url).await
+                }
+            } else {
+                self.check_url(&du.url).await
+            };
+
             if !findings.is_empty() {
                 debug!("Passive findings at {}: {}", du.url, findings.len());
                 all_findings.extend(findings);
@@ -358,7 +389,12 @@ fn check_information_disclosure(
     // Stack traces / error messages in body
     let stack_indicators = [
         (
-            "at ",
+            "\tat ",
+            "Stack trace detected",
+            "Java/Node.js stack trace may leak internal paths",
+        ),
+        (
+            "    at ",
             "Stack trace detected",
             "Java/Node.js stack trace may leak internal paths",
         ),
@@ -385,9 +421,8 @@ fn check_information_disclosure(
     ];
 
     for (pattern, title, desc) in &stack_indicators {
-        if body.contains(pattern) {
-            let idx = body.find(pattern).unwrap_or(0);
-            let snippet = &body[idx..body.len().min(idx + 200)];
+        if let Some(idx) = body.find(pattern) {
+            let snippet = crate::types::safe_truncate(&body[idx..], 200);
             findings.push(
                 Finding::new(
                     *title,
@@ -1275,6 +1310,9 @@ pub async fn run_passive_cli(input: &str, output: &str) -> Result<()> {
     let urls = vec![crate::types::DiscoveredUrl {
         url: input.to_string(),
         method: "GET".to_string(),
+        headers: Vec::new(),
+        body: None,
+        content_type: None,
         parameters: vec![],
         source: crate::types::UrlSource::Seed,
     }];

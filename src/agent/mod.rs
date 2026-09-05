@@ -5,7 +5,9 @@
 //! findings + the attack-plan frontier, and finally assembles a `Report`. It
 //! never runs without a scope file. See `IMPLEMENTATION_PLAN.md` Phase 5.
 
+pub mod autofix;
 pub mod brain;
+pub mod poc;
 pub mod privacy;
 pub mod redteam;
 pub mod scope;
@@ -46,6 +48,10 @@ pub struct AgentConfig {
     /// gated actions — the flag naming the action IS the approval. Scope
     /// enforcement (hosts, schemes, budget, forbidden paths) still fully applies.
     pub auto_approve: bool,
+    /// Do-no-harm / attack-mode / RPS policy for agent HTTP tools.
+    pub safety: crate::safety::SafetyPolicy,
+    /// Optional directory for autofix prompt exports.
+    pub autofix_dir: Option<String>,
 }
 
 /// Drive the agent loop to completion and write the report.
@@ -63,7 +69,7 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
             cfg.repo
         ),
     );
-    let ctx = ToolCtx::new(Arc::clone(&scope), Arc::clone(&trace))?;
+    let ctx = ToolCtx::with_safety(Arc::clone(&scope), Arc::clone(&trace), cfg.safety.clone())?;
 
     let mut state = AgentState {
         goal: cfg.goal.clone(),
@@ -82,6 +88,9 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
     // Loop guard: weaker models re-issue the same tool call instead of finishing.
     let mut last_sig: Option<String> = None;
     let mut repeats: u32 = 0;
+    // Explore-first: at least one successful Recon tool (or non-empty frontier)
+    // before Exploit-class tools, unless auto_approve skips the gate.
+    let mut recon_done = false;
 
     while state.turn < max_turns {
         let action = brain.next_action(&state).await?;
@@ -111,7 +120,23 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
                 last_sig = Some(sig);
                 repeats = 0;
 
-                let class = tools::action_class_of(&tool);
+                let class = tools::effective_action_class(&tool, &args);
+                if !cfg.auto_approve
+                    && !recon_done
+                    && !matches!(class, ActionClass::Recon)
+                    && all_discovered.is_empty()
+                    && state.attack_plan.is_empty()
+                {
+                    trace.note("explore_first", tool.clone());
+                    state.transcript.push(TranscriptEntry {
+                        tool,
+                        result: json!({
+                            "error": "explore-first gate: run a recon tool (analyze_repo, list_plugins, http_probe GET, get_attack_plan) before exploit-class actions"
+                        }),
+                    });
+                    state.turn += 1;
+                    continue;
+                }
                 if scope.requires_approval(class)
                     && !cfg.auto_approve
                     && !approve(&cfg, &tool, class)
@@ -133,6 +158,13 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
                             attack_plan,
                             static_analysis: sa,
                         } = out;
+                        if matches!(class, ActionClass::Recon) {
+                            recon_done = true;
+                        }
+                        if !discovered.is_empty() || !attack_plan.is_empty() {
+                            recon_done = true;
+                        }
+                        ctx.push_findings(&findings);
                         all_findings.extend(findings);
                         all_discovered.extend(discovered);
                         if !attack_plan.is_empty() {
@@ -185,7 +217,25 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
         let cap_path = captures_path(&cfg.output);
         match serde_json::to_string_pretty(&captures) {
             Ok(js) => {
-                if let Err(e) = std::fs::write(&cap_path, js) {
+                let write_res = {
+                    #[cfg(unix)]
+                    {
+                        use std::io::Write;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(0o600)
+                            .open(&cap_path)
+                            .and_then(|mut f| f.write_all(js.as_bytes()).and_then(|_| f.flush()))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::fs::write(&cap_path, js)
+                    }
+                };
+                if let Err(e) = write_res {
                     trace.note("captures_error", format!("{cap_path}: {e}"));
                 } else {
                     trace.note(
@@ -218,6 +268,15 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
     )
     .await?;
 
+    if let Some(ref dir) = cfg.autofix_dir {
+        match autofix::export_findings(&report.findings, dir, None) {
+            Ok(files) => {
+                trace.note("autofix", format!("{} prompt(s) → {dir}", files.len()));
+            }
+            Err(e) => trace.note("autofix_error", e.to_string()),
+        }
+    }
+
     trace.note(
         "report",
         format!("{} findings → {}", report.findings.len(), cfg.output),
@@ -238,7 +297,7 @@ fn captures_path(output: &str) -> String {
     }
 }
 
-/// Drop duplicate findings, keyed by (plugin, title, url, code location).
+/// Drop duplicate findings, keyed by (plugin, title, url, parameter, code location).
 fn dedup_findings(findings: &mut Vec<Finding>) {
     let mut seen = std::collections::HashSet::new();
     findings.retain(|f| {
@@ -247,7 +306,11 @@ fn dedup_findings(findings: &mut Vec<Finding>) {
             .as_ref()
             .map(|l| format!("{}:{}", l.file, l.line_start))
             .unwrap_or_default();
-        seen.insert(format!("{}|{}|{}|{}", f.plugin, f.title, f.url, loc))
+        let param = f.parameter.as_deref().unwrap_or_default();
+        seen.insert(format!(
+            "{}|{}|{}|{}|{}",
+            f.plugin, f.title, f.url, param, loc
+        ))
     });
 }
 
@@ -316,6 +379,8 @@ pub async fn run_agent_cli(
     llm: LlmOverrides,
     ai_redteam: bool,
     ai_redteam_marker: Option<String>,
+    safety: crate::safety::SafetyPolicy,
+    autofix_dir: Option<String>,
 ) -> Result<()> {
     let mut scope = ScopeConfig::load(Path::new(&scope_path))?;
     if let Some(a) = autonomy_override {
@@ -370,9 +435,11 @@ pub async fn run_agent_cli(
         let json_mode = llm.json_mode || scope.model.json_mode;
         let privacy_on = llm.privacy || scope.privacy;
         let vault = build_vault(privacy_on, &scope.allowed_hosts, target.as_deref());
-        Box::new(LlmBrain::with_vault(
-            &base, &model, api_key, json_mode, vault,
-        ))
+        let max_tokens = scope.budget.max_tokens;
+        Box::new(
+            LlmBrain::with_vault(&base, &model, api_key, json_mode, vault)
+                .with_token_budget(max_tokens),
+        )
     };
 
     let goal = goal.unwrap_or_else(|| {
@@ -402,6 +469,8 @@ pub async fn run_agent_cli(
         trace_path,
         non_interactive,
         auto_approve: ai_redteam,
+        safety,
+        autofix_dir,
     };
     let report = run_agent(cfg, brain).await?;
     println!(
@@ -458,6 +527,8 @@ mod tests {
             trace_path: trace.to_string_lossy().to_string(),
             non_interactive: true,
             auto_approve: false,
+            safety: crate::safety::SafetyPolicy::default(),
+            autofix_dir: None,
         };
         let report = run_agent(cfg, brain).await.expect("agent run");
         assert!(!report.findings.is_empty());
@@ -477,6 +548,18 @@ mod tests {
         let mut v = vec![mk(), mk(), mk()];
         dedup_findings(&mut v);
         assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn dedup_preserves_different_parameters() {
+        use crate::types::{Finding, Severity};
+        let f1 = Finding::new("XSS", Severity::High, "http://x/a", "d", "s", "active/xss")
+            .with_parameter("q");
+        let f2 = Finding::new("XSS", Severity::High, "http://x/a", "d", "s", "active/xss")
+            .with_parameter("name");
+        let mut v = vec![f1, f2];
+        dedup_findings(&mut v);
+        assert_eq!(v.len(), 2);
     }
 
     #[tokio::test]
@@ -531,6 +614,8 @@ mod tests {
             trace_path: trace.clone(),
             non_interactive: true,
             auto_approve,
+            safety: crate::safety::SafetyPolicy::default(),
+            autofix_dir: None,
         };
         (cfg, out, trace)
     }
@@ -577,9 +662,11 @@ mod tests {
             report.findings.is_empty(),
             "unconsented exploit action must be denied"
         );
-        assert!(std::fs::read_to_string(&trace)
-            .unwrap_or_default()
-            .contains("approval_denied"));
+        let trace_body = std::fs::read_to_string(&trace).unwrap_or_default();
+        assert!(
+            trace_body.contains("approval_denied") || trace_body.contains("explore_first"),
+            "expected approval_denied or explore_first in trace, got:\n{trace_body}"
+        );
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(&trace);
     }

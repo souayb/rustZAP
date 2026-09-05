@@ -6,11 +6,40 @@ use anyhow::Result;
 use async_trait::async_trait;
 use colored::*;
 use indicatif::ProgressBar;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use tracing::debug;
 use url::Url;
 
+use crate::safety::{HttpSafetyGate, SafetyPolicy};
 use crate::types::{DiscoveredUrl, Finding, Severity};
+
+/// Process-wide gate for active plugin HTTP helpers (`get_response_body`).
+/// Set for the duration of `ActiveScanner::scan_all` or agent `run_plugin`.
+static ACTIVE_GATE: std::sync::Mutex<Option<Arc<HttpSafetyGate>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn install_active_gate(gate: Arc<HttpSafetyGate>) -> ActiveGateGuard {
+    if let Ok(mut g) = ACTIVE_GATE.lock() {
+        *g = Some(gate);
+    }
+    ActiveGateGuard
+}
+
+fn clear_active_gate() {
+    if let Ok(mut g) = ACTIVE_GATE.lock() {
+        *g = None;
+    }
+}
+
+fn active_gate() -> Option<Arc<HttpSafetyGate>> {
+    ACTIVE_GATE.lock().ok().and_then(|g| g.clone())
+}
+
+pub(crate) struct ActiveGateGuard;
+impl Drop for ActiveGateGuard {
+    fn drop(&mut self) {
+        clear_active_gate();
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Plugin trait
@@ -38,9 +67,10 @@ pub trait ScanPlugin: Send + Sync {
 pub struct ActiveScanner {
     client: Arc<reqwest::Client>,
     plugins: Vec<Box<dyn ScanPlugin>>,
-    semaphore: Arc<Semaphore>,
+    concurrency: usize,
     /// When true, run plugins on URLs without query parameters too.
     all_paths: bool,
+    gate: Arc<HttpSafetyGate>,
 }
 
 /// Every active plugin RustZAP ships, freshly constructed. Single source of
@@ -78,22 +108,28 @@ impl ActiveScanner {
         enabled: Vec<String>,
         concurrency: usize,
         all_paths: bool,
+        safety: SafetyPolicy,
     ) -> Self {
         let plugins = all_active_plugins()
             .into_iter()
             .filter(|p| {
                 let name = p.name().to_lowercase();
-                enabled
-                    .iter()
-                    .any(|e| name.contains(&e.to_lowercase()) || e == "all")
+                enabled.iter().any(|e| {
+                    let el = e.trim().to_lowercase();
+                    el == "all"
+                        || name == el
+                        || (el == "sqli-all" && name.starts_with("sqli"))
+                        || (el == "sqli" && (name == "sqli" || name == "sqli-error"))
+                })
             })
             .collect();
 
         ActiveScanner {
             client,
             plugins,
-            semaphore: Arc::new(Semaphore::new(concurrency)),
+            concurrency: concurrency.max(1),
             all_paths,
+            gate: HttpSafetyGate::shared(safety),
         }
     }
 
@@ -108,51 +144,85 @@ impl ActiveScanner {
     }
 
     pub async fn scan_all(&self, urls: &[DiscoveredUrl], pb: &ProgressBar) -> Result<Vec<Finding>> {
-        let mut all_findings = Vec::new();
+        use futures::stream::{self, StreamExt};
 
-        for du in urls {
-            pb.inc(1);
-            pb.set_message(format!("Scanning {}", &du.url[..du.url.len().min(50)]));
+        let _clear = install_active_gate(self.gate.clone());
 
-            // `--active-all-paths` forces plugins to run even on paramless URLs.
+        let mut tasks = Vec::new();
+        let mut remaining = vec![0usize; urls.len()];
+        for (url_idx, du) in urls.iter().enumerate() {
             let has_params = self.all_paths || !du.parameters.is_empty() || du.url.contains('?');
-            let any_always_run = self.plugins.iter().any(|p| p.always_run());
-
-            // Skip URLs with no parameters for active scanning, unless at
-            // least one selected plugin opts to run on any URL.
-            if !has_params && !any_always_run {
-                continue;
-            }
-
-            let _permit = self.semaphore.acquire().await?;
-
-            for plugin in &self.plugins {
+            for (idx, plugin) in self.plugins.iter().enumerate() {
                 if !has_params && !plugin.always_run() {
                     continue;
                 }
-                debug!("Running {} on {}", plugin.name(), du.url);
-                let findings = plugin.scan(&self.client, du).await;
-                if !findings.is_empty() {
-                    for f in &findings {
-                        let tag = if f.poc_validated {
-                            "[confirmed]".green().to_string()
-                        } else {
-                            format!("[{}]", f.confidence.to_string().to_lowercase())
-                                .dimmed()
-                                .to_string()
-                        };
-                        println!(
-                            "  {} {} {} — {}",
-                            f.severity.color_str(),
-                            tag,
-                            f.title.bright_white().bold(),
-                            f.url.dimmed()
-                        );
-                    }
-                    all_findings.extend(findings);
-                }
+                remaining[url_idx] += 1;
+                tasks.push((url_idx, du.clone(), idx));
             }
         }
+
+        // URLs with no plugin work still count toward the bar (same as passive).
+        for (url_idx, count) in remaining.iter().enumerate() {
+            if *count == 0 {
+                pb.inc(1);
+                let preview = crate::types::safe_truncate(&urls[url_idx].url, 50);
+                pb.set_message(format!("Scanning {preview}"));
+            }
+        }
+
+        let client = self.client.clone();
+        let plugins_arc = Arc::new(
+            self.plugins
+                .iter()
+                .map(|p| p.as_ref() as &dyn ScanPlugin)
+                .collect::<Vec<_>>(),
+        );
+        let remaining = Arc::new(Mutex::new(remaining));
+        let pb = pb.clone();
+
+        let findings_stream = stream::iter(tasks)
+            .map(|(url_idx, du, plugin_idx)| {
+                let client = client.clone();
+                let plugins_ref = plugins_arc.clone();
+                let remaining = remaining.clone();
+                let pb = pb.clone();
+                async move {
+                    let plugin = plugins_ref[plugin_idx];
+                    debug!("Running {} on {}", plugin.name(), du.url);
+                    let findings = plugin.scan(&client, &du).await;
+                    if !findings.is_empty() {
+                        for f in &findings {
+                            let tag = if f.poc_validated {
+                                "[confirmed]".green().to_string()
+                            } else {
+                                format!("[{}]", f.confidence.to_string().to_lowercase())
+                                    .dimmed()
+                                    .to_string()
+                            };
+                            println!(
+                                "  {} {} {} — {}",
+                                f.severity.color_str(),
+                                tag,
+                                f.title.bright_white().bold(),
+                                f.url.dimmed()
+                            );
+                        }
+                    }
+
+                    let mut rem = remaining.lock().await;
+                    rem[url_idx] = rem[url_idx].saturating_sub(1);
+                    if rem[url_idx] == 0 {
+                        pb.inc(1);
+                        let preview = crate::types::safe_truncate(&du.url, 50);
+                        pb.set_message(format!("Scanning {preview}"));
+                    }
+                    findings
+                }
+            })
+            .buffer_unordered(self.concurrency);
+
+        let results: Vec<Vec<Finding>> = findings_stream.collect().await;
+        let all_findings = results.into_iter().flatten().collect();
 
         Ok(all_findings)
     }
@@ -180,7 +250,7 @@ pub fn list_plugins() {
 pub fn build_injection_urls_adv(target: &DiscoveredUrl, payload: &str) -> Vec<(String, String)> {
     let mut variants = Vec::new();
 
-    // Inject into query string params
+    // 1. Inject into query string params
     if let Ok(parsed) = url::Url::parse(&target.url) {
         let params: Vec<(String, String)> = parsed
             .query_pairs()
@@ -207,6 +277,25 @@ pub fn build_injection_urls_adv(target: &DiscoveredUrl, payload: &str) -> Vec<(S
             }
             variants.push((key.clone(), modified.to_string()));
         }
+
+        // 2. Inject into REST path segments (numeric or uuid-like segments)
+        if let Some(segments) = parsed.path_segments() {
+            let seg_list: Vec<&str> = segments.collect();
+            for (i, seg) in seg_list.iter().enumerate() {
+                let is_numeric = !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit());
+                let is_uuid = seg.len() >= 32 && seg.contains('-');
+                if is_numeric || is_uuid {
+                    let mut new_segs = seg_list.clone();
+                    new_segs[i] = payload;
+                    let mut modified = parsed.clone();
+                    // `Url::set_path` requires a leading `/`; joining segments alone
+                    // yields a relative path that breaks the URL.
+                    modified.set_path(&format!("/{}", new_segs.join("/")));
+                    let param_name = format!("path_seg_{i}");
+                    variants.push((param_name, modified.to_string()));
+                }
+            }
+        }
     }
 
     variants
@@ -217,22 +306,151 @@ pub async fn get_body(client: &reqwest::Client, url: &str) -> Option<(u16, Strin
 }
 
 pub async fn timed_get(client: &reqwest::Client, url: &str) -> (u64, bool) {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("GET", url, None).await.is_err() {
+            return (0, false);
+        }
+    }
     let t = std::time::Instant::now();
-    let ok = client
-        .get(url)
-        .send()
-        .await
-        .map(|r| r.status().as_u16() < 600)
-        .unwrap_or(false);
-    (t.elapsed().as_millis() as u64, ok)
+    let res = client.get(url).send().await;
+    let elapsed = t.elapsed().as_millis() as u64;
+    let (status, ok) = match res {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            (status, status < 600)
+        }
+        Err(_) => (0, false),
+    };
+    if let Some(gate) = active_gate() {
+        if status > 0 {
+            let _ = gate.after_response(status, elapsed);
+        }
+    }
+    (elapsed, ok)
 }
 
 async fn get_response_body(client: &reqwest::Client, url: &str) -> Option<(u16, String)> {
+    get_response_details(client, url)
+        .await
+        .map(|(status, _, body)| (status, body))
+}
+
+async fn get_response_details(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<(u16, Option<String>, String)> {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("GET", url, None).await.is_err() {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
     match client.get(url).timeout(Duration::from_secs(8)).send().await {
         Ok(r) => {
             let status = r.status().as_u16();
+            let ct = r
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let body = r.text().await.unwrap_or_default();
-            Some((status, body))
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
+            Some((status, ct, body))
+        }
+        Err(_) => None,
+    }
+}
+
+async fn post_response_body(
+    client: &reqwest::Client,
+    url: &str,
+    content_type: &str,
+    body: &str,
+) -> Option<(u16, String)> {
+    if let Some(gate) = active_gate() {
+        if gate
+            .before_url_request("POST", url, Some(body))
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
+    match client
+        .post(url)
+        .header("Content-Type", content_type)
+        .body(body.to_string())
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+    {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body_text = r.text().await.unwrap_or_default();
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
+            Some((status, body_text))
+        }
+        Err(_) => None,
+    }
+}
+
+async fn get_no_redirect(client: &reqwest::Client, url: &str) -> Option<(u16, Option<String>)> {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("GET", url, None).await.is_err() {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
+    match client.get(url).timeout(Duration::from_secs(8)).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
+            Some((status, location))
+        }
+        Err(_) => None,
+    }
+}
+
+async fn options_response(client: &reqwest::Client, url: &str) -> Option<(u16, Option<String>)> {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("OPTIONS", url, None).await.is_err() {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
+    match client
+        .request(reqwest::Method::OPTIONS, url)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let allow = resp
+                .headers()
+                .get("allow")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
+            Some((status, allow))
         }
         Err(_) => None,
     }
@@ -282,25 +500,44 @@ impl ScanPlugin for XssPlugin {
         for (payload, raw_marker) in &breakouts {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
-                if let Some((_, body)) = get_response_body(client, &url).await {
+                if let Some((_, ct, body)) = get_response_details(client, &url).await {
+                    if let Some(ref ctype) = ct {
+                        let cl = ctype.to_lowercase();
+                        if cl.contains("application/json")
+                            || cl.contains("application/pdf")
+                            || cl.contains("text/plain")
+                            || cl.contains("text/css")
+                            || cl.contains("text/javascript")
+                            || cl.contains("application/javascript")
+                        {
+                            continue;
+                        }
+                    }
                     if crate::verify::reflected_raw(&body, raw_marker) {
+                        let snippet: String = body.chars().take(500).collect();
                         findings.push(
-                            Finding::new(
-                                "Reflected Cross-Site Scripting (XSS)",
-                                Severity::High,
-                                &target.url,
-                                "A unique probe injected into this parameter is reflected in the response with its HTML metacharacters unencoded, allowing arbitrary markup/script to execute in the victim's browser.",
-                                "Contextually encode all user input on output. Deploy a strict Content-Security-Policy as defense in depth.",
-                                "active/xss",
-                            )
-                            .with_parameter(&param)
-                            .with_evidence(format!(
-                                "Probe `{}` reflected unencoded as `{}`",
-                                payload, raw_marker
-                            ))
-                            .with_cwe(79)
-                            .with_owasp("A03:2021 – Injection")
-                            .confirmed(),
+                            crate::agent::poc::attach_get_poc(
+                                Finding::new(
+                                    "Reflected Cross-Site Scripting (XSS)",
+                                    Severity::High,
+                                    &target.url,
+                                    "A unique probe injected into this parameter is reflected in the response with its HTML metacharacters unencoded, allowing arbitrary markup/script to execute in the victim's browser.",
+                                    "Contextually encode all user input on output. Deploy a strict Content-Security-Policy as defense in depth.",
+                                    "active/xss",
+                                )
+                                .with_parameter(&param)
+                                .with_evidence(format!(
+                                    "Probe `{}` reflected unencoded as `{}`",
+                                    payload, raw_marker
+                                ))
+                                .with_cwe(79)
+                                .with_owasp("A03:2021 – Injection"),
+                                &url,
+                                token.as_str(),
+                                raw_marker.as_str(),
+                                snippet,
+                                0,
+                            ),
                         );
                         return findings; // one confirmed is enough
                     }
@@ -370,23 +607,30 @@ impl ScanPlugin for SqlInjectionPlugin {
                         // Require the DB error to be NEW vs the baseline — i.e.
                         // actually provoked by our payload.
                         if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
+                            let snippet: String = body.chars().take(500).collect();
                             findings.push(
-                                Finding::new(
-                                    "SQL Injection (Error-Based)",
-                                    Severity::Critical,
-                                    &target.url,
-                                    "A malformed SQL payload provoked a database error that is absent from the baseline response, confirming that user input reaches a SQL query unsanitized.",
-                                    "Use parameterized queries or prepared statements. Never interpolate user input into SQL.",
-                                    "active/sqli",
-                                )
-                                .with_parameter(&param)
-                                .with_evidence(format!(
-                                    "Payload `{}` produced DB error signature `{}` not present in baseline",
-                                    payload, sig
-                                ))
-                                .with_cwe(89)
-                                .with_owasp("A03:2021 – Injection")
-                                .confirmed(),
+                                crate::agent::poc::attach_get_poc(
+                                    Finding::new(
+                                        "SQL Injection (Error-Based)",
+                                        Severity::Critical,
+                                        &target.url,
+                                        "A malformed SQL payload provoked a database error that is absent from the baseline response, confirming that user input reaches a SQL query unsanitized.",
+                                        "Use parameterized queries or prepared statements. Never interpolate user input into SQL.",
+                                        "active/sqli",
+                                    )
+                                    .with_parameter(&param)
+                                    .with_evidence(format!(
+                                        "Payload `{}` produced DB error signature `{}` not present in baseline",
+                                        payload, sig
+                                    ))
+                                    .with_cwe(89)
+                                    .with_owasp("A03:2021 – Injection"),
+                                    &url,
+                                    payload,
+                                    *sig,
+                                    snippet,
+                                    0,
+                                ),
                             );
                             return findings;
                         }
@@ -439,20 +683,27 @@ impl ScanPlugin for PathTraversalPlugin {
                     let body_lower = body.to_lowercase();
                     for sig in &signatures {
                         if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
+                            let snippet: String = body.chars().take(500).collect();
                             findings.push(
-                                Finding::new(
-                                    "Path Traversal — /etc/passwd Readable",
-                                    Severity::Critical,
-                                    &target.url,
-                                    "The application is vulnerable to path traversal, allowing access to arbitrary files on the server filesystem.",
-                                    "Validate and sanitize file path inputs. Use an allowlist of permitted paths.",
-                                    "active/path-traversal",
-                                )
-                                .with_parameter(&param)
-                                .with_evidence(format!("Payload: {} — Response contains '{}' (absent from baseline)", payload, sig))
-                                .with_cwe(22)
-                                .with_owasp("A01:2021 – Broken Access Control")
-                                .confirmed(),
+                                crate::agent::poc::attach_get_poc(
+                                    Finding::new(
+                                        "Path Traversal — /etc/passwd Readable",
+                                        Severity::Critical,
+                                        &target.url,
+                                        "The application is vulnerable to path traversal, allowing access to arbitrary files on the server filesystem.",
+                                        "Validate and sanitize file path inputs. Use an allowlist of permitted paths.",
+                                        "active/path-traversal",
+                                    )
+                                    .with_parameter(&param)
+                                    .with_evidence(format!("Payload: {} — Response contains '{}' (absent from baseline)", payload, sig))
+                                    .with_cwe(22)
+                                    .with_owasp("A01:2021 – Broken Access Control"),
+                                    &url,
+                                    payload,
+                                    *sig,
+                                    snippet,
+                                    0,
+                                ),
                             );
                             return findings;
                         }
@@ -493,36 +744,24 @@ impl ScanPlugin for OpenRedirectPlugin {
         for payload in payloads {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
-                // Use no-redirect policy to catch the 3xx
-                if let Ok(resp) = client
-                    .get(&url)
-                    .timeout(Duration::from_secs(8))
-                    .send()
-                    .await
-                {
-                    let status = resp.status().as_u16();
-                    if (300..=399).contains(&status) {
-                        if let Some(loc) = resp.headers().get("location") {
-                            let loc_str = loc.to_str().unwrap_or("");
-                            if loc_str.contains("rustzap-canary") {
-                                findings.push(
-                                    Finding::new(
-                                        "Open Redirect",
-                                        Severity::Medium,
-                                        &target.url,
-                                        "The application redirects to a user-supplied URL without validation, enabling phishing attacks.",
-                                        "Validate redirect targets against an allowlist of permitted domains.",
-                                        "active/open-redirect",
-                                    )
-                                    .with_parameter(&param)
-                                    .with_evidence(format!("HTTP {} Location: {}", status, loc_str))
-                                    .with_cwe(601)
-                                    .with_owasp("A01:2021 – Broken Access Control")
-                                    .confirmed(),
-                                );
-                                return findings;
-                            }
-                        }
+                if let Some((status, Some(loc_str))) = get_no_redirect(client, &url).await {
+                    if (300..=399).contains(&status) && loc_str.contains("rustzap-canary") {
+                        findings.push(
+                            Finding::new(
+                                "Open Redirect",
+                                Severity::Medium,
+                                &target.url,
+                                "The application redirects to a user-supplied URL without validation, enabling phishing attacks.",
+                                "Validate redirect targets against an allowlist of permitted domains.",
+                                "active/open-redirect",
+                            )
+                            .with_parameter(&param)
+                            .with_evidence(format!("HTTP {} Location: {}", status, loc_str))
+                            .with_cwe(601)
+                            .with_owasp("A01:2021 – Broken Access Control")
+                            .confirmed(),
+                        );
+                        return findings;
                     }
                 }
             }
@@ -647,35 +886,70 @@ impl ScanPlugin for XxePlugin {
             return findings;
         }
 
-        let xxe_payload = r#"<?xml version="1.0" encoding="UTF-8"?>
+        let benign_xml =
+            r#"<?xml version="1.0" encoding="UTF-8"?><root><param>rustzap_baseline</param></root>"#;
+        if let Some((_, base_body)) =
+            post_response_body(client, &target.url, "application/xml", benign_xml).await
+        {
+            if base_body.contains("root:x:0:0:") {
+                // Baseline already contains the target string (static documentation/reflection); abort to prevent FP.
+                return findings;
+            }
+        }
+
+        let canary = format!("rz_xxe_{}", &crate::types::uuid_v4()[..8]);
+        let entity_canary_payload = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE foo [<!ENTITY xxe \"{}\">\n]><root><param>&xxe;</param></root>",
+            canary
+        );
+
+        let entity_expanded = match post_response_body(
+            client,
+            &target.url,
+            "application/xml",
+            &entity_canary_payload,
+        )
+        .await
+        {
+            Some((_, body)) => body.contains(&canary),
+            None => false,
+        };
+
+        let xxe_system_payload = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
 <root><param>&xxe;</param></root>"#;
 
-        if let Ok(resp) = client
-            .post(&target.url)
-            .header("Content-Type", "application/xml")
-            .body(xxe_payload)
-            .timeout(Duration::from_secs(8))
-            .send()
-            .await
-        {
-            let body = resp.text().await.unwrap_or_default();
-            if body.contains("root:x:0:0:") {
-                findings.push(
-                    Finding::new(
-                        "XML External Entity (XXE) Injection",
-                        Severity::Critical,
-                        &target.url,
-                        "The XML parser processes external entity declarations, enabling file read, SSRF, and denial of service.",
-                        "Disable external entity processing in your XML parser. Use a JSON API where possible.",
-                        "active/xxe",
-                    )
-                    .with_evidence("XXE payload successfully read /etc/passwd (root:x:0:0: present in response)".to_string())
-                    .with_cwe(611)
-                    .with_owasp("A03:2021 – Injection")
-                    .confirmed(),
-                );
-            }
+        let system_read =
+            match post_response_body(client, &target.url, "application/xml", xxe_system_payload)
+                .await
+            {
+                Some((_, body)) => body.contains("root:x:0:0:"),
+                None => false,
+            };
+
+        if system_read || entity_expanded {
+            let evidence = if system_read {
+                "XXE payload successfully read /etc/passwd (root:x:0:0: verified present in response)".to_string()
+            } else {
+                format!(
+                    "XML parser expanded dynamic DTD entity canary token `{}` into response body",
+                    canary
+                )
+            };
+            findings.push(
+                Finding::new(
+                    "XML External Entity (XXE) Injection",
+                    Severity::Critical,
+                    &target.url,
+                    "The XML parser processes external entity declarations, enabling file read, SSRF, and denial of service.",
+                    "Disable external entity processing in your XML parser. Use a JSON API where possible.",
+                    "active/xxe",
+                )
+                .with_evidence(evidence)
+                .with_cwe(611)
+                .with_owasp("A03:2021 – Injection")
+                .confirmed(),
+            );
         }
 
         findings
@@ -883,54 +1157,41 @@ impl ScanPlugin for GraphqlIntrospectionPlugin {
         let mut findings = Vec::new();
 
         // Gate by path/content-type so we don't POST to arbitrary endpoints.
-        let probe_ct = match client
-            .get(&target.url)
-            .timeout(Duration::from_secs(6))
-            .send()
-            .await
-        {
-            Ok(r) => r
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string()),
-            Err(_) => None,
+        let probe_body = get_response_body(client, &target.url).await;
+        let probe_ct = if probe_body.is_some() {
+            Some("application/json")
+        } else {
+            None
         };
 
-        if !looks_like_graphql(&target.url, probe_ct.as_deref()) {
+        if !looks_like_graphql(&target.url, probe_ct) {
             return findings;
         }
 
-        let resp = match client
-            .post(&target.url)
-            .header("Content-Type", "application/json")
-            .body(GRAPHQL_INTROSPECTION_QUERY)
-            .timeout(Duration::from_secs(8))
-            .send()
-            .await
+        if let Some((status, body)) = post_response_body(
+            client,
+            &target.url,
+            "application/json",
+            GRAPHQL_INTROSPECTION_QUERY,
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(_) => return findings,
-        };
-
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-
-        if status == 200 && looks_like_introspection_response(&body) {
-            let snippet = body[..body.len().min(120)].to_string();
-            findings.push(
-                Finding::new(
-                    "GraphQL Introspection Enabled",
-                    Severity::Medium,
-                    &target.url,
-                    "The GraphQL endpoint answers introspection queries, exposing the full schema. Attackers can enumerate types, fields, and arguments.",
-                    "Disable introspection in production (e.g. set introspection: false in Apollo Server) or require authentication for the /graphql endpoint.",
-                    "active/graphql-introspection",
-                )
-                .with_evidence(snippet)
-                .with_cwe(200)
-                .with_owasp("A05:2021 – Security Misconfiguration"),
-            );
+            if status == 200 && looks_like_introspection_response(&body) {
+                let snippet = crate::types::safe_truncate(&body, 120).to_string();
+                findings.push(
+                    Finding::new(
+                        "GraphQL Introspection Enabled",
+                        Severity::Medium,
+                        &target.url,
+                        "The GraphQL endpoint answers introspection queries, exposing the full schema. Attackers can enumerate types, fields, and arguments.",
+                        "Disable introspection in production (e.g. set introspection: false in Apollo Server) or require authentication for the /graphql endpoint.",
+                        "active/graphql-introspection",
+                    )
+                    .with_evidence(snippet)
+                    .with_cwe(200)
+                    .with_owasp("A05:2021 – Security Misconfiguration"),
+                );
+            }
         }
 
         findings
@@ -1018,23 +1279,7 @@ impl ScanPlugin for HttpMethodsPlugin {
             }
         }
 
-        let resp = match client
-            .request(reqwest::Method::OPTIONS, &target.url)
-            .timeout(Duration::from_secs(6))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return findings,
-        };
-
-        let allow = resp
-            .headers()
-            .get("allow")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let Some(allow_value) = allow else {
+        let Some((_, Some(allow_value))) = options_response(client, &target.url).await else {
             return findings;
         };
 
@@ -1069,12 +1314,18 @@ impl ScanPlugin for HttpMethodsPlugin {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct RedirectChainPlugin {
+    insecure: bool,
     nofollow: std::sync::OnceLock<reqwest::Client>,
 }
 
 impl RedirectChainPlugin {
     pub fn new() -> Self {
+        Self::with_insecure(false)
+    }
+
+    pub fn with_insecure(insecure: bool) -> Self {
         Self {
+            insecure,
             nofollow: std::sync::OnceLock::new(),
         }
     }
@@ -1084,7 +1335,7 @@ impl RedirectChainPlugin {
             reqwest::Client::builder()
                 .timeout(Duration::from_secs(8))
                 .redirect(reqwest::redirect::Policy::none())
-                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_certs(self.insecure)
                 .user_agent("RustZAP/0.1 RedirectChain")
                 .build()
                 .expect("redirect-chain client")
@@ -1415,5 +1666,49 @@ mod tests {
         hops.push(hop("https://example.com/6", 200, None));
         let findings = analyze_redirect_chain(&hops, 5);
         assert!(findings.iter().any(|f| f.title.contains("Excessive")));
+    }
+
+    #[test]
+    fn path_segment_injection_keeps_leading_slash() {
+        let target = DiscoveredUrl::new(
+            "https://example.com/api/123/items",
+            "GET",
+            crate::types::UrlSource::Link,
+        );
+        let variants = build_injection_urls_adv(&target, "PAYLOAD");
+        let path_hit = variants
+            .iter()
+            .find(|(name, _)| name == "path_seg_1")
+            .expect("numeric path segment should be injectable");
+        let parsed = url::Url::parse(&path_hit.1).unwrap();
+        assert_eq!(parsed.path(), "/api/PAYLOAD/items");
+        assert!(parsed.as_str().starts_with("https://example.com/api/"));
+    }
+
+    #[test]
+    fn exact_plugin_filtering_isolates_sqli_from_sqli_time() {
+        let client = Arc::new(reqwest::Client::new());
+        let scanner = ActiveScanner::new(
+            client.clone(),
+            vec!["sqli".to_string()],
+            1,
+            false,
+            SafetyPolicy::default(),
+        );
+        let names = scanner.enabled_module_names();
+        assert!(names.contains(&"active/sqli".to_string()));
+        assert!(!names.contains(&"active/sqli-time".to_string()));
+        assert!(!names.contains(&"active/sqli-stacked".to_string()));
+
+        let all_sqli_scanner = ActiveScanner::new(
+            client,
+            vec!["sqli-all".to_string()],
+            1,
+            false,
+            SafetyPolicy::default(),
+        );
+        let all_names = all_sqli_scanner.enabled_module_names();
+        assert!(all_names.contains(&"active/sqli".to_string()));
+        assert!(all_names.contains(&"active/sqli-time".to_string()));
     }
 }

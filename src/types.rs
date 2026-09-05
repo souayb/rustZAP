@@ -1,6 +1,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Truncate a string to at most `max_chars` characters safely on UTF-8 character boundaries.
+pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 /// Severity levels for findings
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -10,6 +18,21 @@ pub enum Severity {
     Medium,
     High,
     Critical,
+}
+
+impl std::str::FromStr for Severity {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "info" | "informational" => Ok(Severity::Info),
+            "low" => Ok(Severity::Low),
+            "medium" | "med" => Ok(Severity::Medium),
+            "high" => Ok(Severity::High),
+            "critical" | "crit" => Ok(Severity::Critical),
+            _ => Err("unknown severity: must be info, low, medium, high, or critical"),
+        }
+    }
 }
 
 /// How much trust to place in a finding. This is what stops the scanner from
@@ -73,6 +96,18 @@ impl Severity {
     }
 }
 
+/// Proof-of-concept evidence for confirmed findings (Strix-style reproducible PoC).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PocProof {
+    pub script_type: String, // "curl" | "python"
+    pub script_content: String,
+    pub canary_sent: String,
+    pub canary_received: String,
+    pub raw_request: String,
+    pub raw_response: String,
+    pub execution_time_ms: u64,
+}
+
 /// A security finding
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
@@ -86,6 +121,10 @@ pub struct Finding {
     pub solution: String,
     pub cwe: Option<u32>,
     pub owasp_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nist_control: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disa_stig_id: Option<String>,
     pub plugin: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tool: Option<String>,
@@ -95,6 +134,8 @@ pub struct Finding {
     pub correlated_with: Vec<String>,
     #[serde(default)]
     pub poc_validated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poc: Option<PocProof>,
     /// Trust level for this finding. See `Confidence`.
     #[serde(default)]
     pub confidence: Confidence,
@@ -121,14 +162,27 @@ impl Finding {
             solution: solution.into(),
             cwe: None,
             owasp_category: None,
+            nist_control: None,
+            disa_stig_id: None,
             plugin: plugin.into(),
             source_tool: None,
             location: None,
-            correlated_with: Vec::new(),
+            correlated_with: vec![],
             poc_validated: false,
+            poc: None,
             confidence: Confidence::Firm,
             found_at: Utc::now(),
         }
+    }
+
+    pub fn with_nist(mut self, control: impl Into<String>) -> Self {
+        self.nist_control = Some(control.into());
+        self
+    }
+
+    pub fn with_disa_stig(mut self, stig_id: impl Into<String>) -> Self {
+        self.disa_stig_id = Some(stig_id.into());
+        self
     }
 
     pub fn with_source_tool(mut self, tool: impl Into<String>) -> Self {
@@ -163,6 +217,13 @@ impl Finding {
 
     pub fn with_confidence(mut self, confidence: Confidence) -> Self {
         self.confidence = confidence;
+        self
+    }
+
+    pub fn with_poc(mut self, poc: PocProof) -> Self {
+        self.poc = Some(poc);
+        self.poc_validated = true;
+        self.confidence = Confidence::Confirmed;
         self
     }
 
@@ -207,13 +268,94 @@ pub struct HttpResponse {
     pub elapsed_ms: u64,
 }
 
+/// Cached response representation for zero-network passive scanning.
+#[derive(Debug, Clone)]
+pub struct CachedResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// In-memory response cache populated during spidering.
+#[derive(Debug, Default, Clone)]
+pub struct HttpResponseCache {
+    responses:
+        std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, CachedResponse>>>,
+}
+
+impl HttpResponseCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn insert(
+        &self,
+        url: String,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    ) {
+        let mut map = self.responses.write().await;
+        map.insert(
+            url,
+            CachedResponse {
+                status,
+                headers,
+                body,
+            },
+        );
+    }
+
+    pub async fn get(&self, url: &str) -> Option<CachedResponse> {
+        let map = self.responses.read().await;
+        map.get(url).cloned()
+    }
+
+    pub async fn len(&self) -> usize {
+        let map = self.responses.read().await;
+        map.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        let map = self.responses.read().await;
+        map.is_empty()
+    }
+}
+
 /// Discovered URL with metadata
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct DiscoveredUrl {
     pub url: String,
     pub method: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default)]
     pub parameters: Vec<String>,
     pub source: UrlSource,
+}
+
+impl DiscoveredUrl {
+    pub fn new(url: impl Into<String>, method: impl Into<String>, source: UrlSource) -> Self {
+        let url_str = url.into();
+        let params = if let Ok(u) = url::Url::parse(&url_str) {
+            u.query_pairs().map(|(k, _)| k.to_string()).collect()
+        } else {
+            vec![]
+        };
+        DiscoveredUrl {
+            url: url_str,
+            method: method.into(),
+            headers: Vec::new(),
+            body: None,
+            content_type: None,
+            parameters: params,
+            source,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]

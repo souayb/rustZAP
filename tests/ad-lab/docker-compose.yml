@@ -1,0 +1,11 @@
+# Relay-vulnerable AD DC lab for validating `rustzap ad`. LAB ONLY.
+# No host port publishing — validation runs from a container on this network
+# (see ../ad-lab/validate.sh), so the DC's internal DNS (port 53) is reachable
+# for real ghost-SPN resolution without colliding with the host resolver.
+services:
+  dc:
+    build: .
+    image: rustzap-ad-lab:latest
+    hostname: dc01
+    domainname: corp.local
+    cap_add: ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
