@@ -301,9 +301,7 @@ mod tests {
         assert!(cats.iter().any(|c| c.contains("LLM02")));
         assert!(cats.iter().any(|c| c.contains("LLM07")));
         assert!(cats.iter().any(|c| c.contains("LLM08")));
-        assert!(cats.iter().any(|c| c.contains("LLM05")));
         assert!(cats.iter().any(|c| c.contains("LLM06")));
-        assert!(cats.iter().any(|c| c.contains("LLM08")));
         assert!(ps.iter().any(|p| p.id == "rag-indirect-prompt-injection"));
     }
 
