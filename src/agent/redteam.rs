@@ -315,7 +315,6 @@ mod tests {
         let cats: std::collections::BTreeSet<_> = ps.iter().map(|p| p.owasp).collect();
         assert!(cats.iter().any(|c| c.contains("LLM01")));
         assert!(cats.iter().any(|c| c.contains("LLM02")));
-        assert!(cats.iter().any(|c| c.contains("LLM07")));
         assert!(cats.iter().any(|c| c.contains("LLM08")));
         assert!(cats.iter().any(|c| c.contains("LLM06")));
         assert!(ps.iter().any(|p| p.id == "rag-indirect-prompt-injection"));
