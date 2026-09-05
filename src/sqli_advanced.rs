@@ -92,11 +92,11 @@ impl ScanPlugin for SqliErrorPlugin {
             ("1/0", &["division by zero", "ORA-01476"]),
             (
                 "' ORDER BY 1-- -",
-                &["unknown column", "order by", "invalid column", "ORA-"],
+                &["unknown column '1'", "invalid column name", "ORA-009"],
             ),
             (
                 "' HAVING 1=1-- -",
-                &["group", "having", "unknown column", "ORA-"],
+                &["invalid column name", "ORA-009", "SQLSTATE[42"],
             ),
             ("1 EXEC xp_", &["xp_cmdshell", "xp_regread", "xp_enumdsn"]),
             (
