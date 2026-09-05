@@ -125,6 +125,8 @@ pub struct LlmBrain {
     messages: Vec<Value>,
     /// Privacy tokenization gateway (no-op unless seeded/enabled).
     vault: Vault,
+    total_tokens: u64,
+    max_tokens: Option<u64>,
 }
 
 impl LlmBrain {
@@ -153,7 +155,20 @@ impl LlmBrain {
             json_mode,
             messages,
             vault,
+            total_tokens: 0,
+            max_tokens: None,
         }
+    }
+
+    pub fn with_token_budget(mut self, budget: u64) -> Self {
+        if budget > 0 {
+            self.max_tokens = Some(budget);
+        }
+        self
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.total_tokens
     }
 }
 
@@ -215,6 +230,25 @@ impl AgentBrain for LlmBrain {
         let user = self.vault.tokenize(&user);
         self.messages.push(json!({"role": "user", "content": user}));
 
+        // Context token estimation before dispatching
+        let prompt_chars: usize = self
+            .messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .map(|s| s.len())
+            .sum();
+        let est_prompt_tokens = (prompt_chars / 4) as u64;
+        if let Some(limit) = self.max_tokens {
+            if self.total_tokens + est_prompt_tokens >= limit {
+                return Ok(AgentAction::Finish {
+                    summary: format!(
+                        "LLM token budget exhausted before request (used {} + prompt est {} >= limit {})",
+                        self.total_tokens, est_prompt_tokens, limit
+                    ),
+                });
+            }
+        }
+
         let mut body = json!({
             "model": self.model,
             "messages": self.messages,
@@ -237,12 +271,33 @@ impl AgentBrain for LlmBrain {
             );
         }
         let content = extract_content(&text).unwrap_or_default();
+        let tokens_used = extract_tokens(&text).unwrap_or((text.len() / 4) as u64);
+        self.total_tokens += tokens_used;
+
         self.messages
             .push(json!({"role": "assistant", "content": content}));
+
+        if let Some(limit) = self.max_tokens {
+            if self.total_tokens >= limit {
+                return Ok(AgentAction::Finish {
+                    summary: format!(
+                        "LLM token budget exhausted (used {} >= limit {})",
+                        self.total_tokens, limit
+                    ),
+                });
+            }
+        }
+
         // The model works in placeholder space; restore real values before the
         // loop executes the tool or records the summary.
         Ok(self.vault.detokenize_action(parse_action(&content)))
     }
+}
+
+/// Pull `usage.total_tokens` out of a chat-completions response.
+fn extract_tokens(resp_body: &str) -> Option<u64> {
+    let v: Value = serde_json::from_str(resp_body).ok()?;
+    v.get("usage")?.get("total_tokens")?.as_u64()
 }
 
 /// Pull `choices[0].message.content` out of a chat-completions response.

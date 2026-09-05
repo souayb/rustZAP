@@ -14,13 +14,14 @@ use crate::safety::{HttpSafetyGate, SafetyPolicy};
 use crate::types::{DiscoveredUrl, Finding, Severity};
 
 /// Process-wide gate for active plugin HTTP helpers (`get_response_body`).
-/// Set for the duration of `ActiveScanner::scan_all`.
+/// Set for the duration of `ActiveScanner::scan_all` or agent `run_plugin`.
 static ACTIVE_GATE: std::sync::Mutex<Option<Arc<HttpSafetyGate>>> = std::sync::Mutex::new(None);
 
-fn install_active_gate(gate: Arc<HttpSafetyGate>) {
+pub(crate) fn install_active_gate(gate: Arc<HttpSafetyGate>) -> ActiveGateGuard {
     if let Ok(mut g) = ACTIVE_GATE.lock() {
         *g = Some(gate);
     }
+    ActiveGateGuard
 }
 
 fn clear_active_gate() {
@@ -33,7 +34,7 @@ fn active_gate() -> Option<Arc<HttpSafetyGate>> {
     ACTIVE_GATE.lock().ok().and_then(|g| g.clone())
 }
 
-struct ActiveGateGuard;
+pub(crate) struct ActiveGateGuard;
 impl Drop for ActiveGateGuard {
     fn drop(&mut self) {
         clear_active_gate();
@@ -113,9 +114,13 @@ impl ActiveScanner {
             .into_iter()
             .filter(|p| {
                 let name = p.name().to_lowercase();
-                enabled
-                    .iter()
-                    .any(|e| name.contains(&e.to_lowercase()) || e == "all")
+                enabled.iter().any(|e| {
+                    let el = e.trim().to_lowercase();
+                    el == "all"
+                        || name == el
+                        || (el == "sqli-all" && name.starts_with("sqli"))
+                        || (el == "sqli" && (name == "sqli" || name == "sqli-error"))
+                })
             })
             .collect();
 
@@ -141,8 +146,7 @@ impl ActiveScanner {
     pub async fn scan_all(&self, urls: &[DiscoveredUrl], pb: &ProgressBar) -> Result<Vec<Finding>> {
         use futures::stream::{self, StreamExt};
 
-        install_active_gate(self.gate.clone());
-        let _clear = ActiveGateGuard;
+        let _clear = install_active_gate(self.gate.clone());
 
         let mut tasks = Vec::new();
         let mut remaining = vec![0usize; urls.len()];
@@ -302,17 +306,39 @@ pub async fn get_body(client: &reqwest::Client, url: &str) -> Option<(u16, Strin
 }
 
 pub async fn timed_get(client: &reqwest::Client, url: &str) -> (u64, bool) {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("GET", url, None).await.is_err() {
+            return (0, false);
+        }
+    }
     let t = std::time::Instant::now();
-    let ok = client
-        .get(url)
-        .send()
-        .await
-        .map(|r| r.status().as_u16() < 600)
-        .unwrap_or(false);
-    (t.elapsed().as_millis() as u64, ok)
+    let res = client.get(url).send().await;
+    let elapsed = t.elapsed().as_millis() as u64;
+    let (status, ok) = match res {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            (status, status < 600)
+        }
+        Err(_) => (0, false),
+    };
+    if let Some(gate) = active_gate() {
+        if status > 0 {
+            let _ = gate.after_response(status, elapsed);
+        }
+    }
+    (elapsed, ok)
 }
 
 async fn get_response_body(client: &reqwest::Client, url: &str) -> Option<(u16, String)> {
+    get_response_details(client, url)
+        .await
+        .map(|(status, _, body)| (status, body))
+}
+
+async fn get_response_details(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<(u16, Option<String>, String)> {
     if let Some(gate) = active_gate() {
         if gate.before_url_request("GET", url, None).await.is_err() {
             return None;
@@ -322,12 +348,17 @@ async fn get_response_body(client: &reqwest::Client, url: &str) -> Option<(u16, 
     match client.get(url).timeout(Duration::from_secs(8)).send().await {
         Ok(r) => {
             let status = r.status().as_u16();
+            let ct = r
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let body = r.text().await.unwrap_or_default();
             let latency = start.elapsed().as_millis() as u64;
             if let Some(gate) = active_gate() {
                 let _ = gate.after_response(status, latency);
             }
-            Some((status, body))
+            Some((status, ct, body))
         }
         Err(_) => None,
     }
@@ -469,7 +500,19 @@ impl ScanPlugin for XssPlugin {
         for (payload, raw_marker) in &breakouts {
             let variants = build_injection_urls_adv(target, payload);
             for (param, url) in variants {
-                if let Some((_, body)) = get_response_body(client, &url).await {
+                if let Some((_, ct, body)) = get_response_details(client, &url).await {
+                    if let Some(ref ctype) = ct {
+                        let cl = ctype.to_lowercase();
+                        if cl.contains("application/json")
+                            || cl.contains("application/pdf")
+                            || cl.contains("text/plain")
+                            || cl.contains("text/css")
+                            || cl.contains("text/javascript")
+                            || cl.contains("application/javascript")
+                        {
+                            continue;
+                        }
+                    }
                     if crate::verify::reflected_raw(&body, raw_marker) {
                         let snippet: String = body.chars().take(500).collect();
                         findings.push(
@@ -843,29 +886,70 @@ impl ScanPlugin for XxePlugin {
             return findings;
         }
 
-        let xxe_payload = r#"<?xml version="1.0" encoding="UTF-8"?>
+        let benign_xml =
+            r#"<?xml version="1.0" encoding="UTF-8"?><root><param>rustzap_baseline</param></root>"#;
+        if let Some((_, base_body)) =
+            post_response_body(client, &target.url, "application/xml", benign_xml).await
+        {
+            if base_body.contains("root:x:0:0:") {
+                // Baseline already contains the target string (static documentation/reflection); abort to prevent FP.
+                return findings;
+            }
+        }
+
+        let canary = format!("rz_xxe_{}", &crate::types::uuid_v4()[..8]);
+        let entity_canary_payload = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE foo [<!ENTITY xxe \"{}\">\n]><root><param>&xxe;</param></root>",
+            canary
+        );
+
+        let entity_expanded = match post_response_body(
+            client,
+            &target.url,
+            "application/xml",
+            &entity_canary_payload,
+        )
+        .await
+        {
+            Some((_, body)) => body.contains(&canary),
+            None => false,
+        };
+
+        let xxe_system_payload = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
 <root><param>&xxe;</param></root>"#;
 
-        if let Some((_, body)) =
-            post_response_body(client, &target.url, "application/xml", xxe_payload).await
-        {
-            if body.contains("root:x:0:0:") {
-                findings.push(
-                    Finding::new(
-                        "XML External Entity (XXE) Injection",
-                        Severity::Critical,
-                        &target.url,
-                        "The XML parser processes external entity declarations, enabling file read, SSRF, and denial of service.",
-                        "Disable external entity processing in your XML parser. Use a JSON API where possible.",
-                        "active/xxe",
-                    )
-                    .with_evidence("XXE payload successfully read /etc/passwd (root:x:0:0: present in response)".to_string())
-                    .with_cwe(611)
-                    .with_owasp("A03:2021 – Injection")
-                    .confirmed(),
-                );
-            }
+        let system_read =
+            match post_response_body(client, &target.url, "application/xml", xxe_system_payload)
+                .await
+            {
+                Some((_, body)) => body.contains("root:x:0:0:"),
+                None => false,
+            };
+
+        if system_read || entity_expanded {
+            let evidence = if system_read {
+                "XXE payload successfully read /etc/passwd (root:x:0:0: verified present in response)".to_string()
+            } else {
+                format!(
+                    "XML parser expanded dynamic DTD entity canary token `{}` into response body",
+                    canary
+                )
+            };
+            findings.push(
+                Finding::new(
+                    "XML External Entity (XXE) Injection",
+                    Severity::Critical,
+                    &target.url,
+                    "The XML parser processes external entity declarations, enabling file read, SSRF, and denial of service.",
+                    "Disable external entity processing in your XML parser. Use a JSON API where possible.",
+                    "active/xxe",
+                )
+                .with_evidence(evidence)
+                .with_cwe(611)
+                .with_owasp("A03:2021 – Injection")
+                .confirmed(),
+            );
         }
 
         findings
@@ -1599,5 +1683,32 @@ mod tests {
         let parsed = url::Url::parse(&path_hit.1).unwrap();
         assert_eq!(parsed.path(), "/api/PAYLOAD/items");
         assert!(parsed.as_str().starts_with("https://example.com/api/"));
+    }
+
+    #[test]
+    fn exact_plugin_filtering_isolates_sqli_from_sqli_time() {
+        let client = Arc::new(reqwest::Client::new());
+        let scanner = ActiveScanner::new(
+            client.clone(),
+            vec!["sqli".to_string()],
+            1,
+            false,
+            SafetyPolicy::default(),
+        );
+        let names = scanner.enabled_module_names();
+        assert!(names.contains(&"active/sqli".to_string()));
+        assert!(!names.contains(&"active/sqli-time".to_string()));
+        assert!(!names.contains(&"active/sqli-stacked".to_string()));
+
+        let all_sqli_scanner = ActiveScanner::new(
+            client,
+            vec!["sqli-all".to_string()],
+            1,
+            false,
+            SafetyPolicy::default(),
+        );
+        let all_names = all_sqli_scanner.enabled_module_names();
+        assert!(all_names.contains(&"active/sqli".to_string()));
+        assert!(all_names.contains(&"active/sqli-time".to_string()));
     }
 }

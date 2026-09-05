@@ -140,17 +140,16 @@ impl LdapDirectory for LiveDirectory {
     }
 
     async fn ldap_posture(&self, host: &str) -> Result<LdapPosture> {
-        // Fresh unauthenticated-transport simple bind against :389 to read the
-        // signing-requirement result code. Channel binding needs an LDAPS
-        // differential probe (staged) → Unknown for now.
+        // Unauthenticated anonymous bind against :389 to read the
+        // signing/security requirement result code without exposing
+        // configured production credentials over plaintext transport.
         let url = format!("ldap://{host}:389");
         let settings = LdapConnSettings::new().set_conn_timeout(Duration::from_secs(8));
         let signing = match LdapConnAsync::with_settings(settings, &url).await {
             Ok((conn, mut ldap)) => {
                 ldap3::drive!(conn);
-                let dn = self.bind_dn.clone().unwrap_or_default();
-                let pw = self.password.clone().unwrap_or_default();
-                match ldap.simple_bind(&dn, &pw).await {
+                // Prohibit transmitting configured credentials over unencrypted LDAP.
+                match ldap.simple_bind("", "").await {
                     Ok(res) => posture_from_bind_rc(res.rc),
                     Err(_) => Protection::Unknown,
                 }

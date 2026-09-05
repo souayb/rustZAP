@@ -61,8 +61,11 @@ impl ToolCtx {
     pub fn with_safety(
         scope: Arc<ScopeConfig>,
         trace: Arc<Trace>,
-        safety: crate::safety::SafetyPolicy,
+        mut safety: crate::safety::SafetyPolicy,
     ) -> Result<Self> {
+        if scope.max_requests_per_min > 0 {
+            safety.max_rps = (scope.max_requests_per_min / 60).max(1);
+        }
         let client = scanner::build_client(&default_scan_config("http://placeholder.invalid"))?;
         Ok(Self {
             scope,
@@ -131,7 +134,7 @@ impl ToolCtx {
         self.enforce_scope(url)?;
         self.charge_request()?;
         self.gate
-            .before_request(method, body.as_deref())
+            .before_url_request(method, url, body.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let m = reqwest::Method::from_bytes(method.as_bytes())
@@ -148,6 +151,8 @@ impl ToolCtx {
         }
         let start = Instant::now();
         let resp = req.send().await?;
+        let final_url = resp.url().as_str().to_string();
+        self.enforce_scope(&final_url)?;
         let status = resp.status().as_u16();
         let resp_headers: Vec<(String, String)> = resp
             .headers()
@@ -442,19 +447,31 @@ async fn scan_target(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     config.plugins = plugins.split(',').map(|s| s.trim().to_string()).collect();
     config.safety = ctx.gate.policy.clone();
 
+    ctx.charge_request()?;
     let collected = scanner::collect_scan(config).await?;
+    let in_scope_discovered: Vec<DiscoveredUrl> = collected
+        .discovered
+        .into_iter()
+        .filter(|d| ctx.scope.check_url(&d.url).is_allowed())
+        .collect();
+    let in_scope_findings: Vec<Finding> = collected
+        .findings
+        .into_iter()
+        .filter(|f| ctx.scope.check_url(&f.url).is_allowed())
+        .collect();
+
     let value = json!({
         "target": target,
-        "findings": summarize_findings(&collected.findings),
-        "discovered_urls": collected.discovered.len(),
+        "findings": summarize_findings(&in_scope_findings),
+        "discovered_urls": in_scope_discovered.len(),
         "modules": collected.modules.iter().map(|m| json!({
             "name": m.name, "findings": m.findings, "quiet": m.quiet
         })).collect::<Vec<_>>(),
     });
     Ok(ToolOutput {
         value,
-        findings: collected.findings,
-        discovered: collected.discovered,
+        findings: in_scope_findings,
+        discovered: in_scope_discovered,
         ..Default::default()
     })
 }
@@ -590,6 +607,7 @@ async fn run_plugin(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         parameters,
         source: UrlSource::Seed,
     };
+    let _gate_guard = crate::active::install_active_gate(ctx.gate.clone());
     let findings = plugin.scan(&ctx.client, &du).await;
     let value = json!({
         "plugin": plugin_name,
@@ -852,7 +870,7 @@ async fn spawn_subtask(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
                 .push(json!({"step": i, "tool": tool, "error": "nested subtasks are not allowed"}));
             continue;
         }
-        if action_class_of(tool) != ActionClass::Recon {
+        if effective_action_class(tool, &sargs) != ActionClass::Recon {
             results.push(json!({"step": i, "tool": tool, "error": "sub-tasks may only call recon-class tools"}));
             continue;
         }
@@ -1189,6 +1207,7 @@ mod tests {
             &json!({
                 "steps": [
                     { "tool": "ai_redteam", "args": { "endpoint": "http://127.0.0.1/v1" } },
+                    { "tool": "http_probe", "args": { "url": "http://127.0.0.1/api", "method": "POST" } },
                     { "tool": "spawn_subtask", "args": { "steps": [] } }
                 ]
             }),
@@ -1197,13 +1216,17 @@ mod tests {
         .await
         .unwrap();
 
-        // Both steps are rejected before any request is made → no findings.
+        // All steps are rejected before any request is made → no findings.
         assert!(out.findings.is_empty());
         assert!(out.value["results"][0]["error"]
             .as_str()
             .unwrap()
             .contains("recon-class"));
         assert!(out.value["results"][1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("recon-class"));
+        assert!(out.value["results"][2]["error"]
             .as_str()
             .unwrap()
             .contains("nested"));

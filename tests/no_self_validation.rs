@@ -163,3 +163,66 @@ async fn xss_is_reported_on_raw_reflection() {
     assert!(findings[0].poc_validated);
     assert_eq!(findings[0].confidence, Confidence::Confirmed);
 }
+
+#[tokio::test]
+async fn xss_does_not_self_validate_on_json_content_type() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let val = req
+                    .split("q=")
+                    .nth(1)
+                    .and_then(|s| s.split([' ', '&']).next())
+                    .unwrap_or("");
+                let decoded = val
+                    .replace("%3C", "<")
+                    .replace("%3E", ">")
+                    .replace("%2F", "/")
+                    .replace("%22", "\"")
+                    .replace("%27", "'")
+                    .replace("%3D", "=")
+                    .replace("%28", "(")
+                    .replace("%29", ")");
+                let body = format!("{{\"query\": \"{}\"}}", decoded);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    let url = format!("http://{}/api/search?q=1", addr);
+    let findings = XssPlugin.scan(&client(), &du(&url)).await;
+    assert!(
+        findings.is_empty(),
+        "JSON response reflection must NOT be flagged as XSS, got: {:?}",
+        findings.iter().map(|f| &f.title).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn xxe_does_not_flag_on_static_baseline_echo() {
+    // App statically returns "root:x:0:0:" on all requests (e.g. documentation page).
+    // The differential baseline check MUST prevent this from being falsely flagged.
+    let base = serve(|_| "root:x:0:0:root:/root:/bin/bash".to_string()).await;
+    let url = format!("{}/xml", base);
+    let mut target = du(&url);
+    target.method = "POST".to_string();
+    let findings = rustzap::active::XxePlugin.scan(&client(), &target).await;
+    assert!(
+        findings.is_empty(),
+        "Static /etc/passwd in baseline must NOT trigger confirmed XXE, got: {:?}",
+        findings.iter().map(|f| &f.title).collect::<Vec<_>>()
+    );
+}

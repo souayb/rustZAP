@@ -63,15 +63,17 @@ pub fn parse_openapi_json(json: &str, target: &str) -> Result<(Vec<DiscoveredUrl
                 break 'ops;
             }
             let params = collect_param_names(item_obj.get("parameters"), op.get("parameters"));
+            let headers = extract_headers(item_obj.get("parameters"), op.get("parameters"));
+            let (content_type, body) = extract_body_and_ct(op);
             let concrete = materialize_path(path_tmpl, &params);
             let joined = join_target_path(&base, &concrete)?;
             let url = append_query_placeholders(&joined, &params);
             out.push(DiscoveredUrl {
                 url,
                 method: method.to_ascii_uppercase(),
-                headers: Vec::new(),
-                body: None,
-                content_type: None,
+                headers,
+                body,
+                content_type,
                 parameters: params,
                 source: UrlSource::OpenApi,
             });
@@ -109,6 +111,66 @@ fn collect_param_names(path_level: Option<&Value>, op_level: Option<&Value>) -> 
         }
     }
     names
+}
+
+fn extract_headers(path_level: Option<&Value>, op_level: Option<&Value>) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    for block in [path_level, op_level].into_iter().flatten() {
+        let Some(arr) = block.as_array() else {
+            continue;
+        };
+        for p in arr {
+            if p.get("in").and_then(|i| i.as_str()) == Some("header") {
+                if let Some(name) = p.get("name").and_then(|n| n.as_str()) {
+                    let val = p
+                        .get("example")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("test_header_val");
+                    headers.push((name.to_string(), val.to_string()));
+                }
+            }
+        }
+    }
+    headers
+}
+
+fn extract_body_and_ct(op: &Value) -> (Option<String>, Option<String>) {
+    let Some(rb) = op.get("requestBody") else {
+        return (None, None);
+    };
+    let Some(content) = rb.get("content").and_then(|c| c.as_object()) else {
+        return (None, None);
+    };
+    if let Some(json_content) = content.get("application/json") {
+        let ct = Some("application/json".to_string());
+        let body = if let Some(ex) = json_content.get("example") {
+            Some(ex.to_string())
+        } else if let Some(props) = json_content
+            .get("schema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.as_object())
+        {
+            let mut sample = serde_json::Map::new();
+            for (k, v) in props {
+                let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+                let sample_val = match typ {
+                    "integer" | "number" => serde_json::json!(1),
+                    "boolean" => serde_json::json!(true),
+                    _ => serde_json::json!("test"),
+                };
+                sample.insert(k.clone(), sample_val);
+            }
+            Some(Value::Object(sample).to_string())
+        } else {
+            Some("{}".to_string())
+        };
+        return (ct, body);
+    }
+    if content.get("application/x-www-form-urlencoded").is_some() {
+        let ct = Some("application/x-www-form-urlencoded".to_string());
+        return (ct, Some("param=test".to_string()));
+    }
+    (None, None)
 }
 
 fn materialize_path(tmpl: &str, params: &[String]) -> String {

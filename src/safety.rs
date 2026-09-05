@@ -52,6 +52,21 @@ impl SafetyPolicy {
         }
     }
 
+    /// Operational Technology (OT / SCADA / Industrial Control System) safe profile.
+    /// Strictly read-only, ultra-low rate (5 RPS), strict latency thresholds (2s abort),
+    /// and immediate circuit breaker on any 5xx error (1% threshold) to prevent
+    /// disruption to fragile embedded devices and PLCs.
+    pub fn ot_safe_profile() -> Self {
+        Self {
+            read_only_safe: true,
+            attack_mode: false,
+            max_rps: 5,
+            latency_throttle_threshold_ms: 500,
+            latency_abort_threshold_ms: 2000,
+            max_error_rate: 0.01,
+        }
+    }
+
     /// Build a policy from CLI flags. `--attack` wins over defaults; `--read-only-safe`
     /// and `--max-rps` still apply on top when set.
     pub fn from_flags(attack: bool, read_only_safe: bool, max_rps: Option<u32>) -> Self {

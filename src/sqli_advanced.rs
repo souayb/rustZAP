@@ -11,7 +11,7 @@
 ///   8.  WAF bypass            — comment, case, encoding, whitespace variants
 ///   9.  NoSQL injection       — MongoDB operator injection ($where, $ne, $gt)
 ///  10.  DB fingerprinting     — identify MySQL / PostgreSQL / MSSQL / Oracle / SQLite
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -284,8 +284,8 @@ impl ScanPlugin for SqliTimePlugin {
                 "1 AND 1=(SELECT COUNT(*) FROM ALL_OBJECTS WHERE ROWNUM<100000)",
                 "Oracle",
             ),
-            // SQLite
-            (&format!("1 AND randomblob({})", 100_000_000u64), "SQLite"),
+            // SQLite (safe bounded allocation for timing detection)
+            (&format!("1 AND randomblob({})", 5_000_000u64), "SQLite"),
         ];
 
         // We need a client with a longer timeout for sleep detection
@@ -295,11 +295,7 @@ impl ScanPlugin for SqliTimePlugin {
             .unwrap_or_else(|_| client.clone());
 
         // Baseline latency
-        let baseline_ms = {
-            let t = Instant::now();
-            let _ = long_client.get(&target.url).send().await;
-            t.elapsed().as_millis() as u64
-        };
+        let (baseline_ms, _) = timed_get(&long_client, &target.url).await;
 
         for (payload, db_label) in payloads {
             let variants = build_injection_urls_adv(target, payload);
@@ -442,11 +438,7 @@ impl ScanPlugin for SqliStackedPlugin {
             .build()
             .unwrap_or_else(|_| client.clone());
 
-        let baseline_ms = {
-            let t = Instant::now();
-            let _ = long_client.get(&target.url).send().await;
-            t.elapsed().as_millis() as u64
-        };
+        let (baseline_ms, _) = timed_get(&long_client, &target.url).await;
 
         for (payload, label) in payloads {
             let variants = build_injection_urls_adv(target, payload);

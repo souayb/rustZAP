@@ -216,7 +216,25 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
         let cap_path = captures_path(&cfg.output);
         match serde_json::to_string_pretty(&captures) {
             Ok(js) => {
-                if let Err(e) = std::fs::write(&cap_path, js) {
+                let write_res = {
+                    #[cfg(unix)]
+                    {
+                        use std::io::Write;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(0o600)
+                            .open(&cap_path)
+                            .and_then(|mut f| f.write_all(js.as_bytes()).and_then(|_| f.flush()))
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::fs::write(&cap_path, js)
+                    }
+                };
+                if let Err(e) = write_res {
                     trace.note("captures_error", format!("{cap_path}: {e}"));
                 } else {
                     trace.note(
@@ -416,9 +434,11 @@ pub async fn run_agent_cli(
         let json_mode = llm.json_mode || scope.model.json_mode;
         let privacy_on = llm.privacy || scope.privacy;
         let vault = build_vault(privacy_on, &scope.allowed_hosts, target.as_deref());
-        Box::new(LlmBrain::with_vault(
-            &base, &model, api_key, json_mode, vault,
-        ))
+        let max_tokens = scope.budget.max_tokens;
+        Box::new(
+            LlmBrain::with_vault(&base, &model, api_key, json_mode, vault)
+                .with_token_budget(max_tokens),
+        )
     };
 
     let goal = goal.unwrap_or_else(|| {
