@@ -47,3 +47,5 @@ public_repos/
 # Draft / local notes
 FEATURES.md
 CHANGELOG.md
+node_modules/
+vscode-extension/out/

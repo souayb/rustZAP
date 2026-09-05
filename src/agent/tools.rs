@@ -268,7 +268,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ai_redteam",
-            description: "Run the OWASP LLM Top-10 red-team battery (prompt injection, insecure output handling, system-prompt leakage, excessive agency) against an in-scope OpenAI-compatible chat endpoint. Intrusive — requires approval.",
+            description: "Run the OWASP LLM/RAG red-team battery (prompt injection, insecure output, leakage, agency, indirect retrieved-content injection, tenant/filter canaries, deletion retention) against an in-scope OpenAI-compatible chat endpoint. Vector/RAG results are heuristic unless synthetic canaries are seeded and authorization context is verified. Intrusive — requires approval.",
             action_class: ActionClass::Exploit,
             input_schema: json!({
                 "type": "object",
@@ -279,6 +279,19 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "system_marker": {"type": "string", "description": "A phrase known to be in the target's system prompt; enables leak detection"}
                 },
                 "required": ["endpoint"]
+            }),
+        },
+        ToolSpec {
+            name: "vector_probes",
+            description: "Generate bounded provider-aware synthetic-canary RAG/vector probes for Pinecone, Qdrant, Weaviate, Milvus, or pgvector. Generation is offline; execute returned requests only through an in-scope transport against a test tenant/index.",
+            action_class: ActionClass::Recon,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "provider": {"type": "string", "enum": ["pinecone", "qdrant", "weaviate", "milvus", "pgvector"]},
+                    "canary": {"type": "string", "description": "Synthetic marker seeded in a disposable test document"}
+                },
+                "required": ["provider", "canary"]
             }),
         },
         ToolSpec {
@@ -351,6 +364,7 @@ pub async fn execute(name: &str, args: &Value, ctx: &ToolCtx) -> Result<ToolOutp
         "list_captures" => Ok(list_captures_tool(ctx)),
         "replay_request" => replay_request(args, ctx).await,
         "ai_redteam" => ai_redteam(args, ctx).await,
+        "vector_probes" => vector_probes(args),
         "spawn_subtask" => spawn_subtask(args, ctx).await,
         other => bail!("unknown tool: {other}"),
     }
@@ -361,6 +375,29 @@ fn arg_str(args: &Value, key: &str) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("missing required string argument '{key}'"))
+}
+
+fn vector_probes(args: &Value) -> Result<ToolOutput> {
+    let provider = crate::agent::vector::Provider::parse(&arg_str(args, "provider")?)
+        .ok_or_else(|| anyhow::anyhow!("unsupported vector provider"))?;
+    let canary = arg_str(args, "canary")?;
+    if canary.is_empty() || canary.len() > 128 || canary.chars().any(char::is_control) {
+        bail!("canary must be 1-128 printable characters");
+    }
+    let probes = crate::agent::vector::probes(provider, &canary);
+    Ok(ToolOutput::value_only(json!({
+        "provider": format!("{:?}", provider).to_ascii_lowercase(),
+        "canary": canary,
+        "execution": "offline_generation_only",
+        "probes": probes.iter().map(|p| json!({
+            "id": p.id,
+            "category": p.category,
+            "method": p.method,
+            "path_suffix": p.path_suffix,
+            "body": p.body,
+            "canary": p.canary,
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 async fn scan_target(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {

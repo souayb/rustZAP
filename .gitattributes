@@ -8,3 +8,5 @@ scripts/**/*.cmd text eol=crlf
 
 # Packaging scripts that Windows tools consume
 *.iss text eol=crlf
+node_modules
+node_modules/**

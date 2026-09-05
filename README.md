@@ -559,6 +559,22 @@ rustzap agent --scope scope.yaml --target http://localhost:3000 \
   --autonomy semi --privacy
 ```
 
+### Safety profiles
+
+Scans can select a named safety envelope. The default profile keeps the normal
+web-assessment behavior; `ot-safe` is a low-rate, read-only profile for fragile
+SCADA/ICS-adjacent services. Explicit `--attack`, `--read-only-safe`, and
+`--max-rps` options remain available for authorized staging and lab tests.
+
+```bash
+rustzap scan --target https://staging.example --profile default
+rustzap scan --target https://plant-staging.example --profile ot-safe --plugins xss,sqli
+```
+
+`ot-safe` is a transport safety envelope, not an OT certification. Obtain asset
+owner approval and test on representative staging systems before scanning live
+control networks.
+
 CLI flags override the scope file (`--model`, `--base-url`, `--api-key-env`,
 `--json-mode`, `--autonomy`, `--privacy`). The brain speaks a portable
 one-JSON-action-per-turn protocol, so any OpenAI-compatible gateway works
@@ -592,6 +608,9 @@ available to both the native brain and MCP clients:
 | `replay_request` | recon | Re-send a captured request with mutations (method/url/body/headers) + diff |
 | `spawn_subtask` | recon | Delegate a focused plan of recon calls to a bounded sub-agent; findings merge up |
 | `ai_redteam` | **exploit** | OWASP LLM Top-10 battery against an in-scope chat endpoint (gated by approval) |
+| `export_autofix` | recon | Write remediation prompt `.md` files for findings with locations |
+| `ai_redteam` | **exploit** | OWASP LLM Top-10 battery against an in-scope chat endpoint |
+| `vector_probes` | recon | Generate bounded synthetic-canary probes for Pinecone, Qdrant, Weaviate, Milvus, or pgvector (offline only) |
 
 ### Capture / replay
 
@@ -703,6 +722,14 @@ the `rustzap mcp` command; the server advertises the tools above via
 > relative to the baseline* (or a reflection survives **unencoded**). Every
 > finding carries a `confidence` (`tentative` / `firm` / `confirmed`) and a
 > `poc_validated` flag in JSON, CSV, and HTML output. See `src/verify.rs`.
+
+The SQLi family covers error, boolean-blind, time-blind, UNION, stacked,
+second-order, WAF-obfuscated, OOB, fingerprinting, and NoSQL operator probes.
+Database-specific variants include MySQL, PostgreSQL, SQL Server, Oracle, and
+SQLite comments, conditional expressions, timing functions, string/hex forms,
+`ORDER BY`/`HAVING` discovery, and encoded payloads. Heavy timing, stacked,
+OOB, and state-changing probes should be selected explicitly for an authorized
+staging or lab target.
 
 | Plugin | Vuln | OWASP | CWE |
 |---|---|---|---|

