@@ -80,18 +80,6 @@ enum Commands {
         /// Opt-in: run passive checks on non-GET discovered requests too
         #[arg(long)]
         passive_all_methods: bool,
-        /// Block mutating HTTP verbs (POST/PUT/DELETE/PATCH) during active scan
-        #[arg(long)]
-        read_only_safe: bool,
-        /// Cap outbound HTTP requests per second (0 = unlimited). Default 50.
-        #[arg(long)]
-        max_rps: Option<u32>,
-        /// Safety profile: default or ot-safe (low-rate, read-only, fast-abort).
-        #[arg(long, default_value = "default")]
-        profile: String,
-        /// Exit with non-zero status code if findings at or above this severity are detected (info, low, medium, high, critical)
-        #[arg(long, value_name = "SEVERITY")]
-        fail_on: Option<String>,
     },
 
     /// Run spider only
@@ -494,34 +482,7 @@ async fn main() -> anyhow::Result<()> {
             nuclei_jsonl,
             active_all_paths,
             passive_all_methods,
-            attack,
-            read_only_safe,
-            max_rps,
-            profile,
-            fail_on,
         } => {
-            if attack && !read_only_safe {
-                safety::print_attack_mode_warning(&target);
-            }
-            let mut policy = safety::SafetyPolicy::from_profile(&profile)?;
-            if attack || read_only_safe || max_rps.is_some() {
-                let override_policy =
-                    safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps);
-                if attack {
-                    policy.attack_mode = true;
-                    policy.read_only_safe = false;
-                }
-                if read_only_safe {
-                    policy.read_only_safe = true;
-                    policy.attack_mode = false;
-                }
-                if let Some(rps) = max_rps {
-                    policy.max_rps = rps;
-                }
-                if !attack && !read_only_safe && max_rps.is_none() {
-                    policy = override_policy;
-                }
-            }
             let config = ScanConfig {
                 target_url: target,
                 max_depth: depth,
@@ -544,7 +505,6 @@ async fn main() -> anyhow::Result<()> {
                 nuclei_jsonl,
                 active_all_paths,
                 passive_all_methods,
-                safety: policy,
             };
             scanner::run_scan(config).await?;
         }
