@@ -1187,7 +1187,12 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
         }
         _ => match app.tab {
-            Tab::Dashboard => {}
+            Tab::Dashboard => match code {
+                KeyCode::Char('f') | KeyCode::Enter => app.tab = Tab::Findings,
+                KeyCode::Char('s') => app.tab = Tab::Scan,
+                KeyCode::Char('l') => app.tab = Tab::Logs,
+                _ => {}
+            },
             Tab::Scan => handle_scan_keys(app, code),
             Tab::Findings => handle_findings_keys(app, code),
             Tab::Tools => handle_tools_keys(app, code),
@@ -1594,6 +1599,19 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
     .block(Block::default().borders(Borders::ALL).title(" Risk Score "))
     .alignment(Alignment::Center);
     f.render_widget(score_card, cards[1]);
+    let score_gauge = Gauge::default()
+        .gauge_style(Style::default().fg(score_color))
+        .ratio(f64::from(score) / 100.0)
+        .label(format!("{}%", score));
+    let gauge_area = Rect {
+        x: cards[1].x + 2,
+        y: cards[1].y + cards[1].height.saturating_sub(2),
+        width: cards[1].width.saturating_sub(4),
+        height: 1,
+    };
+    if gauge_area.width > 4 {
+        f.render_widget(score_gauge, gauge_area);
+    }
 
     let status_text = if app.analyze_status.is_running() {
         match &app.analyze_status {
@@ -2291,7 +2309,9 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.tab {
-        Tab::Dashboard => "1-7/Tab: switch · a: analyze · q: quit",
+        Tab::Dashboard => {
+            "f/Enter: findings · s: scan · l: logs · a: analyze · Tab: switch · q: quit"
+        }
         Tab::Scan => "t/P/o: edit · p/i: toggle · +/-/[/]: tune · s: start · x: cancel",
         Tab::Findings => {
             "j/k: nav · Enter/Space: fold · o: open-all · O: close-all · f: filter · c: clear"

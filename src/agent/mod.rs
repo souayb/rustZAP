@@ -14,6 +14,7 @@ pub mod scope;
 pub mod shield;
 pub mod tools;
 pub mod trace;
+pub mod vector;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;

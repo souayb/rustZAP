@@ -40,6 +40,16 @@ impl Default for SafetyPolicy {
 }
 
 impl SafetyPolicy {
+    /// Resolve a named operational profile. Profiles intentionally preserve
+    /// explicit attack capability; they only change the default safety envelope.
+    pub fn from_profile(name: &str) -> anyhow::Result<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "default" | "web" => Ok(Self::default()),
+            "ot-safe" | "ot" | "scada" | "ics" => Ok(Self::ot_safe_profile()),
+            other => anyhow::bail!("unknown safety profile '{other}'; use default or ot-safe"),
+        }
+    }
+
     /// Factory for full attack testing in dedicated development / lab testbeds.
     pub fn attack_mode_policy() -> Self {
         Self {
@@ -407,6 +417,15 @@ mod tests {
         let ro = SafetyPolicy::from_flags(true, true, None);
         assert!(ro.read_only_safe);
         assert!(!ro.attack_mode);
+    }
+
+    #[test]
+    fn named_ot_profile_is_strict_and_selectable() {
+        let p = SafetyPolicy::from_profile("ot-safe").unwrap();
+        assert!(p.read_only_safe);
+        assert!(!p.attack_mode);
+        assert_eq!(p.max_rps, 5);
+        assert!(SafetyPolicy::from_profile("unknown").is_err());
     }
 
     #[tokio::test]
