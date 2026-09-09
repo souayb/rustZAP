@@ -593,8 +593,27 @@ enum Commands {
     },
 }
 
+/// Stack for the thread that actually runs the CLI. Building the clap command
+/// tree for `Cli` needs well over 1 MiB in debug builds, and Windows hands the
+/// process main thread exactly 1 MiB — every invocation aborted with "has
+/// overflowed its stack" before `main` reached its first statement.
+const STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    let worker = std::thread::Builder::new()
+        .name("rustzap".to_string())
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .context("failed to spawn the rustzap worker thread")?;
+    match worker.join() {
+        Ok(result) => result,
+        // The panic hook already reported it; mirror the usual panic exit code.
+        Err(_) => std::process::exit(101),
+    }
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let level = match cli.verbose {
@@ -1073,4 +1092,22 @@ fn print_banner() {
         "{}",
         "  Inspired by OWASP ZAP — Use responsibly!\n".dimmed()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Guards the reason `main` hands its work to a thread with an explicit
+    /// stack: clap's generated builder overflows the 1 MiB Windows main thread.
+    #[test]
+    fn cli_definition_builds_within_the_configured_stack() {
+        std::thread::Builder::new()
+            .stack_size(STACK_SIZE)
+            .spawn(|| Cli::command().debug_assert())
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }
