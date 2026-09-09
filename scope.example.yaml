@@ -48,7 +48,7 @@ approval_for: [exploit, rce, exfil]
 budget:
   max_requests: 500   # 0 = unlimited
   max_turns: 40       # brain turns before the loop stops
-  max_tokens: 0       # 0 = unlimited (LLM output tokens)
+  max_tokens: 0       # 0 = unlimited (cumulative LLM input + output tokens)
 
 # ── Privacy (opt-in) ─────────────────────────────────────────────────────────
 
@@ -68,3 +68,11 @@ model:
   # model: qwen2.5-coder                   # required for the LLM brain
   # api_key_env: LLM_API_KEY               # omit for keyless local servers
   json_mode: false                         # force response_format for OSS models
+
+  limits:
+    request_timeout_secs: 90
+    max_retries: 2             # transient transport / 429 / 5xx retries
+    context_tokens: 32768     # conservative UTF-8 byte estimate + output reserve
+    output_tokens: 2048
+    output_token_field: max_tokens  # or max_completion_tokens, per endpoint
+    # temperature: 0          # omitted by default for reasoning-model compatibility

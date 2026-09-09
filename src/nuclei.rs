@@ -3,8 +3,6 @@
 //! **Must be explicitly enabled** (`--nuclei` or `--nuclei-jsonl`). Never runs
 //! by default. Only scan targets you own or have permission to test.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::warn;
@@ -162,7 +160,7 @@ pub async fn run_nuclei(target: &str, require_binary: bool) -> Result<Vec<Findin
         return Ok(vec![]);
     }
 
-    let output = tokio::process::Command::new("nuclei")
+    let output = tokio::process::Command::new(crate::executable::require("nuclei")?)
         .args(["-u", target, "-jsonl", "-silent"])
         .output()
         .await
@@ -179,22 +177,7 @@ pub async fn run_nuclei(target: &str, require_binary: bool) -> Result<Vec<Findin
 }
 
 fn which_nuclei() -> Option<()> {
-    std::env::var_os("PATH").and_then(|paths| {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = Path::new(&dir).join("nuclei");
-            if candidate.is_file() {
-                return Some(());
-            }
-            #[cfg(windows)]
-            {
-                let exe = Path::new(&dir).join("nuclei.exe");
-                if exe.is_file() {
-                    return Some(());
-                }
-            }
-        }
-        None
-    })
+    crate::executable::find("nuclei").map(|_| ())
 }
 
 #[cfg(test)]

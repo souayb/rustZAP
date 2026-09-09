@@ -201,12 +201,14 @@ fn map_checkov_severity(sev: Option<&str>) -> Severity {
 }
 
 pub async fn run_checkov(repo_path: &Path) -> Result<String> {
-    let output = tokio::process::Command::new("checkov")
-        .args(["-d", ".", "-o", "json", "--quiet", "--compact"])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| super::map_spawn_io(e, "checkov"))?;
+    let output = tokio::process::Command::new(
+        crate::executable::require("checkov").map_err(|e| super::map_spawn_io(e, "checkov"))?,
+    )
+    .args(["-d", ".", "-o", "json", "--quiet", "--compact"])
+    .current_dir(repo_path)
+    .output()
+    .await
+    .map_err(|e| super::map_spawn_io(e, "checkov"))?;
 
     // Exit 1 = failed checks found (JSON still written to stdout).
     if !output.status.success() && output.status.code() != Some(1) {

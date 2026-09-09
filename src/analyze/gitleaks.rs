@@ -107,24 +107,26 @@ pub async fn run_gitleaks(repo_path: &Path) -> Result<String> {
     let report_path = repo_path.join(".rustzap-gitleaks-report.json");
     let _ = tokio::fs::remove_file(&report_path).await;
 
-    let output = tokio::process::Command::new("gitleaks")
-        .args([
-            "detect",
-            "--source",
-            repo_path
-                .to_str()
-                .context("repo path must be valid UTF-8")?,
-            "--no-banner",
-            "--report-format",
-            "json",
-            "--report-path",
-            report_path
-                .to_str()
-                .context("report path must be valid UTF-8")?,
-        ])
-        .output()
-        .await
-        .map_err(|e| super::map_spawn_io(e, "gitleaks"))?;
+    let output = tokio::process::Command::new(
+        crate::executable::require("gitleaks").map_err(|e| super::map_spawn_io(e, "gitleaks"))?,
+    )
+    .args([
+        "detect",
+        "--source",
+        repo_path
+            .to_str()
+            .context("repo path must be valid UTF-8")?,
+        "--no-banner",
+        "--report-format",
+        "json",
+        "--report-path",
+        report_path
+            .to_str()
+            .context("report path must be valid UTF-8")?,
+    ])
+    .output()
+    .await
+    .map_err(|e| super::map_spawn_io(e, "gitleaks"))?;
 
     // Exit code 1 = leaks found (still wrote report); other failures are errors.
     if !output.status.success() && output.status.code() != Some(1) {

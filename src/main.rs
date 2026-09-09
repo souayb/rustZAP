@@ -430,12 +430,14 @@ enum Commands {
     #[command(alias = "ui", alias = "console")]
     Tui,
 
-    /// Install SDD companion tools (Semgrep, Trivy, Gitleaks, …) for this OS.
+    /// Install the full Kali Docker environment (default), or native companion tools.
     ///
-    /// Detects macOS / Debian / Fedora / Arch / Alpine and dispatches to the
-    /// right package manager. Aliases: `setup`.
+    /// Native package installation is opt-in with --native. Aliases: `setup`.
     #[command(alias = "setup")]
     Install {
+        /// Install tools on the host instead of building the isolated environment
+        #[arg(long)]
+        native: bool,
         /// Print the plan without running anything
         #[arg(long)]
         dry_run: bool,
@@ -448,6 +450,18 @@ enum Commands {
         /// Assume yes — non-interactive
         #[arg(short, long)]
         yes: bool,
+    },
+
+    /// Run RustZap in the installed full Kali container; mounts only the current directory
+    Isolated {
+        /// Directory to share with the container (default: current directory)
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+        /// Forward a named host environment variable into the container (repeatable)
+        #[arg(long = "env", value_name = "NAME")]
+        env_vars: Vec<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
     /// Agentic tester (scope-gated; Phase 5). An LLM (or scripted) brain drives
@@ -502,6 +516,23 @@ enum Commands {
         /// detection in --ai-redteam mode (no effect otherwise).
         #[arg(long)]
         ai_redteam_marker: Option<String>,
+        /// Repeat each probe N times to measure an attack success rate with a
+        /// 95% confidence interval instead of a single pass/fail (1-20).
+        #[arg(long, value_name = "N")]
+        ai_redteam_generations: Option<u32>,
+        /// Also re-ask each probe obfuscated: base64, rot13, leetspeak,
+        /// zerowidth, payload-split, or `all`. Multiplies request volume.
+        #[arg(long, value_name = "LIST")]
+        ai_redteam_mutators: Option<String>,
+        /// Wire format of the target API: openai (default), anthropic, custom.
+        #[arg(long, value_name = "SHAPE")]
+        ai_redteam_shape: Option<String>,
+        /// --ai-redteam-shape custom: JSON body with a {{prompt}} placeholder.
+        #[arg(long, value_name = "JSON")]
+        ai_redteam_body_template: Option<String>,
+        /// --ai-redteam-shape custom: JSON pointer to the reply text (/data/answer).
+        #[arg(long, value_name = "POINTER")]
+        ai_redteam_text_path: Option<String>,
         #[arg(short, long, default_value = "agent-report.json")]
         output: String,
         #[arg(long)]
@@ -808,6 +839,11 @@ async fn main() -> anyhow::Result<()> {
             privacy,
             ai_redteam,
             ai_redteam_marker,
+            ai_redteam_generations,
+            ai_redteam_mutators,
+            ai_redteam_shape,
+            ai_redteam_body_template,
+            ai_redteam_text_path,
             output,
             sarif_out,
             trace,
@@ -848,8 +884,15 @@ async fn main() -> anyhow::Result<()> {
                 non_interactive,
                 script,
                 llm,
-                ai_redteam,
-                ai_redteam_marker,
+                agent::RedteamOptions {
+                    enabled: ai_redteam,
+                    marker: ai_redteam_marker,
+                    generations: ai_redteam_generations,
+                    mutators: ai_redteam_mutators,
+                    shape: ai_redteam_shape,
+                    body_template: ai_redteam_body_template,
+                    text_path: ai_redteam_text_path,
+                },
                 safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
                 autofix_dir,
             )
@@ -869,13 +912,19 @@ async fn main() -> anyhow::Result<()> {
             tui::run_tui().await.expect("TUI error");
         }
 
+        Commands::Isolated {
+            args,
+            workspace,
+            env_vars,
+        } => installer::run_isolated(args, workspace, env_vars)?,
         Commands::Install {
+            native,
             dry_run,
             list,
             tool,
             yes,
         } => {
-            installer::run(dry_run, tool, yes, list).await?;
+            installer::run(dry_run, tool, yes, list, native).await?;
         }
 
         Commands::Ad {
@@ -1014,7 +1063,11 @@ fn print_banner() {
     );
     println!(
         "{}",
-        "  Rust Web Application Security Scanner v0.1.0".bright_yellow()
+        format!(
+            "  Rust Web Application Security Scanner v{}",
+            env!("CARGO_PKG_VERSION")
+        )
+        .bright_yellow()
     );
     println!(
         "{}",

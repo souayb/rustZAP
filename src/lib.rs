@@ -7,6 +7,7 @@ pub mod analyze;
 pub mod correlate;
 pub mod crypto_sig;
 pub mod events;
+pub mod executable;
 pub mod har;
 pub mod installer;
 pub mod intel;

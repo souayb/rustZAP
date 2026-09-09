@@ -23,9 +23,12 @@ DRY_RUN=0
 SKIP_UPDATE=0
 ONLY_TOOL=""
 LIST_ONLY=0
+NATIVE=0
+ORIGINAL_ARGS=("$@")
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --native) NATIVE=1 ;;
     --yes|-y) YES=1 ;;
     --dry-run|-n) DRY_RUN=1 ;;
     --skip-update) SKIP_UPDATE=1 ;;
@@ -38,6 +41,21 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# Full isolated setup is the default on every host. Explicit --native retains
+# the package-manager path (also usable inside a disposable Kali VM).
+if [ "$NATIVE" = "0" ] && [ "${RUSTZAP_IN_DOCKER:-0}" != "1" ]; then
+  if ! command -v rustzap >/dev/null 2>&1; then
+    echo "Install the RustZap binary first, then run rustzap install (Docker required)." >&2
+    exit 1
+  fi
+  args=()
+  for arg in "${ORIGINAL_ARGS[@]}"; do
+    case "$arg" in --skip-update) ;; -n) args+=(--dry-run) ;; *) args+=("$arg") ;; esac
+  done
+  exec rustzap install "${args[@]}"
+fi
+export PATH="${HOME}/.local/bin:${PATH}"
 
 # ── Detect OS ────────────────────────────────────────────────────
 detect_os() {
@@ -87,6 +105,9 @@ fi
 cmd_for() {
   local tool="$1" os="$2"
   case "$tool/$os" in
+    nuclei/macos) echo "brew install nuclei" ;;
+    nuclei/debian) echo "$SUDO apt-get install -y nuclei" ;;
+    wifite/debian) echo "$SUDO apt-get install -y wifite" ;;
     # name             os         install command
     semgrep/macos)     echo "brew install semgrep" ;;
     semgrep/debian)    echo "$SUDO apt-get install -y pipx && pipx install semgrep" ;;
@@ -101,7 +122,7 @@ cmd_for() {
     trivy/alpine)      echo "$SUDO apk add --no-cache trivy || echo 'use community repo'" ;;
 
     gitleaks/macos)    echo "brew install gitleaks" ;;
-    gitleaks/debian)   echo "GLV=8.18.4 && curl -sSL \"https://github.com/gitleaks/gitleaks/releases/download/v\${GLV}/gitleaks_\${GLV}_linux_x64.tar.gz\" | $SUDO tar -xz -C /usr/local/bin gitleaks" ;;
+    gitleaks/debian) echo "$SUDO apt-get install -y gitleaks" ;;
     gitleaks/fedora)   echo "$SUDO dnf install -y gitleaks || (GLV=8.18.4 && curl -sSL \"https://github.com/gitleaks/gitleaks/releases/download/v\${GLV}/gitleaks_\${GLV}_linux_x64.tar.gz\" | $SUDO tar -xz -C /usr/local/bin gitleaks)" ;;
     gitleaks/arch)     echo "$SUDO pacman -S --noconfirm gitleaks" ;;
     gitleaks/alpine)   echo "$SUDO apk add --no-cache gitleaks" ;;
@@ -170,7 +191,13 @@ cmd_for() {
   esac
 }
 
-TOOLS=(semgrep trivy gitleaks checkov nmap nikto wapiti tshark hashcat john hydra medusa aircrack-ng)
+TOOLS=(semgrep trivy gitleaks checkov nuclei wifite nmap nikto wapiti tshark hashcat john hydra medusa aircrack-ng)
+
+if [ -n "$ONLY_TOOL" ]; then
+  found=0
+  for tool in "${TOOLS[@]}"; do [ "$tool" != "$ONLY_TOOL" ] || found=1; done
+  if [ "$found" = "0" ]; then echo "Unknown tool: $ONLY_TOOL" >&2; exit 2; fi
+fi
 
 # ── --list mode ──────────────────────────────────────────────────
 if [ "$LIST_ONLY" = "1" ]; then
@@ -184,7 +211,7 @@ if [ "$LIST_ONLY" = "1" ]; then
 fi
 
 # ── Refresh package indexes first (unless skipped) ──────────────
-if [ "$SKIP_UPDATE" = "0" ]; then
+if [ "$SKIP_UPDATE" = "0" ] && [ "$DRY_RUN" = "0" ]; then
   case "$OS" in
     debian) $SUDO apt-get update -qq || true ;;
     fedora) $SUDO dnf -q makecache || true ;;
@@ -241,7 +268,9 @@ for tool in "${TOOLS[@]}"; do
     if command -v "$tool" >/dev/null 2>&1; then
       echo "  ✓ installed ($(command -v "$tool"))"
     else
-      echo "  ✓ install command succeeded (binary not yet on PATH — may need shell reload)"
+      echo "  ✗ install command succeeded but executable was not detected"
+      FAILED=$((FAILED+1))
+      continue
     fi
     INSTALLED=$((INSTALLED+1))
   else
@@ -253,10 +282,9 @@ done
 echo ""
 echo "Done — installed=$INSTALLED skipped=$SKIPPED failed=$FAILED"
 
-# In Docker builds we still want the layer to succeed even if some optional
-# tools didn't install (e.g. medusa on a tiny base image). Set
-# RUSTZAP_STRICT_INSTALL=1 to fail the build on any failure instead.
-if [ "$FAILED" -gt 0 ] && [ "${RUSTZAP_STRICT_INSTALL:-0}" = "1" ]; then
+# Fail incomplete installations by default. An explicit non-strict native
+# installation may set RUSTZAP_STRICT_INSTALL=0.
+if [ "$FAILED" -gt 0 ] && [ "${RUSTZAP_STRICT_INSTALL:-1}" = "1" ]; then
   exit 1
 fi
 exit 0

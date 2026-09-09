@@ -12,8 +12,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: rustzap:latest
-    container_name: rustzap
+    image: rustzap:full
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     # Interactive TUI needs a tty + stdin
     tty: true
     stdin_open: true
@@ -25,7 +26,7 @@ services:
       - ./:/source:ro
     working_dir: /workspace
     ports:
-      - "8080:8080"          # intercepting proxy
+      - "127.0.0.1:8080:8080"          # intercepting proxy
     # Override CMD for a one-shot scan with `docker compose run rustzap scan ...`
     # By default the bare entrypoint launches the TUI.
     command: []

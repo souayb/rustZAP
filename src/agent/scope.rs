@@ -120,6 +120,7 @@ pub struct ModelConfig {
     /// Request strict JSON output via `response_format` (helps open-source models
     /// that otherwise wrap actions in prose). Off by default for max compatibility.
     pub json_mode: bool,
+    pub limits: crate::agent::brain::LlmOptions,
 }
 
 /// Parsed, validated scope file.

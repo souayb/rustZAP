@@ -64,8 +64,8 @@ async fn agent_runs_a_plugin_and_reports_confirmed_finding() {
     let out = tmp("runplugin");
     let brain = Box::new(ScriptedBrain::new(vec![
         AgentAction::CallTool {
-            tool: "list_plugins".into(),
-            args: json!({}),
+            tool: "http_probe".into(),
+            args: json!({"url": format!("{base}/dast/sqli?id=1")}),
         },
         AgentAction::CallTool {
             tool: "run_plugin".into(),

@@ -7,6 +7,7 @@
 
 pub mod autofix;
 pub mod brain;
+pub mod journal;
 pub mod poc;
 pub mod privacy;
 pub mod redteam;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::agent::brain::{
     AgentAction, AgentBrain, AgentState, LlmBrain, ScriptedBrain, TranscriptEntry,
@@ -85,6 +86,13 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
     let mut all_discovered: Vec<DiscoveredUrl> = Vec::new();
     let mut static_analysis: Option<StaticAnalysis> = None;
     let max_turns = scope.budget.max_turns.max(1);
+    let mut journal = journal::TaskJournal::create(&cfg.output)?;
+    trace.note("task_journal", journal.path.display().to_string());
+    journal
+        .append(json!({"event":"start", "goal":cfg.goal, "target":cfg.target, "repo":cfg.repo}))?;
+    let mut terminal_status = "turn_budget_exhausted";
+    let mut brain_failure = None;
+    let mut completed_calls = std::collections::HashSet::new();
     // Loop guard: weaker models re-issue the same tool call instead of finishing.
     let mut last_sig: Option<String> = None;
     let mut repeats: u32 = 0;
@@ -93,9 +101,26 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
     let mut recon_done = false;
 
     while state.turn < max_turns {
-        let action = brain.next_action(&state).await?;
+        let action = match brain.next_action(&state).await {
+            Ok(action) => action,
+            Err(error) => {
+                terminal_status = if error
+                    .downcast_ref::<brain::BrainError>()
+                    .is_some_and(|e| matches!(e, brain::BrainError::BudgetExhausted))
+                {
+                    "token_budget_exhausted"
+                } else {
+                    "brain_error"
+                };
+                trace.note(terminal_status, error.to_string());
+                brain_failure = Some(error);
+                break;
+            }
+        };
         match action {
             AgentAction::Finish { summary } => {
+                terminal_status = "completed";
+                journal.append(json!({"event":"finish", "summary":summary, "evidence_ids":brain.completion_evidence()}))?;
                 trace.note("finish", summary);
                 break;
             }
@@ -103,21 +128,26 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
                 // Detect a repeated identical call: nudge the brain, and bail out
                 // if it keeps looping — the result would not change.
                 let sig = format!("{tool}|{args}");
-                if last_sig.as_deref() == Some(sig.as_str()) {
+                if completed_calls.contains(&sig) || last_sig.as_deref() == Some(sig.as_str()) {
                     repeats += 1;
                     trace.note("repeat_call", tool.clone());
                     if repeats >= 2 {
+                        terminal_status = "loop_guard";
                         trace.note("loop_guard", "stopping after repeated identical tool calls");
                         break;
                     }
-                    state.transcript.push(TranscriptEntry {
-                        tool,
-                        result: json!({"note": "You already ran this exact call; its result is unchanged. Call a DIFFERENT tool or reply {\"finish\": ...}."}),
-                    });
+                    record_observation(
+                        &mut journal,
+                        &mut state,
+                        TranscriptEntry {
+                            tool,
+                            result: json!({"note": "You already ran this exact call; its result is unchanged. Call a DIFFERENT tool or reply {\"finish\": ...}."}),
+                        },
+                    )?;
                     state.turn += 1;
                     continue;
                 }
-                last_sig = Some(sig);
+                last_sig = Some(sig.clone());
                 repeats = 0;
 
                 let class = tools::effective_action_class(&tool, &args);
@@ -128,12 +158,16 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
                     && state.attack_plan.is_empty()
                 {
                     trace.note("explore_first", tool.clone());
-                    state.transcript.push(TranscriptEntry {
-                        tool,
-                        result: json!({
-                            "error": "explore-first gate: run a recon tool (analyze_repo, list_plugins, http_probe GET, get_attack_plan) before exploit-class actions"
-                        }),
-                    });
+                    record_observation(
+                        &mut journal,
+                        &mut state,
+                        TranscriptEntry {
+                            tool,
+                            result: json!({
+                                "error": "explore-first gate: gather target evidence (analyze_repo, http_probe GET, get_attack_plan) before exploit-class actions"
+                            }),
+                        },
+                    )?;
                     state.turn += 1;
                     continue;
                 }
@@ -142,15 +176,21 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
                     && !approve(&cfg, &tool, class)
                 {
                     trace.note("approval_denied", tool.clone());
-                    state.transcript.push(TranscriptEntry {
-                        tool,
-                        result: json!({"error": "approval denied"}),
-                    });
+                    record_observation(
+                        &mut journal,
+                        &mut state,
+                        TranscriptEntry {
+                            tool,
+                            result: json!({"error": "approval denied"}),
+                        },
+                    )?;
                     state.turn += 1;
                     continue;
                 }
+                journal.append(json!({"event":"intent", "task_id":format!("task-{}", state.turn), "tool":tool, "args":args}))?;
                 match tools::execute(&tool, &args, &ctx).await {
                     Ok(out) => {
+                        completed_calls.insert(sig);
                         let tools::ToolOutput {
                             value,
                             findings,
@@ -158,7 +198,12 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
                             attack_plan,
                             static_analysis: sa,
                         } = out;
-                        if matches!(class, ActionClass::Recon) {
+                        if matches!(class, ActionClass::Recon)
+                            && matches!(
+                                tool.as_str(),
+                                "http_probe" | "analyze_repo" | "get_attack_plan"
+                            )
+                        {
                             recon_done = true;
                         }
                         if !discovered.is_empty() || !attack_plan.is_empty() {
@@ -188,17 +233,25 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
                                 ),
                             );
                         }
-                        state.transcript.push(TranscriptEntry {
-                            tool,
-                            result: value,
-                        });
+                        record_observation(
+                            &mut journal,
+                            &mut state,
+                            TranscriptEntry {
+                                tool,
+                                result: value,
+                            },
+                        )?;
                     }
                     Err(e) => {
                         trace.note("tool_error", format!("{tool}: {e}"));
-                        state.transcript.push(TranscriptEntry {
-                            tool,
-                            result: json!({"error": e.to_string()}),
-                        });
+                        record_observation(
+                            &mut journal,
+                            &mut state,
+                            TranscriptEntry {
+                                tool,
+                                result: json!({"error": e.to_string()}),
+                            },
+                        )?;
                     }
                 }
                 state.turn += 1;
@@ -206,6 +259,8 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
         }
     }
 
+    journal.append(json!({"event":"terminal", "status":terminal_status, "turns":state.turn, "findings_count":all_findings.len()}))?;
+    trace.note("terminal_status", terminal_status);
     // A brain may call the same scan/analysis more than once; collapse duplicates
     // so the report reflects distinct findings, not turn count.
     dedup_findings(&mut all_findings);
@@ -281,7 +336,31 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
         "report",
         format!("{} findings → {}", report.findings.len(), cfg.output),
     );
+    if let Some(error) = brain_failure {
+        return Err(error.context(format!("Partial report saved to {}", cfg.output)));
+    }
+    if terminal_status != "completed" {
+        anyhow::bail!(
+            "Agent stopped: {terminal_status}; partial report saved to {}",
+            cfg.output
+        );
+    }
     Ok(report)
+}
+
+fn record_observation(
+    journal: &mut journal::TaskJournal,
+    state: &mut AgentState,
+    entry: TranscriptEntry,
+) -> Result<()> {
+    journal.observation(
+        state.turn,
+        state.transcript.len() + 1,
+        &entry.tool,
+        &entry.result,
+    )?;
+    state.transcript.push(entry);
+    Ok(())
 }
 
 fn scope_autonomy(scope: &ScopeConfig) -> Autonomy {
@@ -340,9 +419,62 @@ pub struct LlmOverrides {
     pub privacy: bool,
 }
 
+/// Target-side settings for `--ai-redteam` — the *application under test*.
+///
+/// Deliberately separate from `LlmOverrides`, which configures RustZAP's own
+/// brain: they are two different systems, with two different credentials, and
+/// conflating them is how an operator ends up probing the wrong model.
+#[derive(Debug, Default, Clone)]
+pub struct RedteamOptions {
+    /// Run the battery directly, with no LLM brain.
+    pub enabled: bool,
+    /// Operator-known phrase from the target's system prompt (enables leak probes).
+    pub marker: Option<String>,
+    /// Repeat count per probe variant; >1 yields an attack success rate.
+    pub generations: Option<u32>,
+    /// Comma-separated prompt mutators, or `all`.
+    pub mutators: Option<String>,
+    /// Wire format: openai (default), anthropic, or custom.
+    pub shape: Option<String>,
+    /// `shape=custom`: JSON body containing the `{{prompt}}` placeholder.
+    pub body_template: Option<String>,
+    /// `shape=custom`: JSON pointer to the reply text.
+    pub text_path: Option<String>,
+}
+
+impl RedteamOptions {
+    /// Arguments for one `ai_redteam` call. In this mode `--model` and
+    /// `--api-key-env` name the *target's* model and credential, not the
+    /// agent's — the flags are shared, the meaning is not.
+    pub fn to_args(&self, endpoint: &str, llm: &LlmOverrides) -> Value {
+        let mut args = json!({ "endpoint": endpoint });
+        for (key, value) in [
+            ("model", llm.model.clone()),
+            ("api_key_env", llm.api_key_env.clone()),
+            ("system_marker", self.marker.clone()),
+            ("shape", self.shape.clone()),
+            ("body_template", self.body_template.clone()),
+            ("text_path", self.text_path.clone()),
+            ("mutators", self.mutators.clone()),
+        ] {
+            if let Some(v) = value {
+                args[key] = json!(v);
+            }
+        }
+        if let Some(g) = self.generations {
+            args["generations"] = json!(g);
+        }
+        args
+    }
+}
+
 /// Build a privacy vault seeded with the scope's concrete hosts and the target
 /// host. Disabled vaults return a no-op.
-fn build_vault(enabled: bool, allowed_hosts: &[String], target: Option<&str>) -> privacy::Vault {
+pub(crate) fn build_vault(
+    enabled: bool,
+    allowed_hosts: &[String],
+    target: Option<&str>,
+) -> privacy::Vault {
     let mut vault = privacy::Vault::new(enabled);
     if !enabled {
         return vault;
@@ -377,8 +509,7 @@ pub async fn run_agent_cli(
     non_interactive: bool,
     script: Option<String>,
     llm: LlmOverrides,
-    ai_redteam: bool,
-    ai_redteam_marker: Option<String>,
+    redteam: RedteamOptions,
     safety: crate::safety::SafetyPolicy,
     autofix_dir: Option<String>,
 ) -> Result<()> {
@@ -391,7 +522,7 @@ pub async fn run_agent_cli(
 
     let brain: Box<dyn AgentBrain> = if let Some(sp) = script {
         Box::new(ScriptedBrain::from_json_file(Path::new(&sp))?)
-    } else if ai_redteam {
+    } else if redteam.enabled {
         // Thin CLI wrapper: run the OWASP LLM Top-10 battery once against the
         // target chat endpoint — no LLM brain needed. `--model` / `--api-key-env`
         // here name the *target's* model/key; `--ai-redteam-marker` enables leak
@@ -400,16 +531,7 @@ pub async fn run_agent_cli(
             .clone()
             .context("--ai-redteam requires --target (the target chat-completions URL)")?;
         eprintln!("⚠ AI red-team: sending OWASP LLM Top-10 probes to {endpoint} (in-scope only)");
-        let mut args = json!({ "endpoint": endpoint });
-        if let Some(m) = llm.model.clone() {
-            args["model"] = json!(m);
-        }
-        if let Some(env) = llm.api_key_env.clone() {
-            args["api_key_env"] = json!(env);
-        }
-        if let Some(marker) = ai_redteam_marker {
-            args["system_marker"] = json!(marker);
-        }
+        let args = redteam.to_args(&endpoint, &llm);
         Box::new(ScriptedBrain::new(vec![
             AgentAction::CallTool {
                 tool: "ai_redteam".into(),
@@ -438,12 +560,13 @@ pub async fn run_agent_cli(
         let max_tokens = scope.budget.max_tokens;
         Box::new(
             LlmBrain::with_vault(&base, &model, api_key, json_mode, vault)
+                .with_options(scope.model.limits.clone())?
                 .with_token_budget(max_tokens),
         )
     };
 
     let goal = goal.unwrap_or_else(|| {
-        if ai_redteam {
+        if redteam.enabled {
             format!(
                 "Run the OWASP LLM Top-10 red-team battery against {}",
                 target.as_deref().unwrap_or("the target")
@@ -468,7 +591,7 @@ pub async fn run_agent_cli(
         sarif_out,
         trace_path,
         non_interactive,
-        auto_approve: ai_redteam,
+        auto_approve: redteam.enabled,
         safety,
         autofix_dir,
     };
@@ -630,6 +753,138 @@ mod tests {
                 summary: "done".into(),
             },
         ]))
+    }
+
+    struct FailingBrain {
+        called: bool,
+    }
+    #[async_trait::async_trait]
+    impl AgentBrain for FailingBrain {
+        async fn next_action(&mut self, _: &AgentState) -> Result<AgentAction> {
+            if self.called {
+                anyhow::bail!("simulated provider failure");
+            }
+            self.called = true;
+            Ok(AgentAction::CallTool {
+                tool: "list_plugins".into(),
+                args: json!({}),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_failure_preserves_report_and_task_receipts() {
+        let (cfg, out, trace) = redteam_cfg("http://127.0.0.1", false);
+        let error = run_agent(cfg, Box::new(FailingBrain { called: false }))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("Partial report saved"));
+        assert!(Path::new(&out).exists());
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        let path = trace_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v["kind"] == "task_journal")
+            .unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.iter().any(|v| v["event"] == "intent"));
+        assert!(events
+            .iter()
+            .any(|v| v["evidence_id"] == "obs-1" && v["status"] == "succeeded"));
+        assert_eq!(events.last().unwrap()["status"], "brain_error");
+        for file in [out, trace, path] {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+
+    #[tokio::test]
+    async fn alternating_completed_calls_are_not_executed_again() {
+        let (cfg, out, trace) = redteam_cfg("http://127.0.0.1", false);
+        let steps = [
+            "list_plugins",
+            "list_captures",
+            "list_plugins",
+            "list_captures",
+        ]
+        .map(|tool| AgentAction::CallTool {
+            tool: tool.into(),
+            args: json!({}),
+        })
+        .to_vec();
+        let error = run_agent(cfg, Box::new(ScriptedBrain::new(steps)))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("loop_guard"));
+        let trace_text = std::fs::read_to_string(&trace).unwrap();
+        let path = trace_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v["kind"] == "task_journal")
+            .unwrap()["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let journal = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            journal
+                .lines()
+                .filter(|line| line.contains("\"event\":\"intent\""))
+                .count(),
+            2
+        );
+        for file in [out, trace, path] {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+
+    /// In `--ai-redteam` mode the shared flags describe the *target*, and every
+    /// capability flag must reach the tool — a silently dropped one would make
+    /// the run look thorough while testing less than the operator asked for.
+    #[test]
+    fn redteam_options_forward_every_flag_to_the_tool() {
+        let llm = LlmOverrides {
+            model: Some("llama3.1".into()),
+            api_key_env: Some("TARGET_KEY".into()),
+            ..Default::default()
+        };
+        let opts = RedteamOptions {
+            enabled: true,
+            marker: Some("SECRET-MARKER".into()),
+            generations: Some(5),
+            mutators: Some("base64,rot13".into()),
+            shape: Some("custom".into()),
+            body_template: Some(r#"{"q": "{{prompt}}"}"#.into()),
+            text_path: Some("/data/answer".into()),
+        };
+
+        let args = opts.to_args("http://app.local/chat", &llm);
+        assert_eq!(args["endpoint"], json!("http://app.local/chat"));
+        assert_eq!(args["model"], json!("llama3.1"));
+        assert_eq!(args["api_key_env"], json!("TARGET_KEY"));
+        assert_eq!(args["system_marker"], json!("SECRET-MARKER"));
+        assert_eq!(args["generations"], json!(5));
+        assert_eq!(args["mutators"], json!("base64,rot13"));
+        assert_eq!(args["shape"], json!("custom"));
+        assert_eq!(args["text_path"], json!("/data/answer"));
+
+        // Unset options stay absent, so the tool applies its own defaults.
+        let bare = RedteamOptions {
+            enabled: true,
+            ..Default::default()
+        }
+        .to_args("http://app.local/chat", &LlmOverrides::default());
+        for key in ["model", "system_marker", "generations", "mutators", "shape"] {
+            assert!(bare.get(key).is_none(), "{key} should be absent");
+        }
     }
 
     #[tokio::test]

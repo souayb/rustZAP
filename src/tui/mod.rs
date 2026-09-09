@@ -26,7 +26,8 @@ use analyze::{
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -152,6 +153,18 @@ enum InputMode {
     EditAgentTarget,
     EditAgentRepo,
     EditAgentOutput,
+    EditAgentGoal,
+    EditAgentModel,
+    EditAgentBaseUrl,
+    EditAgentApiKey,
+    /// Model the *target* application runs (red-team), not the agent's brain.
+    EditAgentTargetModel,
+    /// Env var name holding the target's credential (never the secret itself).
+    EditAgentTargetKeyEnv,
+    /// Operator-known system-prompt phrase that enables the leak probes.
+    EditAgentTargetMarker,
+    /// Prompt mutators to apply on top of each probe.
+    EditAgentMutators,
     /// Consent dialog before walking a local repo (replaces CLI stdin `y/N`).
     ConfirmAnalyze,
     /// Consent dialog before an agent run (network/repo access).
@@ -1002,7 +1015,12 @@ impl App {
 pub async fn run_tui() -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1013,7 +1031,8 @@ pub async fn run_tui() -> anyhow::Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 
@@ -1029,15 +1048,15 @@ async fn event_loop(
         terminal.draw(|f| draw(f, app))?;
 
         if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(key) = event::read()? {
-                // Windows emits Press+Release (and sometimes Repeat) for each
-                // physical key. Handling only Press avoids doubled chars in
-                // edit buffers (h→hh, ://→::////) and double-firing shortcuts.
-                if should_handle_key(key.kind) {
-                    handle_key(app, key.code, key.modifiers);
+            match event::read()? {
+                Event::Key(key) if should_handle_key(key.kind) => {
+                    handle_key(app, key.code, key.modifiers)
                 }
+                Event::Paste(text) => handle_paste(app, &text),
+                _ => {}
             }
         }
+
         if app.should_quit {
             // Make sure any background scan is aborted before we leave.
             if let Some(h) = app.scan_handle.take() {
@@ -1049,6 +1068,9 @@ async fn event_loop(
             if let Some(h) = app.analyze_handle.take() {
                 h.abort();
             }
+            if let Some(h) = app.agent_handle.take() {
+                h.abort();
+            }
             return Ok(());
         }
     }
@@ -1057,6 +1079,19 @@ async fn event_loop(
 /// Only process key *presses*. Crossterm on Windows also emits Release/Repeat.
 fn should_handle_key(kind: KeyEventKind) -> bool {
     kind == KeyEventKind::Press
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    if !matches!(
+        app.input_mode,
+        InputMode::Normal | InputMode::ConfirmAgent | InputMode::ConfirmAnalyze
+    ) {
+        app.input_buffer.extend(
+            text.chars()
+                .filter(|c| !c.is_control())
+                .take(8192usize.saturating_sub(app.input_buffer.chars().count())),
+        );
+    }
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
@@ -1148,9 +1183,60 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                         app.agent.output = value;
                         app.log(format!("Agent output set to {}", app.agent.output));
                     }
+                    InputMode::EditAgentGoal => {
+                        app.agent.goal = value;
+                        app.log("Agent goal updated".into());
+                    }
+                    InputMode::EditAgentModel => {
+                        app.agent.model = value;
+                        app.log("LLM model updated".into());
+                    }
+                    InputMode::EditAgentBaseUrl => {
+                        app.agent.base_url = value;
+                        app.log("LLM API URL updated".into());
+                    }
+                    InputMode::EditAgentApiKey => {
+                        app.agent.api_key = value.trim().to_string();
+                        app.log("Agent LLM API key updated (session only)".into());
+                    }
+                    InputMode::EditAgentTargetModel => {
+                        app.agent.target_model = value.trim().to_string();
+                        app.log("Target model updated".into());
+                    }
+                    InputMode::EditAgentTargetKeyEnv => {
+                        app.agent.target_key_env = value.trim().to_string();
+                        // The variable name is not a secret; the value it names
+                        // is read only when a probe request is built.
+                        app.log(format!(
+                            "Target credential read from ${}",
+                            app.agent.target_key_env
+                        ));
+                    }
+                    InputMode::EditAgentTargetMarker => {
+                        app.agent.target_marker = value.trim().to_string();
+                        app.log("Target system marker updated (leak probes enabled)".into());
+                    }
+                    InputMode::EditAgentMutators => {
+                        app.agent.mutators = value.trim().to_string();
+                        // Names are checked at start; report the volume cost now,
+                        // since each mutator re-sends the whole battery.
+                        let count = app
+                            .agent
+                            .mutators
+                            .split(',')
+                            .filter(|s| !s.trim().is_empty())
+                            .count();
+                        app.log(match count {
+                            0 => "Mutators cleared (plain prompts only)".to_string(),
+                            n => format!("Mutators set — {n} extra variant(s) per probe"),
+                        });
+                    }
                     InputMode::Normal | InputMode::ConfirmAnalyze | InputMode::ConfirmAgent => {}
                 }
                 app.input_mode = InputMode::Normal;
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                app.input_buffer.clear();
             }
             KeyCode::Backspace => {
                 app.input_buffer.pop();
@@ -1268,6 +1354,54 @@ fn handle_analyze_keys(app: &mut App, code: KeyCode) {
 
 fn handle_agent_keys(app: &mut App, code: KeyCode) {
     match code {
+        KeyCode::Char('g') => {
+            app.input_buffer = app.agent.goal.clone();
+            app.input_mode = InputMode::EditAgentGoal;
+        }
+        KeyCode::Char('e') => {
+            app.input_buffer = app.agent.base_url.clone();
+            app.input_mode = InputMode::EditAgentBaseUrl;
+        }
+        KeyCode::Char('m') => {
+            app.input_buffer = app.agent.model.clone();
+            app.input_mode = InputMode::EditAgentModel;
+        }
+        KeyCode::Char('k') => {
+            app.input_buffer = app.agent.api_key.clone();
+            app.input_mode = InputMode::EditAgentApiKey;
+        }
+        KeyCode::Char('K') => {
+            app.agent.api_key.clear();
+            app.log("Session API key cleared; scope environment settings apply".into());
+        }
+        KeyCode::Char('M') => {
+            app.input_buffer = app.agent.target_model.clone();
+            app.input_mode = InputMode::EditAgentTargetModel;
+        }
+        KeyCode::Char('A') => {
+            app.input_buffer = app.agent.target_key_env.clone();
+            app.input_mode = InputMode::EditAgentTargetKeyEnv;
+        }
+        KeyCode::Char('P') => {
+            app.input_buffer = app.agent.target_marker.clone();
+            app.input_mode = InputMode::EditAgentTargetMarker;
+        }
+        KeyCode::Char('G') => {
+            app.agent.generations = agent::generations_next(app.agent.generations);
+            app.log(format!(
+                "Generations → {} ({})",
+                app.agent.generations,
+                if app.agent.generations > 1 {
+                    "reports an attack success rate"
+                } else {
+                    "single pass/fail"
+                }
+            ));
+        }
+        KeyCode::Char('X') => {
+            app.input_buffer = app.agent.mutators.clone();
+            app.input_mode = InputMode::EditAgentMutators;
+        }
         KeyCode::Char('c') => {
             app.input_buffer = app.agent.scope.clone();
             app.input_mode = InputMode::EditAgentScope;
@@ -1441,16 +1575,54 @@ fn draw(f: &mut Frame, app: &App) {
         }
         Tab::Agent => {
             let edit = match app.input_mode {
-                InputMode::EditAgentScope => {
-                    Some(("Editing scope file path", app.input_buffer.as_str()))
-                }
+                InputMode::EditAgentScope => Some(("Scope file", app.input_buffer.as_str(), false)),
                 InputMode::EditAgentTarget => {
-                    Some(("Editing target URL", app.input_buffer.as_str()))
+                    Some(("Target URL", app.input_buffer.as_str(), false))
                 }
-                InputMode::EditAgentRepo => Some(("Editing repo path", app.input_buffer.as_str())),
+                InputMode::EditAgentRepo => {
+                    Some(("Repository path", app.input_buffer.as_str(), false))
+                }
                 InputMode::EditAgentOutput => {
-                    Some(("Editing output path", app.input_buffer.as_str()))
+                    Some(("Output path", app.input_buffer.as_str(), false))
                 }
+                InputMode::EditAgentGoal => Some(("Goal", app.input_buffer.as_str(), false)),
+                InputMode::EditAgentModel => Some((
+                    "Agent LLM model (blank: from scope)",
+                    app.input_buffer.as_str(),
+                    false,
+                )),
+                InputMode::EditAgentBaseUrl => Some((
+                    "Agent LLM API URL (blank: scope / local Ollama)",
+                    app.input_buffer.as_str(),
+                    false,
+                )),
+                InputMode::EditAgentApiKey => Some((
+                    "Agent API key (blank: scope env / keyless)",
+                    app.input_buffer.as_str(),
+                    true,
+                )),
+                InputMode::EditAgentTargetModel => Some((
+                    "Target model (blank: tool default)",
+                    app.input_buffer.as_str(),
+                    false,
+                )),
+                // The env var *name*, so it is not masked; the value it holds
+                // is read only when a probe request is built.
+                InputMode::EditAgentTargetKeyEnv => Some((
+                    "Target key env var name (blank: keyless)",
+                    app.input_buffer.as_str(),
+                    false,
+                )),
+                InputMode::EditAgentTargetMarker => Some((
+                    "Target system-prompt marker (enables leak probes)",
+                    app.input_buffer.as_str(),
+                    true,
+                )),
+                InputMode::EditAgentMutators => Some((
+                    "Mutators: base64, rot13, leetspeak, zerowidth, payload-split, all",
+                    app.input_buffer.as_str(),
+                    false,
+                )),
                 _ => None,
             };
             draw_agent(
@@ -2319,7 +2491,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         Tab::Tools => "j/k: navigate · r/Enter: run · R: re-detect",
         Tab::Logs => "j/k/PgUp/PgDn: scroll · G: bottom · c: clear",
         Tab::Analyze => "r/t/o/S: edit · c: correlate · s: start · x: cancel",
-        Tab::Agent => "c/t/r/o: edit · u: autonomy · b: brain · s: start · x: cancel",
+        Tab::Agent => "e: API URL · m: model · k: key · g: goal · b: brain · s: start",
     };
 
     let mode_label = match app.input_mode {
@@ -2335,7 +2507,15 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         | InputMode::EditAgentScope
         | InputMode::EditAgentTarget
         | InputMode::EditAgentRepo
-        | InputMode::EditAgentOutput => "EDIT",
+        | InputMode::EditAgentOutput
+        | InputMode::EditAgentGoal
+        | InputMode::EditAgentModel
+        | InputMode::EditAgentBaseUrl
+        | InputMode::EditAgentApiKey
+        | InputMode::EditAgentTargetModel
+        | InputMode::EditAgentTargetKeyEnv
+        | InputMode::EditAgentTargetMarker
+        | InputMode::EditAgentMutators => "EDIT",
     };
 
     let scan_label = match &app.scan_status {
@@ -2409,6 +2589,66 @@ mod tests {
         assert!(matches!(Tab::Agent.next(), Tab::Dashboard));
         assert!(matches!(Tab::Dashboard.prev(), Tab::Agent));
         assert_eq!(TAB_TITLES[6], "7·Agent");
+    }
+
+    fn rendered_text(app: &App) -> String {
+        let backend = ratatui::backend::TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn api_key_editing_masks_paste_and_never_logs_the_key() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        let secret = "session-key-DO-NOT-DISPLAY";
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert!(matches!(app.input_mode, InputMode::EditAgentApiKey));
+        handle_paste(&mut app, &format!("{secret}\r\n"));
+        let text = rendered_text(&app);
+        assert!(text.contains("****"));
+        assert!(!text.contains(secret));
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.agent.api_key, secret);
+        assert!(app.input_buffer.is_empty());
+        assert!(!rendered_text(&app).contains(secret));
+        assert!(!app.logs.iter().any(|line| line.contains(secret)));
+        handle_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        handle_paste(&mut app, "replacement-key");
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.agent.api_key, secret, "Escape preserves the prior key");
+        assert!(app.input_buffer.is_empty());
+        handle_key(&mut app, KeyCode::Char('K'), KeyModifiers::NONE);
+        assert!(app.agent.api_key.is_empty());
+    }
+
+    #[test]
+    fn llm_fields_commit_and_pasting_outside_edit_cannot_start_a_run() {
+        let mut app = App::new();
+        app.tab = Tab::Agent;
+        for (shortcut, value) in [
+            ('e', "http://localhost:11434/v1"),
+            ('m', "test-model"),
+            ('g', "Review this target"),
+        ] {
+            handle_key(&mut app, KeyCode::Char(shortcut), KeyModifiers::NONE);
+            handle_paste(&mut app, value);
+            handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        }
+        assert_eq!(app.agent.model, "test-model");
+        assert_eq!(app.agent.base_url, "http://localhost:11434/v1");
+        assert_eq!(app.agent.goal, "Review this target");
+        handle_paste(&mut app, "sY");
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.agent_handle.is_none());
     }
 
     #[test]

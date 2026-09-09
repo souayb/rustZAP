@@ -299,7 +299,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ai_redteam",
-            description: "Run the OWASP LLM/RAG red-team battery (prompt injection, insecure output, leakage, agency, indirect retrieved-content injection, tenant/filter canaries, deletion retention) against an in-scope OpenAI-compatible chat endpoint. Vector/RAG results are heuristic unless synthetic canaries are seeded and authorization context is verified. Intrusive — requires approval.",
+            description: "Run the OWASP LLM/RAG red-team battery (prompt injection, insecure output, leakage, agency, indirect retrieved-content injection, tenant/filter canaries, deletion retention) against an in-scope chat endpoint (OpenAI, Anthropic, or a custom body/response shape). Optional prompt mutators re-ask each probe obfuscated, and repeated generations report an attack success rate with a 95% confidence interval; probes that produced no usable reply are reported as unevaluated, never as passes. Vector/RAG results are heuristic unless synthetic canaries are seeded and authorization context is verified. Intrusive — requires approval.",
             action_class: ActionClass::Exploit,
             input_schema: json!({
                 "type": "object",
@@ -307,7 +307,16 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "endpoint": {"type": "string", "description": "In-scope chat-completions URL of the app under test"},
                     "model": {"type": "string", "description": "Model id to request (default gpt-4o-mini)"},
                     "api_key_env": {"type": "string", "description": "Env var holding a bearer token for the target, if it needs one"},
-                    "system_marker": {"type": "string", "description": "A phrase known to be in the target's system prompt; enables leak detection"}
+                    "system_marker": {"type": "string", "description": "A phrase known to be in the target's system prompt; enables leak detection"},
+                    "temperature": {"type": "number", "description": "Sampling temperature to request; omitted by default because some reasoning endpoints reject the field"},
+                    "shape": {"type": "string", "enum": ["openai", "anthropic", "custom"], "description": "Wire format of the target API (default openai)"},
+                    "body_template": {"type": "string", "description": "shape=custom: JSON body with a {{prompt}} placeholder"},
+                    "text_path": {"type": "string", "description": "shape=custom: JSON pointer to the reply text, e.g. /data/answer"},
+                    "auth_header": {"type": "string", "description": "Header carrying the credential (default authorization, or x-api-key for anthropic)"},
+                    "auth_prefix": {"type": "string", "description": "Prefix before the credential (default 'Bearer ', empty for anthropic)"},
+                    "generations": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Times to repeat each probe variant (default 1). >1 yields an attack success rate with a confidence interval instead of a single coin flip"},
+                    "mutators": {"type": "string", "description": "Opt-in prompt obfuscations to also try: base64, rot13, leetspeak, zerowidth, payload-split, or 'all'. Multiplies request volume"},
+                    "fail_threshold": {"type": "number", "minimum": 0, "maximum": 1, "description": "Attack success rate a target may exhibit before a probe is failed (default 0: any success fails)"}
                 },
                 "required": ["endpoint"]
             }),
@@ -788,18 +797,119 @@ async fn replay_request(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     Ok(ToolOutput::value_only(value))
 }
 
+/// Retries for a probe whose failure is plausibly transient. Bounded and small:
+/// the battery is intrusive, so a struggling target must not be hammered.
+const REDTEAM_MAX_RETRIES: u32 = 2;
+
+/// Ceiling on generations per probe variant. The request count is
+/// `probes x (1 + mutators) x generations`, so this is what keeps an
+/// Exploit-class tool from turning into a load test on someone's endpoint.
+const REDTEAM_MAX_GENERATIONS: u32 = 20;
+
+/// Send one probe and classify the reply. A failed request is an *outcome*,
+/// not an error: one unreachable probe must not abort the battery.
+async fn send_probe(
+    ctx: &ToolCtx,
+    spec: &redteam::TargetSpec,
+    body: String,
+    headers: &[(String, String)],
+) -> redteam::ProbeOutcome {
+    match ctx
+        .send_and_capture("POST", &spec.endpoint, Some(body), headers)
+        .await
+    {
+        Ok((txn, _)) => match txn.response.as_ref() {
+            Some(r) => redteam::classify_reply_at(r.status, &r.body, spec.text_path()),
+            None => redteam::ProbeOutcome::Unevaluated(redteam::Unevaluated::UnrecognizedShape),
+        },
+        Err(e) => {
+            redteam::ProbeOutcome::Unevaluated(redteam::Unevaluated::Transport(e.to_string()))
+        }
+    }
+}
+
+/// Rate limits and server errors are worth one more attempt. Transport errors
+/// are not: here they are almost always a scope or budget refusal, which is
+/// deterministic and would only burn the request budget again.
+fn is_transient(outcome: &redteam::ProbeOutcome) -> bool {
+    matches!(
+        outcome,
+        redteam::ProbeOutcome::Unevaluated(redteam::Unevaluated::HttpStatus(s))
+            if *s == 429 || (500..600).contains(s)
+    )
+}
+
+/// What every variant of a run shares: where to send, how to authenticate, what
+/// token to look for, and how many times to ask.
+struct RunSpec<'a> {
+    target: &'a redteam::TargetSpec,
+    headers: &'a [(String, String)],
+    canary: &'a str,
+    marker: Option<&'a str>,
+    generations: u32,
+}
+
+/// One probe variant, sent `generations` times and scored as a whole.
+async fn run_variant(
+    ctx: &ToolCtx,
+    run: &RunSpec<'_>,
+    probe: &redteam::Probe,
+    prompt: &str,
+) -> (redteam::ProbeReport, u32) {
+    let (spec, headers, generations) = (run.target, run.headers, run.generations);
+    let body = spec.body_for(prompt);
+    let mut report = redteam::ProbeReport::default();
+    let mut requests = 0u32;
+    for _ in 0..generations {
+        let mut outcome = send_probe(ctx, spec, body.clone(), headers).await;
+        requests += 1;
+        let mut sent = 1u32;
+        while sent <= REDTEAM_MAX_RETRIES && is_transient(&outcome) {
+            tokio::time::sleep(Duration::from_millis(250 * sent as u64)).await;
+            outcome = send_probe(ctx, spec, body.clone(), headers).await;
+            requests += 1;
+            sent += 1;
+        }
+        report.record(match outcome {
+            redteam::ProbeOutcome::Evaluated(text) => redteam::Attempt::Judged {
+                hit: redteam::is_susceptible(probe, run.canary, run.marker, &text),
+                text,
+            },
+            redteam::ProbeOutcome::Unevaluated(why) => redteam::Attempt::Skipped(why),
+        });
+    }
+    (report, requests)
+}
+
 async fn ai_redteam(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-    let endpoint = arg_str(args, "endpoint")?;
-    let model = args
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("gpt-4o-mini");
+    let spec = redteam::TargetSpec::from_args(args)?;
     let marker = args.get("system_marker").and_then(|v| v.as_str());
     let api_key = args
         .get("api_key_env")
         .and_then(|v| v.as_str())
         .and_then(|env| std::env::var(env).ok())
         .filter(|k| !k.is_empty());
+    let headers = spec.headers(api_key.as_deref());
+
+    // Repeat count per variant. Above 1 the run yields an attack success rate
+    // instead of a coin flip; capped because every generation is a live request.
+    let generations = args
+        .get("generations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .clamp(1, u64::from(REDTEAM_MAX_GENERATIONS)) as u32;
+    // Opt-in: mutators multiply request volume against an intrusive endpoint.
+    let mutators = match args.get("mutators").and_then(|v| v.as_str()) {
+        Some(spec) => redteam::Mutator::parse_list(spec).map_err(|e| anyhow::anyhow!(e))?,
+        None => Vec::new(),
+    };
+    // The ASR a target may exhibit before the probe is failed; 0.0 fails on any
+    // successful attack, which is the right default for a security test.
+    let threshold = args
+        .get("fail_threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
 
     // Per-run unique canary the injection probes ask the model to echo.
     let canary = format!(
@@ -808,52 +918,87 @@ async fn ai_redteam(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
     );
     let probes = redteam::probes(&canary, marker);
 
+    let run = RunSpec {
+        target: &spec,
+        headers: &headers,
+        canary: &canary,
+        marker,
+        generations,
+    };
+
     let mut findings: Vec<Finding> = Vec::new();
     let mut results: Vec<Value> = Vec::new();
+    let mut failed = 0usize;
+    let mut passed = 0usize;
+    let mut unevaluated = 0usize;
+
     for p in &probes {
-        let body = json!({
-            "model": model,
-            "messages": [{"role": "user", "content": p.prompt}],
-            "temperature": 0,
-        })
-        .to_string();
-        let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
-        if let Some(k) = &api_key {
-            headers.push(("authorization".to_string(), format!("Bearer {k}")));
-        }
-        match ctx
-            .send_and_capture("POST", &endpoint, Some(body), &headers)
-            .await
-        {
-            Ok((txn, _)) => {
-                let raw = txn
-                    .response
-                    .as_ref()
-                    .map(|r| r.body.as_str())
-                    .unwrap_or_default();
-                let text = redteam::extract_text(raw);
-                let hit = redteam::is_susceptible(p, &canary, marker, &text);
-                if hit {
-                    findings.push(redteam::to_finding(p, &endpoint, &text));
+        // The plain prompt, then one variant per mutator.
+        let variants: Vec<(Option<redteam::Mutator>, String)> =
+            std::iter::once((None, p.prompt.clone()))
+                .chain(
+                    mutators
+                        .iter()
+                        .map(|m| (Some(*m), m.apply(&p.prompt, &canary))),
+                )
+                .collect();
+
+        for (mutator, prompt) in variants {
+            let (report, requests) = run_variant(ctx, &run, p, &prompt).await;
+            let verdict = report.verdict(threshold);
+            match verdict {
+                redteam::Verdict::Fail => {
+                    failed += 1;
+                    findings.push(redteam::finding_for(p, &spec.endpoint, &report, mutator));
                 }
-                results.push(json!({
-                    "probe": p.id,
-                    "owasp": p.owasp,
-                    "susceptible": hit,
-                }));
+                redteam::Verdict::Pass => passed += 1,
+                redteam::Verdict::Unevaluated => unevaluated += 1,
             }
-            Err(e) => {
-                results.push(json!({"probe": p.id, "owasp": p.owasp, "error": e.to_string()}))
+
+            let mut entry = json!({
+                "probe": p.id,
+                "owasp": p.owasp,
+                "variant": mutator.map(|m| m.id()).unwrap_or("plain"),
+                "verdict": verdict.as_str(),
+                "generations": report.generations,
+                "evaluated": report.evaluated,
+                "hits": report.hits,
+                "requests": requests,
+            });
+            if let Some(asr) = report.asr() {
+                entry["asr"] = json!(asr);
+                if let Some((lo, hi)) = report.confidence_interval() {
+                    entry["asr_ci_95"] = json!([lo, hi]);
+                }
             }
+            if !report.reasons.is_empty() {
+                entry["unevaluated_reasons"] = json!(report.reasons);
+            }
+            results.push(entry);
         }
     }
 
-    let value = json!({
-        "endpoint": endpoint,
+    let variants_run = results.len();
+    let mut value = json!({
+        "endpoint": spec.endpoint,
         "probes_run": probes.len(),
+        "variants_run": variants_run,
+        "generations_per_variant": generations,
+        "mutators": mutators.iter().map(|m| m.id()).collect::<Vec<_>>(),
+        "fail_threshold": threshold,
+        "failed_count": failed,
+        "passed_count": passed,
+        "unevaluated_count": unevaluated,
+        // Retained for compatibility with the previous result shape.
         "susceptible_count": findings.len(),
         "results": results,
     });
+    if passed + failed == 0 {
+        value["warning"] = json!(
+            "no probe produced a verdict — the endpoint returned no usable chat \
+             completions, so this run is inconclusive, not a pass"
+        );
+    }
     Ok(ToolOutput {
         value,
         findings,
@@ -1193,6 +1338,21 @@ mod tests {
         // The echo reflects the canary → the injection/output probes are flagged.
         assert!(out.value["probes_run"].as_u64().unwrap() >= 6);
         assert!(out.value["susceptible_count"].as_u64().unwrap() >= 1);
+        // Every probe got a real reply, so nothing is left unevaluated.
+        assert_eq!(
+            out.value["unevaluated_count"].as_u64().unwrap(),
+            0,
+            "a responsive endpoint evaluates every probe"
+        );
+        assert_eq!(
+            out.value["failed_count"].as_u64().unwrap()
+                + out.value["passed_count"].as_u64().unwrap(),
+            out.value["variants_run"].as_u64().unwrap()
+        );
+        assert!(out.value["warning"].is_null());
+        // Default run: one variant per probe, one generation each.
+        assert_eq!(out.value["variants_run"], out.value["probes_run"]);
+        assert_eq!(out.value["generations_per_variant"].as_u64().unwrap(), 1);
         assert!(out.findings.iter().any(|f| f
             .owasp_category
             .as_deref()
@@ -1200,6 +1360,324 @@ mod tests {
             .contains("LLM01")));
         // All probe requests were captured for audit/replay.
         assert!(ctx.take_captures().len() >= 6);
+    }
+
+    /// A provider that rejects every request (401 + an error body), the shape a
+    /// misconfigured `api_key_env` produces.
+    async fn spawn_llm_error_server() -> std::net::SocketAddr {
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Request, Response, Server, StatusCode};
+        let make = make_service_fn(|_| async {
+            Ok::<_, std::convert::Infallible>(service_fn(|_req: Request<Body>| async move {
+                let body =
+                    json!({"error": {"message": "Incorrect API key provided", "code": "invalid_api_key"}})
+                        .to_string();
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+            }))
+        });
+        let addr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind(&addr).serve(make);
+        let local = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+        local
+    }
+
+    /// A rejecting endpoint must yield *no* findings and an explicit
+    /// inconclusive verdict. Before classification the error body reached the
+    /// detectors, and `RefusalAbsent` reported excessive agency against a
+    /// target that never answered.
+    #[tokio::test]
+    async fn ai_redteam_reports_provider_errors_as_unevaluated() {
+        let addr = spawn_llm_error_server().await;
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+
+        let out = execute("ai_redteam", &json!({ "endpoint": endpoint }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.findings.is_empty(), "auth failure is not a finding");
+        let run = out.value["variants_run"].as_u64().unwrap();
+        assert_eq!(out.value["passed_count"].as_u64().unwrap(), 0);
+        assert_eq!(out.value["failed_count"].as_u64().unwrap(), 0);
+        assert_eq!(out.value["unevaluated_count"].as_u64().unwrap(), run);
+        assert_eq!(out.value["susceptible_count"].as_u64().unwrap(), 0);
+        assert!(
+            out.value["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not a pass"),
+            "an all-unevaluated run must not read as a clean pass"
+        );
+        for r in out.value["results"].as_array().unwrap() {
+            assert_eq!(r["verdict"], json!("unevaluated"));
+            assert!(
+                r["asr"].is_null(),
+                "no rate without an evaluated generation"
+            );
+            assert!(r["unevaluated_reasons"][0]
+                .as_str()
+                .unwrap()
+                .contains("HTTP 401"));
+        }
+    }
+
+    /// Records every request body, and 503s the first `fail_first` requests so
+    /// retry behavior is observable.
+    async fn spawn_recording_server(
+        fail_first: usize,
+    ) -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Request, Response, Server, StatusCode};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let make_bodies = bodies.clone();
+        let make = make_service_fn(move |_| {
+            let bodies = make_bodies.clone();
+            let seen = seen.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(service_fn(move |req: Request<Body>| {
+                    let bodies = bodies.clone();
+                    let seen = seen.clone();
+                    async move {
+                        let bytes = hyper::body::to_bytes(req.into_body())
+                            .await
+                            .unwrap_or_default();
+                        bodies
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&bytes).to_string());
+                        if seen.fetch_add(1, Ordering::SeqCst) < fail_first {
+                            return Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                                    .body(Body::from("upstream unavailable"))
+                                    .unwrap(),
+                            );
+                        }
+                        let reply =
+                            json!({"choices": [{"message": {"content": "I can't help with that."}}]})
+                                .to_string();
+                        Ok::<_, std::convert::Infallible>(Response::new(Body::from(reply)))
+                    }
+                }))
+            }
+        });
+        let addr = ([127, 0, 0, 1], 0).into();
+        let server = Server::bind(&addr).serve(make);
+        let local = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+        (local, bodies)
+    }
+
+    /// `temperature` is omitted unless requested — several reasoning endpoints
+    /// reject the field, which would make every probe unevaluated.
+    #[tokio::test]
+    async fn ai_redteam_omits_temperature_unless_asked() {
+        let (addr, bodies) = spawn_recording_server(0).await;
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+
+        execute("ai_redteam", &json!({ "endpoint": endpoint }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|b| !b.contains("temperature")),
+            "temperature must not be sent by default"
+        );
+
+        bodies.lock().unwrap().clear();
+        execute(
+            "ai_redteam",
+            &json!({ "endpoint": endpoint, "temperature": 0.2 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|b| b.contains("\"temperature\":0.2")),
+            "an explicit temperature is forwarded"
+        );
+    }
+
+    /// A 503 is transient: the probe retries rather than being written off as
+    /// unevaluated on the first stumble.
+    #[tokio::test]
+    async fn ai_redteam_retries_transient_server_errors() {
+        let (addr, _bodies) = spawn_recording_server(2).await;
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+
+        let out = execute("ai_redteam", &json!({ "endpoint": endpoint }), &ctx)
+            .await
+            .unwrap();
+
+        // The first probe absorbed both 503s and still produced a verdict.
+        assert_eq!(
+            out.value["unevaluated_count"].as_u64().unwrap(),
+            0,
+            "retries recovered every probe"
+        );
+        let results = out.value["results"].as_array().unwrap();
+        assert!(
+            results.iter().any(|r| r["requests"].as_u64() == Some(3)),
+            "the variant that hit the outage retried twice"
+        );
+        // The server always refuses, so nothing is reported as susceptible.
+        assert_eq!(out.value["susceptible_count"].as_u64().unwrap(), 0);
+    }
+
+    /// Repeated generations turn a coin flip into a measured rate: the echo
+    /// server always complies, so the ASR is 1.0 with a bounded interval.
+    #[tokio::test]
+    async fn ai_redteam_generations_yield_a_success_rate_and_interval() {
+        let addr = spawn_llm_echo_server().await;
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+
+        let out = execute(
+            "ai_redteam",
+            &json!({ "endpoint": endpoint, "generations": 4 }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.value["generations_per_variant"].as_u64().unwrap(), 4);
+        let injection = out.value["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["probe"] == json!("llm01-direct-injection"))
+            .expect("the injection probe ran");
+        assert_eq!(injection["verdict"], json!("fail"));
+        assert_eq!(injection["generations"].as_u64().unwrap(), 4);
+        assert_eq!(injection["hits"].as_u64().unwrap(), 4);
+        assert!((injection["asr"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+
+        // The interval must admit doubt even at 4/4, and stay in range.
+        let ci = injection["asr_ci_95"].as_array().unwrap();
+        let (lo, hi) = (ci[0].as_f64().unwrap(), ci[1].as_f64().unwrap());
+        assert!(lo > 0.0 && lo < 1.0, "4/4 is not certainty: {lo}");
+        assert!(hi <= 1.0);
+
+        // The measured rate reaches the report, not just the JSON.
+        assert!(out.findings.iter().any(|f| f
+            .evidence
+            .as_deref()
+            .unwrap_or("")
+            .contains("ASR 100%")));
+    }
+
+    /// Mutators are opt-in and multiply variants, and a hit through an
+    /// obfuscated prompt is labelled as such in the finding.
+    #[tokio::test]
+    async fn ai_redteam_mutators_add_labelled_variants() {
+        let addr = spawn_llm_echo_server().await;
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let endpoint = format!("http://{addr}/v1/chat/completions");
+
+        let plain = execute("ai_redteam", &json!({ "endpoint": endpoint }), &ctx)
+            .await
+            .unwrap();
+        let buffed = execute(
+            "ai_redteam",
+            &json!({ "endpoint": endpoint, "mutators": "leetspeak,zerowidth" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let probes = plain.value["probes_run"].as_u64().unwrap();
+        assert_eq!(plain.value["variants_run"].as_u64().unwrap(), probes);
+        assert_eq!(
+            buffed.value["variants_run"].as_u64().unwrap(),
+            probes * 3,
+            "plain + one variant per mutator"
+        );
+        assert_eq!(buffed.value["mutators"], json!(["leetspeak", "zerowidth"]));
+        assert!(buffed
+            .findings
+            .iter()
+            .any(|f| f.title.contains("via leetspeak obfuscation")));
+
+        // A typo must not silently reduce coverage.
+        let err = match execute(
+            "ai_redteam",
+            &json!({ "endpoint": endpoint, "mutators": "base64,nope" }),
+            &ctx,
+        )
+        .await
+        {
+            Ok(_) => panic!("a mistyped mutator must fail the call, not run fewer variants"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unknown mutator 'nope'"), "{err}");
+    }
+
+    /// A non-OpenAI application: custom body template and reply pointer. Before
+    /// target adapters this endpoint could not be probed at all.
+    #[tokio::test]
+    async fn ai_redteam_probes_a_custom_shaped_target() {
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Request, Response, Server};
+
+        // Answers `{"question": ...}` with `{"data": {"answer": <echo>}}`.
+        let make = make_service_fn(|_| async {
+            Ok::<_, std::convert::Infallible>(service_fn(|req: Request<Body>| async move {
+                let bytes = hyper::body::to_bytes(req.into_body())
+                    .await
+                    .unwrap_or_default();
+                let parsed: Value = serde_json::from_slice(&bytes).expect("valid JSON body");
+                let question = parsed["question"].as_str().unwrap_or_default().to_string();
+                let reply = json!({"data": {"answer": question}}).to_string();
+                Ok::<_, std::convert::Infallible>(Response::new(Body::from(reply)))
+            }))
+        });
+        let server = Server::bind(&([127, 0, 0, 1], 0).into()).serve(make);
+        let addr = server.local_addr();
+        tokio::spawn(async move {
+            let _ = server.await;
+        });
+
+        let ctx = ctx_for("allowed_hosts: [\"127.0.0.1\"]\n");
+        let out = execute(
+            "ai_redteam",
+            &json!({
+                "endpoint": format!("http://{addr}/chat"),
+                "shape": "custom",
+                "body_template": r#"{"question": "{{prompt}}"}"#,
+                "text_path": "/data/answer",
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.value["unevaluated_count"].as_u64().unwrap(), 0);
+        assert!(
+            !out.findings.is_empty(),
+            "the echo reflects the canary through the custom shape"
+        );
     }
 
     #[tokio::test]

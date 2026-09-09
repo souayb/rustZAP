@@ -144,12 +144,14 @@ fn to_full_path(path: &str, repo_root: &Path) -> PathBuf {
 }
 
 pub async fn run_semgrep_scan(repo_path: &Path) -> Result<String> {
-    let output = tokio::process::Command::new("semgrep")
-        .args(["scan", "--quiet", "--json", "--config", "auto", "."])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| super::map_spawn_io(e, "semgrep"))?;
+    let output = tokio::process::Command::new(
+        crate::executable::require("semgrep").map_err(|e| super::map_spawn_io(e, "semgrep"))?,
+    )
+    .args(["scan", "--quiet", "--json", "--config", "auto", "."])
+    .current_dir(repo_path)
+    .output()
+    .await
+    .map_err(|e| super::map_spawn_io(e, "semgrep"))?;
 
     if !output.status.success() {
         anyhow::bail!(

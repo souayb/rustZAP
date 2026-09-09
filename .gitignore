@@ -53,3 +53,6 @@ FEATURES.md
 CHANGELOG.md
 node_modules/
 vscode-extension/out/
+
+# Durable agent task journals (may contain target evidence)
+*.tasks-*.jsonl

@@ -42,6 +42,14 @@ fn definitions() -> Vec<ToolDef> {
     vec![
         // (name, cmd, category, role, default_args, needs_target)
         (
+            "Nuclei",
+            "nuclei",
+            "DAST",
+            "Template-based scanner",
+            vec!["-u"],
+            true,
+        ),
+        (
             "Semgrep",
             "semgrep",
             "SAST",
@@ -164,34 +172,12 @@ fn definitions() -> Vec<ToolDef> {
     ]
 }
 
-fn is_installed(cmd: &str) -> bool {
-    std::process::Command::new("/usr/bin/env")
-        .args([
-            "sh",
-            "-c",
-            &format!("command -v {} >/dev/null 2>&1", shell_escape(cmd)),
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn shell_escape(s: &str) -> String {
-    // Only allow simple command names; reject anything funky.
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        s.to_string()
-    } else {
-        String::new()
-    }
-}
-
 pub fn detect_tools() -> Vec<ExternalTool> {
+    let discovery = crate::executable::Discovery::default();
     definitions()
         .into_iter()
         .map(|(name, cmd, category, role, args, needs_target)| {
-            let installed = is_installed(cmd);
+            let installed = discovery.find(cmd).is_some();
             ExternalTool {
                 name: name.to_string(),
                 command: cmd.to_string(),
@@ -210,15 +196,17 @@ pub async fn run_tool(
     target: Option<String>,
     tx: UnboundedSender<ToolEvent>,
 ) -> Result<()> {
-    if !tool.installed {
-        let _ = tx.send(ToolEvent::Error {
-            tool: tool.name.clone(),
-            error: format!("{} is not installed on this system", tool.command),
-        });
-        return Ok(());
-    }
-
-    let mut cmd = Command::new(&tool.command);
+    let path = match crate::executable::require(&tool.command) {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = tx.send(ToolEvent::Error {
+                tool: tool.name.clone(),
+                error: e.to_string(),
+            });
+            return Ok(());
+        }
+    };
+    let mut cmd = Command::new(path);
     cmd.args(&tool.default_args);
 
     let mut cmdline = format!("{} {}", tool.command, tool.default_args.join(" "));

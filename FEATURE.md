@@ -69,6 +69,7 @@ that need human follow-up (e.g. dispatched OOB payloads) are `tentative`.
 | **G2** | Curl PoC on confirmed findings | `src/agent/poc.rs` `attach_get_poc` / `build_poc_proof` — SQLi / XSS / path-traversal + AI red-team confirmed findings ship `poc` in JSON |
 | **G3** | Agent explore-first + Exploit classes | `run_plugin` / `scan_target` / `replay_request` = Exploit; mutating `http_probe` elevated; recon-before-exploit gate; `export_autofix` tool + `rustzap autofix` |
 | **G4** | Windows TUI key doubling fix | `src/tui/mod.rs` — only `KeyEventKind::Press` (Press+Release no longer doubles chars) |
+| **G5** | AI red-team: probe/detector/evaluator split | `src/agent/redteam/` — `probes.rs` catalogue, `detect.rs` detectors + reply classification, `eval.rs` ASR with 95% Wilson CI, `mutate.rs` prompt obfuscations, `target.rs` OpenAI/Anthropic/custom shapes; three outcomes (fail/pass/**unevaluated**) so a rejected key never reads as a pass; confidence tracks evidence — only marker leaks are `confirmed` |
 
 Tier **E** tracks **E6** (`serve`) remains **planned**. Agentic tester (**E7**) is shipped with G1–G3 hardening — see IMPLEMENTATION_PLAN Phase 5.
 

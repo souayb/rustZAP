@@ -104,12 +104,14 @@ fn map_trivy_severity(sev: Option<&str>) -> Severity {
 }
 
 pub async fn run_trivy_fs(repo_path: &Path) -> Result<String> {
-    let output = tokio::process::Command::new("trivy")
-        .args(["fs", "--format", "json", "--quiet", "."])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| super::map_spawn_io(e, "trivy"))?;
+    let output = tokio::process::Command::new(
+        crate::executable::require("trivy").map_err(|e| super::map_spawn_io(e, "trivy"))?,
+    )
+    .args(["fs", "--format", "json", "--quiet", "."])
+    .current_dir(repo_path)
+    .output()
+    .await
+    .map_err(|e| super::map_spawn_io(e, "trivy"))?;
 
     if !output.status.success() {
         anyhow::bail!(

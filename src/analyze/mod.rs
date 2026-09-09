@@ -133,7 +133,7 @@ pub fn missing_binary_action(selected_count: usize, tools_explicit: bool) -> Mis
 
 pub fn missing_binary_fail_message(tool: &str) -> String {
     format!(
-        "{tool} not found on PATH. Install it (e.g. `rustzap install --tool {tool}`) \
+        "{tool} not found on PATH. Install it (e.g. `rustzap install --native --tool {tool}`) \
          or run `rustzap analyze REPO --tools native`."
     )
 }
@@ -907,7 +907,10 @@ mod tests {
         assert_eq!(missing_binary_action(1, true), MissingBinaryAction::Fail);
         let msg = missing_binary_fail_message("semgrep");
         assert!(msg.contains("--tools native"), "{msg}");
-        assert!(msg.contains("rustzap install --tool semgrep"), "{msg}");
+        assert!(
+            msg.contains("rustzap install --native --tool semgrep"),
+            "{msg}"
+        );
     }
 
     #[test]

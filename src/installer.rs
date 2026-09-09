@@ -5,8 +5,8 @@
 //! Checkov, Nmap, Nikto, Wapiti, tshark, Hashcat, John, Hydra, Medusa,
 //! Aircrack-ng).
 //!
-//! Same coverage as `scripts/install-tools.sh` — the script is the canonical
-//! reference and is also what the Dockerfile invokes at build time.
+//! Full Kali Docker installation is the default. Native package-manager
+//! installation is explicit; detection uses the same resolver as execution.
 
 use anyhow::{Context, Result};
 use colored::*;
@@ -15,6 +15,7 @@ use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
+    Windows,
     Macos,
     Debian,
     Fedora,
@@ -25,6 +26,9 @@ pub enum Os {
 
 impl Os {
     pub fn detect() -> Os {
+        if cfg!(windows) {
+            return Os::Windows;
+        }
         if cfg!(target_os = "macos") {
             return Os::Macos;
         }
@@ -52,6 +56,7 @@ impl Os {
 
     pub fn label(&self) -> &'static str {
         match self {
+            Os::Windows => "Windows",
             Os::Macos => "macOS (Homebrew)",
             Os::Debian => "Debian/Ubuntu (apt)",
             Os::Fedora => "Fedora/RHEL (dnf)",
@@ -89,13 +94,24 @@ impl Tool {
             Os::Fedora => self.fedora,
             Os::Arch => self.arch,
             Os::Alpine => self.alpine,
-            Os::Unknown => None,
+            Os::Unknown | Os::Windows => None,
         }
     }
 }
 
 // Mirrors scripts/install-tools.sh. Keep them in sync.
 const TOOLS: &[Tool] = &[
+    Tool {
+        name: "nuclei",
+        macos: Some("brew install nuclei"),
+        debian: Some("$SUDO apt-get install -y nuclei"),
+        fedora: None, arch: Some("$SUDO pacman -S --noconfirm nuclei"), alpine: None,
+    },
+    Tool {
+        name: "wifite",
+        macos: None, debian: Some("$SUDO apt-get install -y wifite"),
+        fedora: None, arch: Some("$SUDO pacman -S --noconfirm wifite"), alpine: None,
+    },
     Tool {
         name: "semgrep",
         macos: Some("brew install semgrep"),
@@ -115,7 +131,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "gitleaks",
         macos: Some("brew install gitleaks"),
-        debian: Some("GLV=8.18.4 && curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v${GLV}/gitleaks_${GLV}_linux_x64.tar.gz | $SUDO tar -xz -C /usr/local/bin gitleaks"),
+        debian: Some("$SUDO apt-get install -y gitleaks"),
         fedora: Some("$SUDO dnf install -y gitleaks"),
         arch: Some("$SUDO pacman -S --noconfirm gitleaks"),
         alpine: Some("$SUDO apk add --no-cache gitleaks"),
@@ -203,11 +219,7 @@ const TOOLS: &[Tool] = &[
 ];
 
 fn is_installed(cmd: &str) -> bool {
-    Command::new("/usr/bin/env")
-        .args(["sh", "-c", &format!("command -v {} >/dev/null 2>&1", cmd)])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::executable::find(cmd).is_some()
 }
 
 fn sudo_prefix() -> &'static str {
@@ -232,7 +244,13 @@ fn resolve(cmd: &str) -> String {
 }
 
 /// Public entry point for the `install` subcommand.
-pub async fn run(dry_run: bool, only: Option<String>, yes: bool, list: bool) -> Result<()> {
+pub async fn run(
+    dry_run: bool,
+    only: Option<String>,
+    yes: bool,
+    list: bool,
+    native: bool,
+) -> Result<()> {
     let os = Os::detect();
     println!(
         "{} {}",
@@ -240,12 +258,24 @@ pub async fn run(dry_run: bool, only: Option<String>, yes: bool, list: bool) -> 
         os.label().bright_cyan()
     );
 
-    if os == Os::Unknown {
-        anyhow::bail!("Unsupported OS — install companion tools manually (see SDD section 4)");
+    if let Some(name) = only.as_deref() {
+        anyhow::ensure!(TOOLS.iter().any(|t| t.name == name), "Unknown tool: {name}");
     }
-
     if list {
         return list_tools(os);
+    }
+    if !native && std::env::var_os("RUSTZAP_IN_DOCKER").is_none() {
+        anyhow::ensure!(
+            only.is_none(),
+            "--tool requires --native; the isolated installation includes the full tool set"
+        );
+        return install_isolated(dry_run, yes);
+    }
+    if os == Os::Windows {
+        anyhow::bail!("Native installation is not supported on Windows. Use `rustzap install` for Kali Docker. Existing native tools are detected by `rustzap install --list`.");
+    }
+    if os == Os::Unknown {
+        anyhow::bail!("Unsupported OS — install companion tools manually (see SDD section 4)");
     }
 
     if dry_run {
@@ -304,12 +334,15 @@ pub async fn run(dry_run: bool, only: Option<String>, yes: bool, list: bool) -> 
         }
 
         match run_shell(&cmd) {
-            Ok(true) => {
+            Ok(true) if is_installed(tool.name) => {
                 println!("  {} installed", "✓".green());
                 installed += 1;
             }
-            Ok(false) => {
-                println!("  {} non-zero exit", "✗".red());
+            Ok(_) => {
+                println!(
+                    "  {} install failed or executable was not detected",
+                    "✗".red()
+                );
                 failed += 1;
             }
             Err(e) => {
@@ -334,6 +367,7 @@ pub async fn run(dry_run: bool, only: Option<String>, yes: bool, list: bool) -> 
 }
 
 fn list_tools(os: Os) -> Result<()> {
+    let discovery = crate::executable::Discovery::default();
     println!("\n{:<14} INSTALL COMMAND ({})", "TOOL", os.label());
     println!("{}", "─".repeat(70));
     for tool in TOOLS {
@@ -341,12 +375,18 @@ fn list_tools(os: Os) -> Result<()> {
             .cmd_for(os)
             .map(resolve)
             .unwrap_or_else(|| "(not packaged)".to_string());
-        let installed_badge = if is_installed(tool.name) {
+        let found = discovery.find(tool.name);
+        let installed_badge = if found.is_some() {
             "✓".green().to_string()
         } else {
             "·".dimmed().to_string()
         };
-        println!("{} {:<13} {}", installed_badge, tool.name, cmd);
+        println!(
+            "{} {:<13} {}",
+            installed_badge,
+            tool.name,
+            found.map(|p| p.display().to_string()).unwrap_or(cmd)
+        );
     }
     println!();
     Ok(())
@@ -369,4 +409,148 @@ fn run_shell(cmd: &str) -> Result<bool> {
         .status()
         .context("spawn bash")?;
     Ok(status.success())
+}
+
+include!(concat!(env!("OUT_DIR"), "/build_files.rs"));
+
+pub fn image_name() -> String {
+    format!("rustzap:{}-full", env!("CARGO_PKG_VERSION"))
+}
+
+fn install_isolated(dry_run: bool, yes: bool) -> Result<()> {
+    println!("Full installation: Kali Linux container with RustZap and companion tools.");
+    list_tools(Os::detect())?;
+    println!(
+        "Host tools above are detected; the container has its own independent tool installation."
+    );
+    println!(
+        "Build image {} from the source bundled with this executable.",
+        image_name()
+    );
+    if dry_run {
+        return Ok(());
+    }
+    let docker = crate::executable::require("docker").context("Install and start Docker Desktop (Windows/macOS) or Docker Engine (Linux), then run rustzap install again")?;
+    anyhow::ensure!(
+        Command::new(&docker)
+            .args(["info"])
+            .output()?
+            .status
+            .success(),
+        "Docker is not running or is inaccessible; start Docker and retry"
+    );
+    if !yes && !confirm("Download and build the full isolated environment? [Y/n] ")? {
+        return Ok(());
+    }
+    let dir = std::env::temp_dir().join(format!("rustzap-build-{}", crate::types::uuid_v4()));
+    std::fs::create_dir(&dir)?;
+    let result = (|| -> Result<()> {
+        for (name, content) in BUILD_FILES {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, content)?;
+        }
+        // The inner build does not need another embedded build context.
+        std::fs::write(dir.join("build.rs"), include_str!("../build.rs"))?;
+        anyhow::ensure!(
+            Command::new(&docker)
+                .args(["build", "--tag", &image_name()])
+                .arg(&dir)
+                .status()?
+                .success(),
+            "Full image build failed; no successful installation was recorded"
+        );
+        anyhow::ensure!(
+            Command::new(&docker)
+                .args([
+                    "run",
+                    "--rm",
+                    "--network=none",
+                    "--cap-drop=ALL",
+                    &image_name(),
+                    "install",
+                    "--list"
+                ])
+                .status()?
+                .success(),
+            "Container tool verification failed"
+        );
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result?;
+    println!("Installed. Start with `rustzap isolated` or `rustzap isolated analyze . --yes`.");
+    Ok(())
+}
+
+pub fn run_isolated(
+    args: Vec<String>,
+    workspace: Option<std::path::PathBuf>,
+    env_vars: Vec<String>,
+) -> Result<()> {
+    use std::io::IsTerminal;
+    let docker = crate::executable::require("docker")?;
+    let mut command = Command::new(docker);
+    command.args([
+        "run",
+        "--rm",
+        "--init",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "-i",
+    ]);
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        command.arg("-t");
+    }
+    let dir = workspace.unwrap_or(std::env::current_dir()?);
+    std::fs::create_dir_all(&dir)?;
+    let dir = dir.canonicalize()?;
+    for name in env_vars {
+        anyhow::ensure!(
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "--env accepts variable names only"
+        );
+        command.args(["--env", &name]);
+    }
+    command.arg("--add-host=host.docker.internal:host-gateway");
+    #[cfg(unix)]
+    {
+        let uid = Command::new("id").arg("-u").output()?;
+        let gid = Command::new("id").arg("-g").output()?;
+        anyhow::ensure!(
+            uid.status.success() && gid.status.success(),
+            "Cannot determine container user"
+        );
+        if String::from_utf8_lossy(&uid.stdout).trim() != "0" {
+            command.arg("--user").arg(format!(
+                "{}:{}",
+                String::from_utf8_lossy(&uid.stdout).trim(),
+                String::from_utf8_lossy(&gid.stdout).trim()
+            ));
+        }
+        command.args(["--env", "HOME=/tmp"]);
+    }
+    let mount_dir = dir.display().to_string();
+    #[cfg(windows)]
+    let mount_dir = mount_dir
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&mount_dir)
+        .to_string();
+    // --volume is a separate argument; no shell interpolation of paths or user flags.
+    command
+        .arg("--volume")
+        .arg(format!("{mount_dir}:/workspace"));
+    command
+        .args(["--workdir", "/workspace", &image_name()])
+        .args(args);
+    anyhow::ensure!(
+        command
+            .status()
+            .context("launch isolated RustZap; run rustzap install first")?
+            .success(),
+        "Isolated RustZap failed; run rustzap install if the image is missing"
+    );
+    Ok(())
 }

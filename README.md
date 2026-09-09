@@ -87,7 +87,7 @@ A Homebrew formula is also generated per release (`packaging/homebrew/`); see
 ### From source
 
 ```bash
-# Requires Rust 1.75+
+# Requires Rust 1.91+
 git clone https://github.com/souayb/rustZAP
 cd rustZAP
 ./scripts/install-hooks.sh    # Linux/macOS/Git Bash; Windows: scripts\install-hooks.cmd
@@ -107,42 +107,86 @@ cd vscode-extension && npm ci && npm run compile   # F5 to debug in VS Code
 
 Requires the `rustzap` binary on `PATH` or `rustzap.path` in settings. See [vscode-extension/README.md](vscode-extension/README.md).
 
-### Install companion tools (OS-aware)
+### Full isolated installation (default)
 
-The SDD calls for a unified console driving Semgrep, Trivy, Gitleaks, Checkov, Nmap, Nikto, Wapiti, tshark, Hashcat, John, Hydra, Medusa, and Aircrack-ng. RustZAP can install them for you — it auto-detects your OS and dispatches to the right package manager.
-
-```bash
-rustzap install --list           # see what would be installed on this OS
-rustzap install --dry-run        # print the exact commands, run nothing
-rustzap install                  # interactive install (asks per tool)
-rustzap install --yes            # non-interactive, install everything available
-rustzap install --tool semgrep   # install just one tool
-```
-
-Supported package managers:
-
-| OS | Manager |
-|---|---|
-| macOS | Homebrew |
-| Debian / Ubuntu / Kali | apt + pipx |
-| Fedora / RHEL / Rocky | dnf + pipx |
-| Arch / Manjaro | pacman + pipx |
-| Alpine | apk + pip3 |
-
-The same logic is available as a standalone shell script:
+After installing the RustZap binary, install and start Docker Desktop on Windows/macOS
+or Docker Engine on Linux, then run:
 
 ```bash
-./scripts/install-tools.sh --list       # show plan
-./scripts/install-tools.sh --yes        # install everything available
-./scripts/install-tools.sh --tool nmap  # install one
+rustzap install --list                    # detect native tools and show resolved paths
+rustzap install --dry-run                 # preview the full setup
+rustzap install --yes                     # build the full Kali Linux environment
+rustzap isolated                         # start the console in that environment
+rustzap isolated analyze . --yes --tools native,semgrep,trivy,gitleaks,checkov
 ```
+
+The full image includes **Semgrep, Trivy, Gitleaks, Checkov, Nuclei, Nmap, Nikto,
+Wapiti, tshark, Hashcat, John, Hydra, Medusa, Aircrack-ng, and Wifite**. Missing
+executables fail the image build; installation no longer treats a successful
+package-manager exit as proof that a tool is available. The installed binary
+bundles its source and build recipe, so setup works without a source checkout.
+Docker caches unchanged layers when setup is repeated. Allow several GB of disk
+space and time for the initial build and scanner database downloads.
+
+Host detection and container detection are separate: finding Semgrep on Windows
+does not mean it exists inside Kali. `rustzap isolated install --list` inspects
+the container. The Windows installer selects full setup by default in its final
+page (Docker Desktop must already be running); silent installations leave setup
+to `rustzap install --yes`. Start-menu entries offer isolated and native consoles.
+
+`isolated` mounts **only the selected workspace**, with read/write access for
+reports, and drops Linux capabilities. It does not mount the Docker socket or
+host credentials. Run from a dedicated test workspace, or select one explicitly:
+
+```bash
+rustzap isolated --workspace ./assessment analyze . --yes --tools native
+# Forward only the API-key variable your scope file names:
+rustzap isolated --env LLM_API_KEY agent --scope scope.yaml --target http://app:3000
+```
+
+Paths passed after the subcommand are container paths. A host model endpoint can
+be configured as `http://host.docker.internal:11434/v1` if the model server accepts
+connections from Docker. Containers share the host kernel; packet capture,
+wireless adapters, GPU cracking, and kernel monitoring need additional hardware
+or privileges. Use a dedicated Kali VM for those workflows. Falco remains an
+optional host/VM runtime monitor and is not part of the container tool set.
+No scanning starts during installation.
+
+### Native tools and Windows detection
+
+Native installation is an explicit alternative, including inside your own Kali VM:
+
+```bash
+rustzap install --native --yes
+rustzap install --native --tool semgrep
+./scripts/install-tools.sh --native --tool nmap
+```
+
+Native package managers are Homebrew, apt/pipx, dnf/pipx, pacman/pipx, or apk.
+Package availability varies by distribution; the full Kali image is the supported
+complete tool set. Native Windows package installation is not automated. Existing
+Windows tools are detected and can be run directly.
+
+Discovery checks executable files instead of invoking a Unix shell. On Windows
+it reads both the running process PATH and current user/machine PATH, honors
+PATHEXT, and checks common pip/pipx, Scoop, Chocolatey, WinGet, Nmap, Wireshark,
+and Docker locations. Press **Shift+R** in Tools to refresh after installation;
+launching a tool resolves it again. An explicit executable override also works:
+
+```powershell
+$env:RUSTZAP_TOOL_TRIVY = 'C:\Tools\Trivy\trivy.exe'
+rustzap install --list
+```
+
+The same resolver is used by the installer, console, static analyzers, and Nuclei.
+Overrides use `RUSTZAP_TOOL_<UPPERCASE_NAME>` (hyphens become underscores).
 
 ### Docker
 
 A multi-stage `Dockerfile` ships RustZAP with all companion tools pre-installed (no host setup needed):
 
 ```bash
-# Build the image (~600 MB, includes Semgrep/Trivy/Gitleaks/Nmap/...)
+# Build the full Kali image (several GB, depending on package versions)
 docker build -t rustzap .
 
 # Drop into the TUI (interactive)
@@ -520,9 +564,9 @@ rustzap plugins
 
 RustZAP can drive its own scanners, static analysis, and evidence primitives from
 an **agentic loop** — an LLM (or deterministic scripted) brain that plans and
-calls tools under strict, config-selected guardrails. The same capabilities are
-exposed two ways over **one shared tool registry**:
+calls tools under strict, config-selected guardrails. The same capabilities share **one tool registry**:
 
+- **Agent tab (`7`)** — configure a live LLM and run it from the console.
 - **`rustzap agent`** — the native loop. A brain observes findings + the
   attack-plan frontier, calls tools, and RustZAP assembles a `Report`.
 - **`rustzap mcp`** — an [MCP](https://modelcontextprotocol.io/) server over
@@ -530,6 +574,49 @@ exposed two ways over **one shared tool registry**:
 
 > ⚠️ Network-touching tools **refuse to run without a scope file**. Only ever
 > point the agent at hosts you own or have explicit written permission to test.
+
+### Configure the LLM in the console
+
+Open `rustzap isolated` (or `rustzap tui`) and press **7** for the Agent tab.
+**LLM (live)** is the default brain. Configure it directly:
+
+| Key | Field |
+|---|---|
+| `e` | Agent's OpenAI-compatible API base URL, typically ending in `/v1` |
+| `m` | Agent's provider model ID |
+| `k` | Agent's API key — masked while typing or pasting |
+| `g` | Goal for the assessment |
+| `c`, `t`, `r` | Scope file, target URL, repository path |
+| `s` | Start after the existing consent dialog |
+
+These configure **RustZAP's own brain**. When the brain is **Red-team**, the
+*application under test* is configured separately — it is a different model
+behind a different credential:
+
+| Key | Field |
+|---|---|
+| `M` | Target model ID (blank: the tool's default) |
+| `A` | Name of the env var holding the target's bearer token (the name, never the secret) |
+| `P` | Target system-prompt marker — without it the leak probes cannot fire |
+| `G` | Generations per variant — cycles 1 → 3 → 5 → 10 (above 1 reports an attack success rate) |
+| `X` | Prompt mutators to add (`base64,rot13`, `all`, …; blank for plain prompts only) |
+
+Starting a red-team run whose `A` variable is unset fails immediately with the
+reason, rather than producing a run in which every probe is unevaluated.
+
+Press **Enter** to save a field, **Esc** to discard edits, and **Ctrl+U** to
+clear the editor. **Shift+K** clears the session key. The key stays in memory
+until cleared or the console exits; it is never saved to the scope file or
+added to prompts, reports, logs, or command-line arguments. No environment
+forwarding is needed when entering the key inside the isolated console.
+
+Blank model/API URL fields inherit the scope configuration (the API URL falls
+back to local Ollama). A blank key uses the scope's `api_key_env`, if configured,
+or keyless access otherwise. Entered values take precedence over scope defaults.
+The model must be specified in the form or scope. Use **b** to cycle to the
+existing scripted Recon and Red-team workflows. Autonomy and scope enforcement
+are unchanged: actions requiring approval are denied in this non-interactive
+runner unless the selected autonomy permits them.
 
 ### The scope file (mandatory)
 
@@ -717,17 +804,98 @@ The `ai_redteam` tool probes an in-scope, OpenAI-compatible chat endpoint (the
 *application under test*) for LLM-specific weaknesses. It is classed **exploit**
 (intrusive) so it is gated by the approval matrix.
 
-| Probe | OWASP | Detection |
-|-------|-------|-----------|
-| Direct prompt injection · role-override jailbreak | LLM01 | reflected unique canary (confirmed) |
-| Insecure output handling (active-content emission) | LLM02 | reflected canary in `<script>` (confirmed) |
-| Sensitive info · system-prompt leakage | LLM06 / LLM07 | operator-supplied `system_marker` leaks into the reply |
-| Excessive agency (unsafe action compliance) | LLM08 | no refusal to a privileged instruction (heuristic) |
+| Probe | OWASP | Detection | Confidence |
+|-------|-------|-----------|------------|
+| Direct prompt injection · role-override jailbreak | LLM01 | reflected unique canary | tentative |
+| Insecure output handling (candidate active-content sink) | LLM05 | reflected canary in `<script>` | tentative |
+| System-prompt / instruction disclosure | LLM02 | operator-supplied `system_marker` leaks into the reply | **confirmed** |
+| Sensitive configuration disclosure | LLM02 | `system_marker` in a rules/tools dump | tentative |
+| Excessive agency (unsafe action compliance) | LLM06 | no refusal to a privileged instruction | tentative |
+| Indirect injection via retrieved content | LLM01 | canary echoed from an instruction-shaped document | tentative |
+| RAG tenant isolation · metadata-filter bypass · deletion retention | LLM08 | synthetic canary or marker returned | tentative |
+
+Only the marker leak is **confirmed**: you know that text was hidden, so its
+appearance is disclosure on its own. Canary probes stay *tentative* by design —
+an echoed canary shows the model followed the injected instruction, but nothing
+here observes the application's instruction boundary or whether the reply is ever
+rendered, so confirming those requires checking the deployed system prompt or the
+sink that consumes the output.
 
 Leak probes only fire when you supply `system_marker` (a phrase you know is in
 the target's system prompt), so there are no false positives when it is omitted.
 Findings land in the report with OWASP + CWE metadata under plugin
 `agent/ai-redteam`.
+
+#### Three outcomes, not two
+
+Every probe variant ends as **fail**, **pass**, or **unevaluated**, and the run
+reports `failed_count` / `passed_count` / `unevaluated_count`. A reply that was an
+HTTP error, a provider `error` body, or anything that is not a chat completion
+never reaches a detector, so a rejected key or a rate-limited target reads as
+*inconclusive* rather than a clean pass — a run with no verdicts at all carries an
+explicit `warning`. Rate limits and 5xx are retried twice before a variant is
+given up on, and each result carries the `requests` it actually cost.
+
+#### Repeated generations and attack success rate
+
+An LLM is stochastic, so one generation cannot separate "this target is
+vulnerable" from "we got unlucky once". Pass `generations` (1–20, default 1) to
+repeat every variant and get an **attack success rate** with a 95 % Wilson
+confidence interval:
+
+```jsonc
+{ "probe": "llm01-direct-injection", "variant": "plain", "verdict": "fail",
+  "generations": 10, "evaluated": 10, "hits": 3,
+  "asr": 0.3, "asr_ci_95": [0.108, 0.603], "requests": 10 }
+```
+
+Wilson rather than the textbook normal interval because these counts are small
+and the proportions sit near 0 or 1, exactly where the normal approximation
+returns nonsense such as a negative lower bound. `fail_threshold` (default `0`)
+sets the ASR a target may exhibit before the probe is failed — the default fails
+on any successful attack.
+
+#### Prompt mutators (opt-in)
+
+A guardrail that blocks *"ignore all previous instructions"* often passes the
+Base64 of the same sentence, so `mutators` re-asks every probe in obfuscated form
+and multiplies coverage without new prompts:
+
+| Mutator | Technique |
+|---|---|
+| `base64`, `rot13` | encode the instruction and ask the model to decode and follow it |
+| `leetspeak` | character substitution (`a→4`, `e→3`, …) that survives keyword filters |
+| `zerowidth` | zero-width spaces inside trigger words, splitting them at tokenization |
+| `payload-split` | cut the instruction mid-word into two variables the model concatenates |
+
+Pass a comma-separated list or `all`; an unknown name is an error rather than a
+silent omission. Mutators are **off by default** because each one re-sends the
+whole battery against an intrusive endpoint. A finding from a mutated prompt is
+labelled with the variant that produced it, which is itself the signal: a target
+that resists the plain prompt but not its Base64 has a filter, not a boundary.
+
+The canary survives every mutation — encodings carry it inside the payload the
+model decodes, in-place mutators copy it through verbatim — otherwise the battery
+would report false negatives it could not explain.
+
+#### Target shapes
+
+`shape` selects the wire format of the application under test, so the battery is
+not limited to OpenAI-compatible endpoints:
+
+| Shape | Request | Auth |
+|---|---|---|
+| `openai` *(default)* | `messages` | `Authorization: Bearer …` |
+| `anthropic` | `messages` + required `max_tokens` | `x-api-key` + `anthropic-version` |
+| `custom` | your `body_template` with a `{{prompt}}` placeholder | `auth_header` / `auth_prefix` |
+
+For `custom`, `text_path` is a JSON pointer to the reply text (`/data/answer`),
+so an in-house `POST /chat {"question": …}` service is probed like any other.
+The prompt is JSON-escaped into the template, so quotes and newlines in a probe
+cannot break the body. `temperature` is omitted unless you pass it, since some
+reasoning endpoints reject the field.
+
+#### Running it
 
 A brain can call `ai_redteam` mid-run, or you can invoke the battery directly
 with the **`--ai-redteam`** flag — no LLM brain required. In this mode `--target`
@@ -737,12 +905,31 @@ for the intrusive action, so it runs without a separate approval prompt — but 
 target must still be in scope (host allowlist, budget, and rate limit all apply).
 
 ```bash
+# Single pass over the battery.
 rustzap agent --scope scope.yaml \
   --target http://localhost:3000/v1/chat/completions \
   --ai-redteam --model gpt-4o-mini \
   --ai-redteam-marker "You are ShopBot, the internal assistant" \
   -o redteam-report.json
+
+# Measured run: 10 generations per variant, every obfuscation.
+rustzap agent --scope scope.yaml \
+  --target http://localhost:3000/v1/chat/completions \
+  --ai-redteam --model gpt-4o-mini \
+  --ai-redteam-generations 10 --ai-redteam-mutators all \
+  -o redteam-report.json
+
+# A non-OpenAI application.
+rustzap agent --scope scope.yaml \
+  --target http://localhost:8080/chat \
+  --ai-redteam --ai-redteam-shape custom \
+  --ai-redteam-body-template '{"question": "{{prompt}}"}' \
+  --ai-redteam-text-path /data/answer \
+  -o redteam-report.json
 ```
+
+> ⚠️ Request volume is `probes x (1 + mutators) x generations`. `--ai-redteam-mutators all
+> --ai-redteam-generations 10` is **110x** a default run — size it for a target you own.
 
 ### MCP server
 
@@ -1102,7 +1289,7 @@ rustzap/
 │   ├── installer.rs         # OS-aware companion-tool installer (`rustzap install`)
 │   └── tui/                 # Multi-tab console (Dashboard / Scan / Findings / Tools / Logs / Analyze / Agent)
 ├── scripts/
-│   └── install-tools.sh     # Canonical shell installer — used by Dockerfile & host
+│   └── install-tools.sh     # Full setup wrapper; explicit native package installation
 ├── Dockerfile               # Multi-stage build with all companion tools pre-installed
 ├── docker-compose.yml       # Compose service + optional Juice-Shop lab target
 └── Cargo.toml
@@ -1145,3 +1332,29 @@ Then register it in `ActiveScanner::new()` and `list_plugins()` inside `active.r
 ## License
 
 MIT — Use responsibly. Never scan systems without authorization.
+
+### Agent reliability and evidence
+
+The LLM planner uses a bounded projection of local state rather than an ever-growing
+conversation. Recent observations include stable `obs-N` IDs and truncation markers;
+compact older coverage, findings counts, and the attack-plan frontier remain visible.
+An LLM completion must cite successful observation IDs. These references establish
+provenance, not semantic proof that an arbitrary natural-language goal was met.
+Tool-generated findings remain authoritative.
+
+Malformed actions, unknown tools, invalid arguments, and unsupported evidence references
+receive one repair attempt, then fail explicitly. HTTP 429 and server errors use bounded
+backoff; authentication errors fail immediately. Timeouts and response limits are
+configured in `model.limits` in [scope.example.yaml](scope.example.yaml). Temperature is
+omitted unless configured. Select `output_token_field: max_completion_tokens` for an
+endpoint that requires it; the default `max_tokens` supports older/local endpoints.
+The run budget counts reported input and output usage; missing usage falls back to a
+conservative byte estimate. Provider billing for interrupted requests may be unknown.
+
+Each run writes a restricted-permission `OUTPUT.tasks-<run-id>.jsonl` journal containing
+task intents, outcomes, evidence IDs, and terminal status. Intents are flushed before tool
+execution. Completed identical calls are suppressed across the run, including alternating
+loops. Token/turn exhaustion, loop stops, and provider errors produce a nonzero exit and
+preserve the partial report. Journals redact recognized secrets but may still contain
+sensitive target output. They support audit and manual recovery; automatic resume and a
+separate Supervisor/Executor scheduler are not implemented.

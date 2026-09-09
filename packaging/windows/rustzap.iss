@@ -44,13 +44,17 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; Opt-in only — never force a PATH mutation on the user.
 Name: "addtopath"; Description: "Add RustZAP to PATH (recommended for CLI use)"; Flags: unchecked
 
+[Run]
+Filename: "{app}\{#AppExeName}"; Parameters: "install --yes"; Description: "Set up the full isolated Kali environment (requires Docker Desktop)"; Flags: postinstall skipifsilent runasoriginaluser
+
 [Files]
 Source: "..\..\target\x86_64-pc-windows-msvc\release\rustzap.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\RustZAP"; Filename: "{app}\{#AppExeName}"
+Name: "{group}\RustZAP"; Filename: "{app}\{#AppExeName}"; Parameters: "isolated --workspace ""{localappdata}\RustZAP\workspace"""
+Name: "{group}\RustZAP Native"; Filename: "{app}\{#AppExeName}"
 Name: "{group}\Uninstall RustZAP"; Filename: "{uninstallexe}"
 
 [Registry]

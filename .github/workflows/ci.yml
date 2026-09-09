@@ -44,3 +44,22 @@ jobs:
       - run: npm ci
       - run: npm run compile
       - run: npm test
+
+  isolated-environment:
+    name: full Kali environment (Linux amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: rustzap:ci-full
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify full installation and unprivileged runtime
+        run: |
+          docker run --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges rustzap:ci-full --version
+          docker run --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges rustzap:ci-full install --list
+          docker run --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges --entrypoint sh rustzap:ci-full -c 'test "$(id -u)" != 0 && semgrep --version && trivy --version && checkov --version'

@@ -13,7 +13,6 @@ analyze-report.json
 audit-report.json
 stress-report.json
 reports/
-Dockerfile
 .dockerignore
 docker-compose.yml
 README.md
