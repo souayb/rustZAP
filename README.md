@@ -84,6 +84,49 @@ open rustzap-<version>-macos-universal.dmg   # then run Install.command, or drag
 A Homebrew formula is also generated per release (`packaging/homebrew/`); see
 `packaging/README.md` for its current publishing status.
 
+### Verifying a download, and the OS trust warnings
+
+**Always verify the checksum first.** It is the only integrity check that does
+not depend on code signing, and it is the one that matters most for a security
+tool:
+
+```bash
+# Linux / macOS - run in the directory holding the downloaded artifact
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+```powershell
+# Windows - compare against the matching line in SHA256SUMS
+Get-FileHash .\rustzap-<version>-windows-x64.exe -Algorithm SHA256
+```
+
+Release artifacts are **not yet code-signed** (see `packaging/README.md` ->
+"Code signing" for status and how to enable it), so Windows and macOS will each
+warn that the publisher is unverified. That warning is expected, not a sign of
+tampering - but it is also exactly what tampering would look like, which is why
+you check the hash above *before* clicking through:
+
+- **Windows (SmartScreen):** "Windows protected your PC" -> **More info** ->
+  **Run anyway**.
+- **macOS (Gatekeeper):** the `.dmg` and the `Install.command` inside it are
+  both quarantined on download. Clear it after verifying the checksum:
+
+  ```bash
+  xattr -c rustzap-<version>-macos-universal.dmg
+  ```
+
+  (`xattr -c` clears all extended attributes; unlike `xattr -d
+  com.apple.quarantine`, it does not error out when the download method left no
+  quarantine flag in the first place — `curl`/`wget` downloads don't.)
+
+  Then `open` the DMG and run `Install.command`. If macOS still refuses, right-
+  click `Install.command` -> **Open** -> **Open**.
+- **Linux:** `.deb`/`.rpm`/AppImage carry no OS-level publisher check, so there
+  is no warning to bypass; the checksum is the verification step.
+
+Prefer to avoid the warnings entirely? Build [from source](#from-source) - it is
+a single `cargo build --release`.
+
 ### From source
 
 ```bash

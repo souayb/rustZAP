@@ -97,15 +97,35 @@ jobs:
       - run: cargo build --release --target x86_64-pc-windows-msvc --bin rustzap
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
+      # Sign the payload binary BEFORE Inno Setup packs it, then sign the
+      # installer itself afterwards — both halves must carry a signature or
+      # SmartScreen still flags the extracted rustzap.exe. sign-windows.ps1
+      # skips signing (loudly) when WINDOWS_PFX_BASE64 is absent, mirroring how
+      # build-macos.sh falls back to ad-hoc signing rather than faking a cert.
+      - name: Sign rustzap.exe (Authenticode)
+        env:
+          WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: >
+          pwsh scripts/packaging/sign-windows.ps1
+          target\x86_64-pc-windows-msvc\release\rustzap.exe
+        shell: pwsh
       - name: Build installer
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
             /DAppVersion=${{ needs.version.outputs.version }} `
             packaging\windows\rustzap.iss
         shell: pwsh
-      # TODO once a real Authenticode certificate is available as a CI secret:
-      #   signtool sign /fd SHA256 /tr <timestamp-url> /td SHA256 /f cert.pfx /p %PFX_PASSWORD% dist\*.exe
-      # Never invented here — unsigned until WINDOWS_PFX/WINDOWS_PFX_PASSWORD secrets exist.
+      - name: Sign installer (Authenticode)
+        env:
+          WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: >
+          pwsh scripts/packaging/sign-windows.ps1
+          dist\rustzap-${{ needs.version.outputs.version }}-windows-x64.exe
+        shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
