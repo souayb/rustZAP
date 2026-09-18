@@ -18,6 +18,9 @@ Use this file so changes to **RustZAP** are correct, safe, and shippable. When i
 - `analyze` / `audit` must **ask before reading a local repo**. CLI: TTY prompt, or `--yes` in CI. TUI Analyze tab: confirmation dialog, then `assume_yes` only after **Y**. Do not walk the filesystem silently.
 - Do not add **default-on** intrusive behavior (aggressive path brute force, OOB callbacks to third parties, etc.) without **explicit CLI flags** and README warnings.
 - Destructive or high-rate tests belong behind opt-in flags and local integration tests — never hard-coded against real domains.
+- `rate-limit-missing` is a **bounded detection probe** (a fixed ≤15-request burst through `HttpSafetyGate`, checking only for the *absence* of 429/503/`Retry-After`), not a load/DoS attack. It is opt-in only and must never be added to a CLI default `--plugins` list. Actual load/stress testing against an authorized target is the separate, already-opt-in `rustzap stress` subcommand (`src/stress.rs`) — do not blur the two or make `rate-limit-missing` send more than its fixed burst size.
+- `cache-deception` and `cache-poisoning` (`src/cache_abuse.rs`) are opt-in only — higher false-positive risk (they require a shared cache in front of the target to mean anything) and heavier request patterns than the rest of the active suite.
+- `rfi` (`src/active.rs`) follows the `sqli-oob` pattern: inert unless `RUSTZAP_OOB_DOMAIN` names a listener, and even then only reports `tentative` — never infer success from the HTTP response.
 
 ---
 
@@ -59,8 +62,11 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 | `src/scanner.rs` | `run_scan`: spider → passive → active → `Report` |
 | `src/spider.rs` | Crawl same-host HTML links; queue + depth |
 | `src/passive.rs` | Header/body checks; `PassiveScanner::check_url` |
-| `src/active.rs` | `ScanPlugin` trait; **registered** active plugins |
+| `src/active.rs` | `ScanPlugin` trait; **registered** active plugins (incl. `crlf-injection`, `host-header-injection`, `rfi`) |
 | `src/sqli_advanced.rs` | Extra `ScanPlugin` types — **verify whether `mod sqli_advanced` exists in `main.rs`** when debugging “plugin missing” |
+| `src/sensitive_paths.rs` | `sensitive-paths` opt-in plugin — curated well-known/backup path wordlist |
+| `src/cache_abuse.rs` | Opt-in `cache-deception` / `cache-poisoning` plugins |
+| `src/rate_limit.rs` | Opt-in `rate-limit-missing` plugin — bounded burst, not a load/DoS attack |
 | `src/report.rs` | JSON/CSV/HTML report; `Finding` aggregation |
 | `src/types.rs` | `Finding`, `Severity`, `DiscoveredUrl`, … |
 | `src/proxy.rs` | Intercepting proxy |
@@ -91,6 +97,7 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 - Each plugin: `name()`, `description()`, `async fn scan(&self, client, target) -> Vec<Finding>`.
 - **Registration:** plugins must appear in `ActiveScanner::new`’s `all_plugins` vec **and** `list_plugins()` if you want `rustzap plugins` to list truthfully.
 - **Selection:** `enabled` uses **substring** matching on plugin name (case-insensitive) or literal `all`.
+- Default `--plugins` (CLI + TUI, keep in sync) now includes `crlf-injection` and `host-header-injection` — both are single-request, non-destructive checks. `rfi`, `sensitive-paths`, `cache-deception`, `cache-poisoning`, and `rate-limit-missing` stay **opt-in only** (never add them to a default `--plugins` string).
 
 ### Active scan gating (critical)
 
@@ -99,7 +106,7 @@ In `active.rs`, URLs **without** query parameters are **skipped** for active sca
 ### Passive checks
 
 - Add new checks as functions returning `Vec<Finding>`, then call them from `PassiveScanner::check_url`.
-- Use stable `plugin` strings: e.g. `passive/cors`, `passive/missing-headers` — downstream normalizers depend on consistency.
+- Use stable `plugin` strings: e.g. `passive/cors`, `passive/missing-headers`, `passive/csrf-missing-token` — downstream normalizers depend on consistency.
 - Populate `cwe` / `owasp_category` when applicable (`Finding::with_cwe`, `with_owasp`).
 
 ### HTTP client

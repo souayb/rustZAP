@@ -162,6 +162,17 @@ fn golden_matrix_covers_all_known_passive_plugins() {
     let stxt = evaluate_security_txt("https://example.com/.well-known/security.txt", 404, "", now);
     covered.extend(stxt.iter().map(|f| f.plugin.as_str()));
 
+    // CSRF — POST form with no CSRF-shaped hidden field and no csrf meta tag
+    let csrf_body =
+        r#"<form method="post" action="/transfer"><input type="text" name="amount"></form>"#;
+    let csrf = check_response_passive(
+        "https://example.com/transfer",
+        200,
+        &HeaderMap::new(),
+        csrf_body,
+    );
+    covered.extend(csrf.iter().map(|f| f.plugin.as_str()));
+
     for plugin in known_plugin_names() {
         assert!(
             covered.contains(plugin),
@@ -390,4 +401,27 @@ fn golden_combined_fixture_plugin_set() {
     ] {
         assert!(got.contains(expected), "missing {expected} in {got:?}");
     }
+}
+
+#[test]
+fn golden_csrf_flags_unprotected_post_form() {
+    let body = r#"<form method="POST" action="/account/delete"><input type="submit"></form>"#;
+    let findings =
+        check_response_passive("https://example.com/account", 200, &HeaderMap::new(), body);
+    assert_has_plugin(&findings, "passive/csrf-missing-token");
+    assert_finding_json_roundtrip(&findings);
+}
+
+#[test]
+fn golden_csrf_ignores_protected_post_form() {
+    let body = r#"<form method="POST" action="/account/delete">
+        <input type="hidden" name="authenticity_token" value="tok">
+        <input type="submit">
+    </form>"#;
+    let findings =
+        check_response_passive("https://example.com/account", 200, &HeaderMap::new(), body);
+    assert!(
+        !plugins(&findings).contains("passive/csrf-missing-token"),
+        "form with an authenticity_token hidden field must not be flagged"
+    );
 }

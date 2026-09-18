@@ -61,7 +61,7 @@ enum Commands {
         insecure: bool,
         #[arg(
             long,
-            default_value = "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain"
+            default_value = "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain,crlf-injection,host-header-injection"
         )]
         plugins: String,
         /// Import OpenAPI 3.x JSON from a local file (expands paths into scan surface)
@@ -238,7 +238,7 @@ enum Commands {
 
         #[arg(
             long,
-            default_value = "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain"
+            default_value = "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain,crlf-injection,host-header-injection"
         )]
         plugins: String,
 

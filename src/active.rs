@@ -89,6 +89,12 @@ pub fn all_active_plugins() -> Vec<Box<dyn ScanPlugin>> {
         Box::new(HttpMethodsPlugin::new()),
         Box::new(RedirectChainPlugin::new()),
         Box::new(crate::sensitive_paths::SensitivePathsPlugin::new()),
+        Box::new(CrlfInjectionPlugin),
+        Box::new(HostHeaderInjectionPlugin::new()),
+        Box::new(RfiPlugin),
+        Box::new(crate::cache_abuse::CacheDeceptionPlugin::new()),
+        Box::new(crate::cache_abuse::CachePoisoningPlugin),
+        Box::new(crate::rate_limit::RateLimitMissingPlugin::new()),
     ];
     plugins.extend(crate::sqli_advanced::plugins());
     plugins
@@ -456,6 +462,41 @@ async fn options_response(client: &reqwest::Client, url: &str) -> Option<(u16, O
     }
 }
 
+/// GET a URL with optional extra request headers, returning status, the full
+/// response `HeaderMap`, and the body. Shared by plugins that need to inspect
+/// response headers (CRLF/header injection, Host header injection, cache
+/// deception/poisoning, rate-limit probing) rather than just status+body.
+/// Gated through the same `HttpSafetyGate` as every other active helper.
+pub async fn get_with_headers(
+    client: &reqwest::Client,
+    url: &str,
+    extra_headers: &[(&str, &str)],
+) -> Option<(u16, reqwest::header::HeaderMap, String)> {
+    if let Some(gate) = active_gate() {
+        if gate.before_url_request("GET", url, None).await.is_err() {
+            return None;
+        }
+    }
+    let start = std::time::Instant::now();
+    let mut req = client.get(url).timeout(Duration::from_secs(8));
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let headers = resp.headers().clone();
+            let body = resp.text().await.unwrap_or_default();
+            let latency = start.elapsed().as_millis() as u64;
+            if let Some(gate) = active_gate() {
+                let _ = gate.after_response(status, latency);
+            }
+            Some((status, headers, body))
+        }
+        Err(_) => None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // XSS Plugin
 // ─────────────────────────────────────────────────────────────────────────────
@@ -713,6 +754,78 @@ impl ScanPlugin for PathTraversalPlugin {
         }
 
         findings
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RFI Plugin — Out-of-Band, detection only (no real callback server)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Remote File Inclusion: like `sqli-oob`, this can only be *confirmed* by an
+/// external listener observing a callback from the target's server. Reporting
+/// success from the HTTP response alone would be guesswork, so this plugin
+/// stays inert unless `RUSTZAP_OOB_DOMAIN` names a listener (interactsh/Burp
+/// Collaborator). Opt-in only — not part of the default `--plugins` set.
+pub struct RfiPlugin;
+
+#[async_trait]
+impl ScanPlugin for RfiPlugin {
+    fn name(&self) -> &str {
+        "rfi"
+    }
+    fn description(&self) -> &str {
+        "Remote File Inclusion — OOB payloads (requires RUSTZAP_OOB_DOMAIN listener)"
+    }
+
+    async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
+        let canary_domain = match std::env::var("RUSTZAP_OOB_DOMAIN") {
+            Ok(d) if !d.trim().is_empty() => d,
+            _ => return vec![],
+        };
+        let token = crate::verify::rand_token(8);
+
+        let payloads = [
+            format!("http://{}.{}/rustzap-rfi.txt", token, canary_domain),
+            format!("https://{}.{}/rustzap-rfi.txt", token, canary_domain),
+            format!("//{}.{}/rustzap-rfi.txt", token, canary_domain),
+        ];
+
+        // Dispatch every payload so any that reach a vulnerable include/require
+        // sink trigger a callback to the listener. We never infer success from
+        // the HTTP response — that would be self-validation.
+        let mut dispatched = Vec::new();
+        for payload in &payloads {
+            let variants = build_injection_urls_adv(target, payload);
+            for (param, url) in variants {
+                let _ = get_body(client, &url).await;
+                dispatched.push(format!("{} (param `{}`)", payload, param));
+            }
+        }
+
+        if dispatched.is_empty() {
+            return vec![];
+        }
+
+        vec![Finding::new(
+            "Remote File Inclusion — Out-of-Band Payloads Dispatched",
+            Severity::Info,
+            &target.url,
+            format!(
+                "RFI payloads pointing at listener `{}` were sent to parameters that may reach an include()/require()-style sink. Confirmation requires an observed HTTP/DNS callback on that listener — the scan response alone cannot prove code execution.",
+                canary_domain
+            ),
+            "Check your interactsh/Burp Collaborator listener for callbacks bearing the per-request token. A callback confirms the parameter is passed to a remote-inclusion sink; disable remote includes (e.g. PHP `allow_url_include=Off`) and enforce an allowlist for any server-side URL fetch.",
+            "active/rfi",
+        )
+        .with_evidence(format!(
+            "Dispatched {} OOB payload variant(s) to listener {}: {}",
+            dispatched.len(),
+            canary_domain,
+            dispatched.join("; ")
+        ))
+        .with_cwe(98)
+        .with_owasp("A03:2021 – Injection")
+        .tentative()]
     }
 }
 
@@ -1503,6 +1616,173 @@ impl ScanPlugin for RedirectChainPlugin {
         }
 
         analyze_redirect_chain(&hops, MAX_HOPS - 1)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CRLF Injection Plugin
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Injects a raw CR/LF sequence followed by a uniquely-named header into a
+/// query parameter. If the server decodes the sequence and reflects it
+/// unsanitized into the raw response (classic HTTP response splitting), our
+/// invented header name — which cannot legitimately preexist — shows up in
+/// the parsed response headers. That is unambiguous evidence, so this fires
+/// `confirmed()` with no baseline diff needed.
+pub struct CrlfInjectionPlugin;
+
+#[async_trait]
+impl ScanPlugin for CrlfInjectionPlugin {
+    fn name(&self) -> &str {
+        "crlf-injection"
+    }
+    fn description(&self) -> &str {
+        "CRLF Injection — HTTP response splitting via unsanitized CR/LF in a reflected parameter"
+    }
+
+    async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        let token = crate::verify::rand_token(8);
+        let header_name = format!("x-rustzap-crlf-{}", token);
+        let payload = format!("rustzap\r\n{}: injected", header_name);
+
+        let variants = build_injection_urls_adv(target, &payload);
+        for (param, url) in variants {
+            let Some((status, headers, _body)) = get_with_headers(client, &url, &[]).await else {
+                continue;
+            };
+            if let Some(val) = headers.get(header_name.as_str()) {
+                let val_str = val.to_str().unwrap_or("");
+                findings.push(
+                    Finding::new(
+                        "CRLF Injection (HTTP Response Splitting)",
+                        Severity::High,
+                        &target.url,
+                        "A parameter value containing an unencoded CR/LF sequence was reflected into the raw HTTP response as a new header, confirming the application does not sanitize newline characters before writing user input into response headers.",
+                        "Strip or reject CR/LF characters from any value written into a response header (redirect targets, cookies, cache headers). Use your framework's header-setting API rather than concatenating raw strings.",
+                        "active/crlf-injection",
+                    )
+                    .with_parameter(&param)
+                    .with_evidence(format!(
+                        "HTTP {} — injected header `{}: {}` appeared in the response, unreachable by any pre-existing page content",
+                        status, header_name, val_str
+                    ))
+                    .with_cwe(93)
+                    .with_owasp("A03:2021 – Injection")
+                    .confirmed(),
+                );
+                return findings;
+            }
+        }
+
+        findings
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host Header Injection Plugin
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct HostHeaderInjectionPlugin {
+    seen_paths: Mutex<HashSet<String>>,
+}
+
+impl HostHeaderInjectionPlugin {
+    pub fn new() -> Self {
+        Self {
+            seen_paths: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+impl Default for HostHeaderInjectionPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ScanPlugin for HostHeaderInjectionPlugin {
+    fn name(&self) -> &str {
+        "host-header-injection"
+    }
+    fn description(&self) -> &str {
+        "Host Header Injection — spoofed Host/X-Forwarded-Host reflected in body or redirect Location"
+    }
+
+    fn always_run(&self) -> bool {
+        true
+    }
+
+    async fn scan(&self, client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
+        let mut findings = Vec::new();
+
+        // Dedupe by path: the injected Host is path-independent, so query
+        // string variants of the same page would otherwise repeat the check.
+        let path_key = match Url::parse(&target.url) {
+            Ok(u) => format!(
+                "{}://{}{}",
+                u.scheme(),
+                u.host_str().unwrap_or(""),
+                u.path()
+            ),
+            Err(_) => return findings,
+        };
+        {
+            let mut seen = self.seen_paths.lock().await;
+            if !seen.insert(path_key) {
+                return findings;
+            }
+        }
+
+        let token = crate::verify::rand_token(10);
+        let evil_host = format!("rustzap-hhi-{}.example", token);
+        let extra_headers = [
+            ("Host", evil_host.as_str()),
+            ("X-Forwarded-Host", evil_host.as_str()),
+        ];
+
+        let Some((status, headers, body)) =
+            get_with_headers(client, &target.url, &extra_headers).await
+        else {
+            return findings;
+        };
+
+        let evil_lower = evil_host.to_lowercase();
+        let reflected_in_location = headers
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(|l| l.to_lowercase().contains(&evil_lower))
+            .unwrap_or(false);
+        let reflected_in_body = body.to_lowercase().contains(&evil_lower);
+
+        if reflected_in_location || reflected_in_body {
+            findings.push(
+                Finding::new(
+                    "Host Header Injection",
+                    Severity::Medium,
+                    &target.url,
+                    "The application reflects an attacker-controlled Host/X-Forwarded-Host header back into the response (redirect Location or body), which can enable cache poisoning, password-reset-link poisoning, or SSRF pivoting on frameworks that build absolute URLs from the Host header.",
+                    "Validate the Host header against an explicit allowlist of expected hostnames. Never trust Host or X-Forwarded-Host when building absolute URLs, emails, or cache keys.",
+                    "active/host-header-injection",
+                )
+                .with_evidence(format!(
+                    "Sent Host/X-Forwarded-Host: {} — HTTP {} reflected it in {}",
+                    evil_host,
+                    status,
+                    if reflected_in_location {
+                        "the Location header"
+                    } else {
+                        "the response body"
+                    }
+                ))
+                .with_cwe(20)
+                .with_owasp("A05:2021 – Security Misconfiguration")
+                .confirmed(),
+            );
+        }
+
+        findings
     }
 }
 

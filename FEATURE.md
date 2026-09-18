@@ -11,6 +11,8 @@ This document tracks **DAST / passive / discovery** ideas and what is still open
 | **Spider / discovery** | `src/spider.rs` — queue, `extract_urls`, robots/sitemap | Before passive/active |
 | **TLS / transport** | `src/tls.rs` | Per unique host during scan |
 | **Sensitive paths** | `src/sensitive_paths.rs` — opt-in plugin | When `--plugins` includes `sensitive-paths` |
+| **Cache abuse** | `src/cache_abuse.rs` — opt-in `cache-deception` / `cache-poisoning` | When `--plugins` includes those names |
+| **Rate-limit probe** | `src/rate_limit.rs` — opt-in `rate-limit-missing`, bounded burst | When `--plugins` includes `rate-limit-missing` |
 | **External worker** | `src/tools.rs`, `src/installer.rs` | Optional shell-out to companion tools |
 | **Native static** | `src/analyze/inventory.rs`, `src/analyze/native/` | `rustzap analyze --tools native` (Phase 2.5) or TUI tab **6·Analyze**. `analyze`/`audit` require repo consent (CLI prompt / `--yes`, or TUI `[Y]/[N]` dialog) |
 
@@ -70,6 +72,14 @@ that need human follow-up (e.g. dispatched OOB payloads) are `tentative`.
 | **G3** | Agent explore-first + Exploit classes | `run_plugin` / `scan_target` / `replay_request` = Exploit; mutating `http_probe` elevated; recon-before-exploit gate; `export_autofix` tool + `rustzap autofix` |
 | **G4** | Windows TUI key doubling fix | `src/tui/mod.rs` — only `KeyEventKind::Press` (Press+Release no longer doubles chars) |
 | **G5** | AI red-team: probe/detector/evaluator split | `src/agent/redteam/` — `probes.rs` catalogue, `detect.rs` detectors + reply classification, `eval.rs` ASR with 95% Wilson CI, `mutate.rs` prompt obfuscations, `target.rs` OpenAI/Anthropic/custom shapes; three outcomes (fail/pass/**unevaluated**) so a rejected key never reads as a pass; confidence tracks evidence — only marker leaks are `confirmed` |
+| **H1** | CRLF Injection | `active/crlf-injection` — `src/active.rs`; unique-header canary, no baseline needed; **default plugin** |
+| **H2** | Host Header Injection | `active/host-header-injection` — `src/active.rs`; spoofed `Host`/`X-Forwarded-Host` reflected in body or `Location`; **default plugin** |
+| **H3** | CSRF — missing token on POST forms | `passive/csrf-missing-token` — `src/passive.rs`; skips pages with a `csrf-token` meta tag (JS/header-delivered token) to avoid false positives |
+| **H4** | Web Cache Deception | `active/cache-deception` — `src/cache_abuse.rs`; **opt-in** (higher FP risk; needs a shared cache to matter) |
+| **H5** | Web Cache Poisoning | `active/cache-poisoning` — `src/cache_abuse.rs`; unkeyed `X-Forwarded-Host` reflected into a cache-hit response; **opt-in** |
+| **H6** | RFI (Remote File Inclusion) | `active/rfi` — `src/active.rs`; OOB pattern identical to `sqli-oob`, inert unless `RUSTZAP_OOB_DOMAIN` set; **opt-in** |
+| **H7** | Rate-limit-missing detection | `active/rate-limit-missing` — `src/rate_limit.rs`; bounded ≤15-request burst through `HttpSafetyGate`, flags absence of 429/503/`Retry-After`; **opt-in, not a load/DoS attack** (see `rustzap stress` for that) |
+| **H8** | Sensitive-paths wordlist expansion | `src/sensitive_paths.rs` — added `.git/index`, `.npmrc`, `.htpasswd`, IaC state files, IDE configs, more `.bak` variants |
 
 Tier **E** tracks **E6** (`serve`) remains **planned**. Agentic tester (**E7**) is shipped with G1–G3 hardening — see IMPLEMENTATION_PLAN Phase 5.
 
@@ -94,6 +104,22 @@ Tier **E** tracks **E6** (`serve`) remains **planned**. Agentic tester (**E7**) 
 
 6. **G5 — Strix Docker sandbox / multi-agent** (not planned in-tree)
    External Strix CLI parity (sandbox exploit runtime, graph-of-agents) remains out of scope; prefer wiring RustZAP’s native gates and PoCs.
+
+7. **H-backlog — intentionally not implemented (unauthenticated DAST context)**
+   From an AllAboutBugBounty-style taxonomy pass, these categories need either
+   multi-identity/authenticated context, a real destructive action, or an
+   external OAuth flow to test without an unacceptable false-positive rate —
+   they stay documented backlog rather than half-working heuristics:
+   - **IDOR** — requires two distinct authenticated identities to prove one
+     can read the other's resource; sequential-ID probing alone is noise.
+   - **Mass Assignment** — requires knowing the object schema and an
+     authenticated baseline to diff against.
+   - **Arbitrary File Upload** — requires discovering real upload endpoints
+     and sending actual file bodies; unsafe to do generically/unauthenticated.
+   - **OAuth Misconfiguration** — requires flow-aware crawling (authorize →
+     redirect → token) rather than a single-request probe.
+   - **SSI Injection / Reflected File Download** — rare in modern stacks;
+     low value relative to effort right now.
 
 ---
 
