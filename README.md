@@ -995,22 +995,32 @@ staging or lab target.
 | `graphql-introspection` | GraphQL schema exposure via introspection query | A05:2021 | CWE-200 |
 | `http-methods` | OPTIONS probe — flags dangerous methods (PUT/DELETE/TRACE/PATCH) | A05:2021 | CWE-650 |
 | `redirect-chain` | Redirect chain analyzer — HTTPS→HTTP downgrade, cross-origin, loops, excessive hops | A02:2021 | CWE-601 |
+| `crlf-injection` | CRLF Injection — HTTP response splitting via unsanitized CR/LF reflected into a response header | A03:2021 | CWE-93 |
+| `host-header-injection` | Host Header Injection — spoofed `Host`/`X-Forwarded-Host` reflected in body or redirect `Location` | A05:2021 | CWE-20 |
 | `sensitive-paths` ⚠️ | Well-known / backup file probe (`/.git/HEAD`, `/.env`, `/backup.zip`, …) — **opt-in, default OFF** | A05:2021 | CWE-538 |
+| `rfi` ⚠️ | Remote File Inclusion — OOB payloads. **Inert unless `RUSTZAP_OOB_DOMAIN` names a listener**; reported `tentative` until you observe a callback — **opt-in** | A03:2021 | CWE-98 |
+| `cache-deception` ⚠️ | Web Cache Deception — static-suffix path caching of dynamic/personalized content — **opt-in, higher false-positive risk** | A05:2021 | CWE-524 |
+| `cache-poisoning` ⚠️ | Web Cache Poisoning — unkeyed `X-Forwarded-Host` reflected into a cache-hit response — **opt-in, higher false-positive risk** | A05:2021 | CWE-444 |
+| `rate-limit-missing` ⚠️ | **Bounded ≤15-request burst** (not a load/DoS attack — see [Stress Testing](#stress-testing)) through the safety gate; flags the absence of `429`/`503`/`Retry-After` — **opt-in** | A04:2021 | CWE-799 |
 
-⚠️ `sensitive-paths` is intentionally excluded from defaults. Enable it only against targets you are explicitly authorized to scan — it issues 25+ HEAD requests against well-known dotfile and backup paths.
+⚠️ `sensitive-paths`, `rfi`, `cache-deception`, `cache-poisoning`, and `rate-limit-missing` are intentionally excluded from defaults. Enable them only against targets you are explicitly authorized to scan. `sensitive-paths` issues 25+ HEAD requests against well-known dotfile and backup paths; `cache-deception`/`cache-poisoning` carry a higher false-positive risk (they only mean something behind a shared cache); `rate-limit-missing` sends a small fixed burst through the same `HttpSafetyGate` (`--max-rps`, circuit breaker) as every other active plugin — it is a detection probe, not a stress test.
 
 Run specific plugins only:
 
 ```bash
-# Default plugin set (everything except sensitive-paths)
+# Default plugin set (everything except the opt-in ones below)
 rustzap scan --target https://example.com
 
 # Narrow to a few plugins
 rustzap scan --target https://example.com --plugins xss,sqli,ssrf
 
-# Opt in to sensitive-path probing
+# Opt in to the higher-risk / higher-FP plugins
 rustzap scan --target https://example.com \
-  --plugins xss,sqli,ssrf,sensitive-paths
+  --plugins xss,sqli,ssrf,sensitive-paths,cache-deception,cache-poisoning,rate-limit-missing
+
+# Opt in to RFI OOB dispatch (requires a listener domain)
+RUSTZAP_OOB_DOMAIN=your-interactsh-domain.example \
+  rustzap scan --target https://example.com --plugins xss,sqli,rfi
 ```
 
 ---
@@ -1035,6 +1045,7 @@ rustzap scan --target https://example.com \
 | CSP `unsafe-inline`, `unsafe-eval`, wildcard, `object-src` not `'none'` | `passive/csp-unsafe-directives` | Low → High |
 | Tech-stack fingerprint (Server, generator meta, framework markers) | `passive/tech-fingerprint` | Info |
 | JWT `alg:none`, missing `exp`, lifetime > 1 year | `passive/jwt-heuristic` | High / Medium / Low |
+| POST form missing an anti-CSRF token field (skipped if a `csrf-token` meta tag is present) | `passive/csrf-missing-token` | Low |
 
 The `security.txt` probe runs **once per origin** (not once per URL). The CSP check inspects both `Content-Security-Policy` and `Content-Security-Policy-Report-Only` — findings on the Report-Only header are downgraded one severity tier.
 

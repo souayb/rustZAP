@@ -188,7 +188,7 @@ impl Default for ConfigForm {
             target: "https://example.com".to_string(),
             depth: 3,
             concurrency: 10,
-            plugins: "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain".to_string(),
+            plugins: "xss,sqli,nosql,path-traversal,open-redirect,ssrf,xxe,cmd-injection,ssti,graphql-introspection,http-methods,redirect-chain,crlf-injection,host-header-injection".to_string(),
             output: "rustzap-report.json".to_string(),
             passive_only: false,
             insecure: false,

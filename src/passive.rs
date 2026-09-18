@@ -139,6 +139,7 @@ impl PassiveScanner {
         findings.extend(check_csp_policy(url, &headers));
         findings.extend(check_tech_fingerprint(url, &headers, &body));
         findings.extend(check_jwt_surface(url, &body));
+        findings.extend(check_csrf_missing_token(url, &body));
 
         findings
     }
@@ -167,6 +168,7 @@ pub fn check_response_passive(
     findings.extend(check_csp_policy(url, headers));
     findings.extend(check_tech_fingerprint(url, headers, body));
     findings.extend(check_jwt_surface(url, body));
+    findings.extend(check_csrf_missing_token(url, body));
     findings
 }
 
@@ -1260,6 +1262,99 @@ fn parse_jwt_number_claim(json: &str, key: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CSRF — missing anti-CSRF token on state-changing forms
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Heuristic CSRF-token check: parses `<form method="post">` elements and
+/// flags any that lack a hidden input whose name looks like a CSRF token
+/// (`csrf`, `xsrf`, `_token`, `authenticity_token`, `nonce`/anti-forgery
+/// variants). If the page carries a `<meta name="csrf-token">` (the
+/// Rails/Laravel pattern of delivering a token to JS for an
+/// `X-CSRF-Token`/`X-XSRF-TOKEN` header instead of a hidden field), the
+/// check is skipped entirely — flagging that would be a false positive
+/// against a legitimately-protected AJAX form.
+pub fn check_csrf_missing_token(url: &str, body: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    if body.len() > 2_000_000 || !body.contains("<form") {
+        return findings; // skip pathologically large bodies and pages with no forms
+    }
+
+    let document = scraper::Html::parse_document(body);
+
+    let Ok(meta_selector) =
+        scraper::Selector::parse(r#"meta[name="csrf-token"], meta[name="csrf-param"]"#)
+    else {
+        return findings;
+    };
+    if document.select(&meta_selector).next().is_some() {
+        return findings;
+    }
+
+    let (Ok(form_selector), Ok(input_selector)) = (
+        scraper::Selector::parse("form"),
+        scraper::Selector::parse("input"),
+    ) else {
+        return findings;
+    };
+
+    let Ok(token_name_re) = regex::Regex::new(
+        r"(?i)csrf|xsrf|_token|authenticity_token|anti-forgery|requestverificationtoken",
+    ) else {
+        return findings;
+    };
+
+    for form in document.select(&form_selector) {
+        let method = form.value().attr("method").unwrap_or("get").to_lowercase();
+        if method != "post" {
+            continue;
+        }
+
+        let has_token = form.select(&input_selector).any(|input| {
+            input
+                .value()
+                .attr("name")
+                .map(|n| token_name_re.is_match(n))
+                .unwrap_or(false)
+        });
+        if has_token {
+            continue;
+        }
+
+        let action = form
+            .value()
+            .attr("action")
+            .unwrap_or("(same page)")
+            .to_string();
+        findings.push(
+            Finding::new(
+                "Form Missing CSRF Token",
+                Severity::Low,
+                url,
+                format!(
+                    "A state-changing form (method=POST, action=\"{}\") has no hidden field matching common anti-CSRF token naming, and the page carries no csrf meta tag either. If the endpoint relies solely on cookies for authentication, it may be vulnerable to Cross-Site Request Forgery.",
+                    action
+                ),
+                "Include a per-session (or per-request) anti-CSRF token as a hidden form field and verify it server-side, or rely on SameSite=Strict/Lax cookies plus double-submit-cookie / Origin header verification.",
+                "passive/csrf-missing-token",
+            )
+            .with_evidence(format!(
+                "<form method=\"post\" action=\"{}\"> has no CSRF-token-shaped hidden input",
+                action
+            ))
+            .with_cwe(352)
+            .with_owasp("A01:2021 – Broken Access Control")
+            .tentative(),
+        );
+
+        if findings.len() >= 5 {
+            break; // cap output per page
+        }
+    }
+
+    findings
+}
+
 fn redact_jwt(token: &str) -> String {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -1287,6 +1382,7 @@ pub fn known_plugin_names() -> &'static [&'static str] {
         "passive/tech-fingerprint",
         "passive/jwt-heuristic",
         "passive/security-txt",
+        "passive/csrf-missing-token",
     ]
 }
 
@@ -1601,5 +1697,52 @@ Policy: https://example.com/policy\n";
             assert!(!ev.contains("somesignatureGoesHere1234"));
             assert!(ev.contains("REDACTED"));
         }
+    }
+
+    #[test]
+    fn csrf_flags_post_form_without_token() {
+        let body = r#"<html><body>
+            <form method="POST" action="/transfer">
+                <input type="text" name="amount">
+                <input type="submit" value="Send">
+            </form>
+        </body></html>"#;
+        let findings = check_csrf_missing_token("https://example.com/transfer", body);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].plugin, "passive/csrf-missing-token");
+    }
+
+    #[test]
+    fn csrf_ignores_form_with_hidden_token() {
+        let body = r#"<html><body>
+            <form method="post" action="/transfer">
+                <input type="hidden" name="csrf_token" value="abc123">
+                <input type="text" name="amount">
+            </form>
+        </body></html>"#;
+        assert!(check_csrf_missing_token("https://example.com/transfer", body).is_empty());
+    }
+
+    #[test]
+    fn csrf_ignores_get_forms() {
+        let body = r#"<form method="get" action="/search"><input name="q"></form>"#;
+        assert!(check_csrf_missing_token("https://example.com/search", body).is_empty());
+    }
+
+    #[test]
+    fn csrf_skips_page_with_csrf_meta_tag() {
+        let body = r#"<html><head><meta name="csrf-token" content="xyz"></head><body>
+            <form method="post" action="/transfer"><input type="text" name="amount"></form>
+        </body></html>"#;
+        assert!(check_csrf_missing_token("https://example.com/transfer", body).is_empty());
+    }
+
+    #[test]
+    fn csrf_skips_pages_with_no_forms() {
+        assert!(check_csrf_missing_token(
+            "https://example.com",
+            "<html><body>no forms here</body></html>"
+        )
+        .is_empty());
     }
 }

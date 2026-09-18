@@ -49,6 +49,22 @@ pub const SENSITIVE_PATHS: &[&str] = &[
     "/.aws/credentials",
     "/id_rsa",
     "/.ssh/id_rsa",
+    "/.git/index",
+    "/.npmrc",
+    "/.htpasswd",
+    "/web.config.bak",
+    "/settings.py.bak",
+    "/application.properties.bak",
+    "/credentials.json",
+    "/secrets.yml",
+    "/secrets.yaml",
+    "/terraform.tfstate",
+    "/.terraform/terraform.tfstate",
+    "/docker-compose.override.yml",
+    "/.idea/workspace.xml",
+    "/index.php.bak",
+    "/index.html.bak",
+    "/.vscode/sftp.json",
 ];
 
 pub struct SensitivePathsPlugin {
