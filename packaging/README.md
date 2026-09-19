@@ -28,6 +28,7 @@ scripts/packaging/
 ├── version.sh                        canonical version getter
 ├── build-appimage.sh <target> <dir>  Linux only
 ├── build-macos.sh [dir]              macOS only — universal2 + codesign + dmg
+├── sign-windows.ps1 <file...>        Windows only — Authenticode sign+verify
 └── generate-homebrew-formula.sh      run AFTER a release tag is pushed
 ```
 
@@ -58,6 +59,11 @@ bash scripts/packaging/build-appimage.sh x86_64-unknown-linux-gnu dist
 # Windows (.exe) — must run on Windows, with Inno Setup installed:
 cargo build --release --target x86_64-pc-windows-msvc --bin rustzap
 iscc /DAppVersion=$(bash scripts/packaging/version.sh) packaging\windows\rustzap.iss
+# Optional, for a real Authenticode-signed build (sign the binary before iscc,
+# and the installer after) — see "Code signing" below:
+#   $env:WINDOWS_PFX_BASE64="<base64 of cert.pfx>"; $env:WINDOWS_PFX_PASSWORD="<password>"
+#   pwsh scripts/packaging/sign-windows.ps1 target\x86_64-pc-windows-msvc\release\rustzap.exe
+#   pwsh scripts/packaging/sign-windows.ps1 dist\rustzap-<version>-windows-x64.exe
 
 # macOS (.dmg, universal2) — must run on macOS:
 bash scripts/packaging/build-macos.sh dist
@@ -84,21 +90,90 @@ before shipping; see the skill's "Test lifecycle" section.
 `.github/workflows/release.yml` builds all of the above on native runners per
 platform (Linux x86_64 + arm64, Windows x86_64, macOS universal2) on every
 `vX.Y.Z` tag push, validates every artifact, generates `SHA256SUMS`, and
-publishes a GitHub Release. See that file's comments for the secrets it reads
-(`MACOS_SIGN_IDENTITY`, `MACOS_CERT_P12_BASE64`, `MACOS_CERT_P12_PASSWORD`,
-`MACOS_NOTARY_PROFILE`) — all optional; without them the macOS build falls
-back to ad-hoc signing and says so explicitly rather than pretending to be
-Gatekeeper-compatible.
+publishes a GitHub Release. The signing secrets it reads (`WINDOWS_PFX_*`,
+`MACOS_*`) are documented under "Code signing" below — all optional; without
+them each platform degrades to unsigned/ad-hoc and says so explicitly rather
+than pretending to be SmartScreen- or Gatekeeper-compatible.
+
+## Code signing
+
+Signing is what stops Windows SmartScreen and macOS Gatekeeper from telling
+users the publisher is unverified. **Every signing step below already exists in
+`release.yml`; each is inert until its secret is present, and each says so
+loudly rather than pretending to have signed.** Enabling signing therefore means
+buying an identity and adding secrets — no code changes.
+
+### Windows (Authenticode)
+
+`scripts/packaging/sign-windows.ps1` signs the payload `rustzap.exe` before Inno
+Setup packs it, and the resulting installer afterwards. Both halves need a
+signature; signing only the installer leaves the extracted binary flagged.
+
+| Secret / variable | Kind | Purpose |
+|---|---|---|
+| `WINDOWS_PFX_BASE64` | secret | Base64 of the `.pfx` holding the cert + private key. Absent → signing is skipped and reported. |
+| `WINDOWS_PFX_PASSWORD` | secret | Password for that `.pfx`. Set-but-empty while `WINDOWS_PFX_BASE64` is set is a hard error, deliberately. |
+| `WINDOWS_TIMESTAMP_URL` | variable (optional) | RFC 3161 timestamp server; defaults to DigiCert's. Timestamping is what lets signatures outlive cert expiry. |
+
+```bash
+base64 -w0 cert.pfx      # value for WINDOWS_PFX_BASE64 (macOS: base64 -i cert.pfx)
+```
+
+Certificate options, cheapest first:
+
+- **Azure Trusted Signing** (~$10/month) — cloud-based, CI-friendly, no hardware
+  token to babysit. Requires a verified identity; organizations need 3 years of
+  legal-entity history.
+- **OV certificate** (~$200-400/year) — since the 2023 CA/Browser Forum rules the
+  private key must live on a hardware token or cloud HSM, which is awkward in CI.
+- **EV certificate** (~$400-700/year) — the only option that grants SmartScreen
+  reputation immediately.
+
+**A signature alone does not silence SmartScreen.** OV certs and Trusted Signing
+start at zero reputation and accrue it as downloads accumulate, so warnings can
+persist for weeks after signing works. Only EV skips that ramp. Publishing via
+`winget` sidesteps the prompt entirely and costs nothing.
+
+### macOS (Developer ID + notarization)
+
+`scripts/packaging/build-macos.sh` already implements the full
+sign -> notarize -> staple flow. It needs an **Apple Developer Program**
+membership ($99/year):
+
+| Secret | Purpose |
+|---|---|
+| `MACOS_CERT_P12_BASE64` | Base64 of the "Developer ID Application" cert `.p12`. |
+| `MACOS_CERT_P12_PASSWORD` | Password for that `.p12`. |
+| `MACOS_SIGN_IDENTITY` | e.g. `Developer ID Application: NAME (TEAMID)`. Unset → ad-hoc signing, which is **not** Gatekeeper-compatible. |
+| `MACOS_NOTARY_PROFILE` | `xcrun notarytool` keychain-profile name. Unset → notarization skipped (reported, not faked). |
+
+For a CLI, a **Homebrew tap** avoids Gatekeeper prompts altogether and is the
+highest-value unblocked step — the formula is already generated per release; it
+just needs a tap repo to live in.
+
+### When signing is switched on, update the main README
+
+`README.md` -> "Verifying a download, and the OS trust warnings" states in prose
+that release artifacts are unsigned and walks users through the SmartScreen and
+Gatekeeper bypasses. That claim is static — it does not track the secrets. It is
+also **shipped inside the Windows installer** (`packaging/windows/rustzap.iss`
+installs `README.md` alongside the binary), so leaving it stale would tell users
+holding a signed installer that their download is unsigned. Adding a signing
+secret is therefore a two-part change: the secret, and that README block.
+
+### Linux
+
+Nothing to sign: `.deb`, `.rpm`, and AppImage carry no OS-level publisher gate.
+The published `SHA256SUMS` is the integrity check. A GPG-signed release is the
+optional upgrade if repo-based distribution is ever added.
 
 ## Known limitations (as of this writing)
 
-- **Windows codesigning is not wired up** — no Authenticode certificate
-  secret exists yet. The `.exe` this pipeline produces is unsigned; SmartScreen
-  will warn. Add `WINDOWS_PFX` / `WINDOWS_PFX_PASSWORD` secrets and the
-  `signtool sign` step noted in `release.yml` to fix this.
-- **macOS signing/notarization requires `MACOS_*` secrets that are not yet
-  configured** in this repository. Until they are, macOS builds are ad-hoc
-  signed only (not Gatekeeper-compatible).
+- **No release artifact is currently signed.** The pipeline steps exist and are
+  wired up on both Windows and macOS, but the certificates they need are not
+  configured as repository secrets, so Windows ships unsigned and macOS ships
+  ad-hoc signed (neither is SmartScreen- nor Gatekeeper-clean). See
+  "Code signing" above — this is a purchasing/config task, not a code task.
 - **Windows arm64 is not built.** Only x86_64. Add a matrix entry + confirm
   Inno Setup's arm64 support if this becomes a requirement.
 - **Linux arm64 is cross-target-built and structurally validated locally on
