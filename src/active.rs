@@ -13,6 +13,8 @@ use url::Url;
 use crate::safety::{HttpSafetyGate, SafetyPolicy};
 use crate::types::{DiscoveredUrl, Finding, Severity};
 
+pub mod bola;
+
 /// Process-wide gate for active plugin HTTP helpers (`get_response_body`).
 /// Set for the duration of `ActiveScanner::scan_all` or agent `run_plugin`.
 static ACTIVE_GATE: std::sync::Mutex<Option<Arc<HttpSafetyGate>>> = std::sync::Mutex::new(None);
@@ -95,6 +97,7 @@ pub fn all_active_plugins() -> Vec<Box<dyn ScanPlugin>> {
         Box::new(crate::cache_abuse::CacheDeceptionPlugin::new()),
         Box::new(crate::cache_abuse::CachePoisoningPlugin),
         Box::new(crate::rate_limit::RateLimitMissingPlugin::new()),
+        Box::new(bola::BolaPlugin::new()),
     ];
     plugins.extend(crate::sqli_advanced::plugins());
     plugins

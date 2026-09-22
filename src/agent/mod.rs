@@ -7,6 +7,7 @@
 
 pub mod autofix;
 pub mod brain;
+pub mod honeypot;
 pub mod journal;
 pub mod poc;
 pub mod privacy;

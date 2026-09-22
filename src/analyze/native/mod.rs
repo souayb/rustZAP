@@ -10,10 +10,13 @@ use crate::report::{AttackPlanEntry, Inventory};
 use crate::types::Finding;
 
 pub mod config_audit;
+pub mod dlp;
 pub mod dom_sinks;
 pub mod forms;
+pub mod hashes;
 pub mod js_surface;
 pub mod params;
+pub mod sbom;
 pub mod secrets;
 
 pub const SOURCE_TOOL: &str = "rustzap-native";
@@ -30,6 +33,9 @@ pub const NATIVE_MODULES: &[&str] = &[
     "sast/forms",
     "sast/params",
     "iac/native",
+    "sast/dlp-pii",
+    "sast/crypto-audit",
+    "sca/native-sbom",
 ];
 
 pub struct NativeScanResult {
@@ -68,8 +74,23 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     let secrets_files = Arc::clone(&files);
     let config_root = Arc::clone(&root);
     let config_files = Arc::clone(&files);
+    let dlp_root = Arc::clone(&root);
+    let dlp_files = Arc::clone(&files);
+    let hashes_root = Arc::clone(&root);
+    let hashes_files = Arc::clone(&files);
+    let sbom_root = Arc::clone(&root);
 
-    let (js_res, sinks_res, forms_res, params_res, secrets_res, config_res) = tokio::join!(
+    let (
+        js_res,
+        sinks_res,
+        forms_res,
+        params_res,
+        secrets_res,
+        config_res,
+        dlp_res,
+        hashes_res,
+        sbom_res,
+    ) = tokio::join!(
         tokio::task::spawn_blocking(move || js_surface::scan(js_root.as_path(), js_files.as_ref())),
         tokio::task::spawn_blocking(move || {
             dom_sinks::scan(sinks_root.as_path(), sinks_files.as_ref())
@@ -87,6 +108,11 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
         tokio::task::spawn_blocking(move || {
             config_audit::scan(config_root.as_path(), config_files.as_ref())
         }),
+        tokio::task::spawn_blocking(move || { dlp::scan(dlp_root.as_path(), dlp_files.as_ref()) }),
+        tokio::task::spawn_blocking(move || {
+            hashes::scan(hashes_root.as_path(), hashes_files.as_ref())
+        }),
+        tokio::task::spawn_blocking(move || { sbom::scan_repository_sbom(sbom_root.as_path()) }),
     );
 
     let js = js_res.context("js_surface analyzer task failed")?;
@@ -95,6 +121,9 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     let param_result = params_res.context("params analyzer task failed")?;
     let secret_findings = secrets_res.context("secrets analyzer task failed")?;
     let config_findings = config_res.context("config_audit analyzer task failed")?;
+    let dlp_findings = dlp_res.context("dlp analyzer task failed")?;
+    let hashes_findings = hashes_res.context("hashes analyzer task failed")?;
+    let sbom_report = sbom_res.context("sbom analyzer task failed")?;
 
     let mut findings = vec![inv_finding];
     findings.extend(js);
@@ -103,6 +132,9 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     findings.extend(param_result.findings);
     findings.extend(secret_findings);
     findings.extend(config_findings);
+    findings.extend(dlp_findings);
+    findings.extend(hashes_findings);
+    findings.extend(sbom_report.findings);
     sort_native_findings(&mut findings);
 
     let mut attack_plan = form_result.attack_plan;

@@ -11,6 +11,10 @@ use url::Url;
 
 use crate::types::{DiscoveredUrl, Finding, Severity};
 
+pub mod crypto_audit;
+pub mod dlp;
+pub mod metadata;
+
 pub struct PassiveScanner {
     client: Arc<reqwest::Client>,
     seen_origins: Mutex<HashSet<String>>,
@@ -140,6 +144,11 @@ impl PassiveScanner {
         findings.extend(check_tech_fingerprint(url, &headers, &body));
         findings.extend(check_jwt_surface(url, &body));
         findings.extend(check_csrf_missing_token(url, &body));
+        findings.extend(dlp::check_dlp_exposure(url, &body));
+        findings.extend(crypto_audit::check_crypto_posture_passive(
+            url, &headers, &body,
+        ));
+        findings.extend(metadata::check_document_metadata_exposure(url, &body));
 
         findings
     }
@@ -169,6 +178,11 @@ pub fn check_response_passive(
     findings.extend(check_tech_fingerprint(url, headers, body));
     findings.extend(check_jwt_surface(url, body));
     findings.extend(check_csrf_missing_token(url, body));
+    findings.extend(dlp::check_dlp_exposure(url, body));
+    findings.extend(crypto_audit::check_crypto_posture_passive(
+        url, headers, body,
+    ));
+    findings.extend(metadata::check_document_metadata_exposure(url, body));
     findings
 }
 
