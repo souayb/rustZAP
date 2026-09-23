@@ -11,6 +11,7 @@ use url::Url;
 
 use crate::types::{DiscoveredUrl, Finding, Severity};
 
+pub mod cloud_headers;
 pub mod crypto_audit;
 pub mod dlp;
 pub mod metadata;
@@ -149,6 +150,7 @@ impl PassiveScanner {
             url, &headers, &body,
         ));
         findings.extend(metadata::check_document_metadata_exposure(url, &body));
+        findings.extend(cloud_headers::check_cloud_headers(url, &headers));
 
         findings
     }
@@ -183,6 +185,7 @@ pub fn check_response_passive(
         url, headers, body,
     ));
     findings.extend(metadata::check_document_metadata_exposure(url, body));
+    findings.extend(cloud_headers::check_cloud_headers(url, headers));
     findings
 }
 

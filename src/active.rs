@@ -14,6 +14,9 @@ use crate::safety::{HttpSafetyGate, SafetyPolicy};
 use crate::types::{DiscoveredUrl, Finding, Severity};
 
 pub mod bola;
+pub mod cors;
+pub mod graphql_advanced;
+pub mod websocket;
 
 /// Process-wide gate for active plugin HTTP helpers (`get_response_body`).
 /// Set for the duration of `ActiveScanner::scan_all` or agent `run_plugin`.
@@ -98,6 +101,9 @@ pub fn all_active_plugins() -> Vec<Box<dyn ScanPlugin>> {
         Box::new(crate::cache_abuse::CachePoisoningPlugin),
         Box::new(crate::rate_limit::RateLimitMissingPlugin::new()),
         Box::new(bola::BolaPlugin::new()),
+        Box::new(cors::CorsActivePlugin::new()),
+        Box::new(websocket::WebSocketPlugin::new()),
+        Box::new(graphql_advanced::GraphqlAdvancedPlugin::new()),
     ];
     plugins.extend(crate::sqli_advanced::plugins());
     plugins

@@ -9,6 +9,7 @@ use crate::analyze::inventory::{self, collect_repo_files_with, WalkConfig};
 use crate::report::{AttackPlanEntry, Inventory};
 use crate::types::Finding;
 
+pub mod cloud;
 pub mod config_audit;
 pub mod dlp;
 pub mod dom_sinks;
@@ -33,6 +34,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     "sast/forms",
     "sast/params",
     "iac/native",
+    "iac/cloud",
     "sast/dlp-pii",
     "sast/crypto-audit",
     "sca/native-sbom",
@@ -79,6 +81,8 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     let hashes_root = Arc::clone(&root);
     let hashes_files = Arc::clone(&files);
     let sbom_root = Arc::clone(&root);
+    let cloud_root = Arc::clone(&root);
+    let cloud_files = Arc::clone(&files);
 
     let (
         js_res,
@@ -90,6 +94,7 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
         dlp_res,
         hashes_res,
         sbom_res,
+        cloud_res,
     ) = tokio::join!(
         tokio::task::spawn_blocking(move || js_surface::scan(js_root.as_path(), js_files.as_ref())),
         tokio::task::spawn_blocking(move || {
@@ -113,6 +118,9 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
             hashes::scan(hashes_root.as_path(), hashes_files.as_ref())
         }),
         tokio::task::spawn_blocking(move || { sbom::scan_repository_sbom(sbom_root.as_path()) }),
+        tokio::task::spawn_blocking(move || {
+            cloud::scan(cloud_root.as_path(), cloud_files.as_ref())
+        }),
     );
 
     let js = js_res.context("js_surface analyzer task failed")?;
@@ -124,6 +132,7 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     let dlp_findings = dlp_res.context("dlp analyzer task failed")?;
     let hashes_findings = hashes_res.context("hashes analyzer task failed")?;
     let sbom_report = sbom_res.context("sbom analyzer task failed")?;
+    let cloud_findings = cloud_res.context("cloud analyzer task failed")?;
 
     let mut findings = vec![inv_finding];
     findings.extend(js);
@@ -135,6 +144,7 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     findings.extend(dlp_findings);
     findings.extend(hashes_findings);
     findings.extend(sbom_report.findings);
+    findings.extend(cloud_findings);
     sort_native_findings(&mut findings);
 
     let mut attack_plan = form_result.attack_plan;
