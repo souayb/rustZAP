@@ -13,6 +13,15 @@ use url::Url;
 use crate::safety::{HttpSafetyGate, SafetyPolicy};
 use crate::types::{DiscoveredUrl, Finding, Severity};
 
+pub mod bola;
+pub mod cors;
+pub mod graphql_advanced;
+pub mod mass_assignment;
+pub mod nosql;
+pub mod prototype_pollution;
+pub mod smuggling;
+pub mod websocket;
+
 /// Process-wide gate for active plugin HTTP helpers (`get_response_body`).
 /// Set for the duration of `ActiveScanner::scan_all` or agent `run_plugin`.
 static ACTIVE_GATE: std::sync::Mutex<Option<Arc<HttpSafetyGate>>> = std::sync::Mutex::new(None);
@@ -95,6 +104,14 @@ pub fn all_active_plugins() -> Vec<Box<dyn ScanPlugin>> {
         Box::new(crate::cache_abuse::CacheDeceptionPlugin::new()),
         Box::new(crate::cache_abuse::CachePoisoningPlugin),
         Box::new(crate::rate_limit::RateLimitMissingPlugin::new()),
+        Box::new(bola::BolaPlugin::new()),
+        Box::new(cors::CorsActivePlugin::new()),
+        Box::new(websocket::WebSocketPlugin::new()),
+        Box::new(graphql_advanced::GraphqlAdvancedPlugin::new()),
+        Box::new(smuggling::RequestSmugglingPlugin::new()),
+        Box::new(nosql::NoSqlInjectionPlugin::new()),
+        Box::new(mass_assignment::MassAssignmentPlugin::new()),
+        Box::new(prototype_pollution::PrototypePollutionPlugin::new()),
     ];
     plugins.extend(crate::sqli_advanced::plugins());
     plugins
