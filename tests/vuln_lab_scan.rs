@@ -29,6 +29,8 @@ fn scan_config(target: &str) -> ScanConfig {
         openapi_path: None,
         openapi_url: None,
         har_path: None,
+        paths_file: None,
+        discover_openapi: false,
         nuclei: false,
         nuclei_jsonl: None,
         active_all_paths: true,
