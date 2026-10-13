@@ -221,6 +221,122 @@ fn append_query_placeholders(url: &str, params: &[String]) -> String {
     format!("{}?{}", url.trim_end_matches('?'), qs.join("&"))
 }
 
+/// Common locations where web frameworks expose an OpenAPI/Swagger JSON
+/// document. Probed (same-origin) when the user supplies no explicit spec, so a
+/// headless API whose root 404s still gets a meaningful scan surface.
+pub const COMMON_OPENAPI_PATHS: &[&str] = &[
+    "/openapi.json",
+    "/swagger.json",
+    "/swagger/v1/swagger.json",
+    "/v3/api-docs",
+    "/v2/api-docs",
+    "/api-docs",
+    "/api-docs.json",
+    "/.well-known/openapi.json",
+];
+
+/// Probe common spec locations against the target origin. Returns the first
+/// location that answers 2xx with a body that parses as a non-empty OpenAPI
+/// document. Network/parse failures on individual probes are ignored.
+pub async fn discover_openapi(
+    client: &reqwest::Client,
+    target: &str,
+) -> Option<(Vec<DiscoveredUrl>, Finding)> {
+    let base = Url::parse(target).ok()?;
+    for path in COMMON_OPENAPI_PATHS {
+        let mut probe = base.clone();
+        probe.set_query(None);
+        probe.set_fragment(None);
+        probe.set_path(path);
+        let url = probe.to_string();
+        let Ok(resp) = client.get(&url).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.text().await else {
+            continue;
+        };
+        if let Ok((urls, _)) = parse_openapi_json(&body, target) {
+            if urls.is_empty() {
+                continue;
+            }
+            let count = urls.len();
+            let finding = Finding::new(
+                "OpenAPI Surface Auto-Discovered",
+                Severity::Info,
+                target,
+                format!(
+                    "Auto-discovered an OpenAPI document at {url} and imported {count} \
+                     operation(s) into the scan surface."
+                ),
+                "Confirm this specification is meant to be publicly reachable; if not, \
+                 restrict access to it.",
+                "passive/openapi-discovery",
+            )
+            .with_evidence(url);
+            return Some((urls, finding));
+        }
+    }
+    None
+}
+
+/// Load a plain list of routes/paths and expand them into the scan surface.
+/// Each non-empty line that does not start with `#` is either `/path`,
+/// `METHOD /path`, or a full `http(s)://` URL. `{id}`-style templates are
+/// materialized with a placeholder, like OpenAPI paths.
+pub fn load_paths_file(path: &str, target: &str) -> Result<(Vec<DiscoveredUrl>, Finding)> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("Read paths file {}", path))?;
+    let base = Url::parse(target).context("Invalid scan target for --paths join")?;
+
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if out.len() >= OPENAPI_MAX_OPS {
+            break;
+        }
+        // Optional leading HTTP method token (`POST /items`).
+        let (method, rest) = match line.split_once(char::is_whitespace) {
+            Some((m, r)) if is_http_method(m) => (m.to_ascii_uppercase(), r.trim()),
+            _ => ("GET".to_string(), line),
+        };
+        let url = if rest.starts_with("http://") || rest.starts_with("https://") {
+            rest.to_string()
+        } else {
+            let concrete = materialize_path(rest, &[]);
+            join_target_path(&base, &concrete)?
+        };
+        out.push(DiscoveredUrl::new(url, method, UrlSource::PathsFile));
+    }
+
+    let finding = Finding::new(
+        "Paths File Imported",
+        Severity::Info,
+        target,
+        format!(
+            "Imported {} path(s) from a --paths file into the scan surface.",
+            out.len()
+        ),
+        "Review the imported paths for accuracy and scope.",
+        "passive/paths-import",
+    )
+    .with_evidence(format!("{} paths", out.len()));
+
+    Ok((out, finding))
+}
+
+fn is_http_method(s: &str) -> bool {
+    matches!(
+        s.to_ascii_uppercase().as_str(),
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +381,25 @@ mod tests {
             .expect("users");
         assert!(users.parameters.iter().any(|p| p == "id"));
         assert!(users.url.contains('?'));
+    }
+
+    #[test]
+    fn paths_file_imports_methods_and_templates() {
+        let p = std::env::temp_dir().join(format!("rz-paths-{}.txt", crate::types::uuid_v4()));
+        std::fs::write(&p, "# a comment\n\n/health\nPOST /items\n/users/{id}\n").expect("write");
+        let (urls, finding) =
+            load_paths_file(p.to_str().unwrap(), "https://api.example.com").expect("load");
+        std::fs::remove_file(&p).ok();
+
+        assert_eq!(finding.plugin, "passive/paths-import");
+        assert!(urls
+            .iter()
+            .any(|u| u.method == "GET" && u.url.ends_with("/health")));
+        assert!(urls
+            .iter()
+            .any(|u| u.method == "POST" && u.url.ends_with("/items")));
+        assert!(urls.iter().any(|u| u.url.contains("/users/1")));
+        assert!(urls.iter().all(|u| u.source == UrlSource::PathsFile));
     }
 
     #[test]
