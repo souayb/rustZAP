@@ -5,30 +5,42 @@
 use std::net::IpAddr;
 
 use async_trait::async_trait;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 
 use super::probe::DnsResolver;
 
 pub struct LiveDns {
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
 }
 
 impl LiveDns {
     /// Build a resolver aimed at `dc_ip` (port 53) when it parses as an IP,
-    /// else the system resolver.
+    /// else the system resolver. Falls back to a default-config resolver if the
+    /// system configuration cannot be read.
     pub fn new(dc_ip: &str) -> Self {
         let resolver = match dc_ip.parse::<IpAddr>() {
             Ok(ip) => {
-                let group = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
-                let config = ResolverConfig::from_parts(None, vec![], group);
-                TokioAsyncResolver::tokio(config, ResolverOpts::default())
+                // Query the DC directly over UDP+TCP on port 53.
+                let config = ResolverConfig::from_parts(
+                    None,
+                    vec![],
+                    vec![NameServerConfig::udp_and_tcp(ip)],
+                );
+                Self::from_config(config)
             }
-            Err(_) => TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
-                TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
-            }),
+            Err(_) => TokioResolver::builder_tokio()
+                .and_then(|builder| builder.build())
+                .unwrap_or_else(|_| Self::from_config(ResolverConfig::default())),
         };
         LiveDns { resolver }
+    }
+
+    fn from_config(config: ResolverConfig) -> TokioResolver {
+        TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .build()
+            .expect("building a hickory resolver from an explicit config is infallible")
     }
 }
 

@@ -1,5 +1,11 @@
 //! RustZAP library — scanner modules (binary entrypoint: `src/main.rs`).
 
+// `#[async_trait]` expands async trait methods into functions that return an
+// already-`#[must_use]` boxed future while also attaching its own `#[must_use]`,
+// which Rust 1.99's clippy flags as `double_must_use` on every async-trait in the
+// crate. The attribute is macro-generated and harmless, so allow it crate-wide.
+#![allow(clippy::double_must_use)]
+
 pub mod active;
 pub mod ad;
 pub mod agent;
