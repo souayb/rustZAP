@@ -153,6 +153,9 @@ pub fn print_attack_mode_warning(target: &str) {
 pub struct CircuitBreaker {
     total_requests: AtomicUsize,
     error_5xx_count: AtomicUsize,
+    /// HTTP 429 (Too Many Requests) responses seen. Not a 5xx error — this is
+    /// target back-pressure, so it never trips the breaker; it drives throttling.
+    throttle_429_count: AtomicUsize,
     total_latency_ms: AtomicU64,
     tripped: std::sync::atomic::AtomicBool,
 }
@@ -167,6 +170,10 @@ impl CircuitBreaker {
         let total = self.total_requests.fetch_add(1, Ordering::SeqCst) + 1;
         self.total_latency_ms
             .fetch_add(latency_ms, Ordering::SeqCst);
+
+        if status == 429 {
+            self.throttle_429_count.fetch_add(1, Ordering::SeqCst);
+        }
 
         if (500..=599).contains(&status) {
             let errors = self.error_5xx_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -201,9 +208,15 @@ impl CircuitBreaker {
         self.tripped.load(Ordering::SeqCst)
     }
 
+    /// Number of HTTP 429 responses observed so far.
+    pub fn throttle_429_count(&self) -> usize {
+        self.throttle_429_count.load(Ordering::SeqCst)
+    }
+
     pub fn reset(&self) {
         self.total_requests.store(0, Ordering::SeqCst);
         self.error_5xx_count.store(0, Ordering::SeqCst);
+        self.throttle_429_count.store(0, Ordering::SeqCst);
         self.total_latency_ms.store(0, Ordering::SeqCst);
         self.tripped.store(false, Ordering::SeqCst);
     }
@@ -216,14 +229,26 @@ pub struct HttpSafetyGate {
     breaker: CircuitBreaker,
     /// Timestamps of recent request starts (for RPS window).
     recent: AsyncMutex<Vec<Instant>>,
+    /// Current requests-per-second ceiling actually enforced. Starts at
+    /// `policy.max_rps` and is reduced adaptively when the target returns 429.
+    /// `0` means unlimited (only until the first 429 imposes a ceiling).
+    effective_rps: std::sync::atomic::AtomicU32,
+    /// Set once the target has rate-limited us (any HTTP 429).
+    throttled: std::sync::atomic::AtomicBool,
 }
+
+/// RPS ceiling imposed the first time an otherwise-unlimited scan is 429'd.
+const THROTTLE_INITIAL_RPS: u32 = 10;
 
 impl HttpSafetyGate {
     pub fn new(policy: SafetyPolicy) -> Self {
+        let effective_rps = std::sync::atomic::AtomicU32::new(policy.max_rps);
         Self {
             policy,
             breaker: CircuitBreaker::new(),
             recent: AsyncMutex::new(Vec::new()),
+            effective_rps,
+            throttled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -269,18 +294,50 @@ impl HttpSafetyGate {
 
     /// Record metrics; returns `Err(CircuitOpen)` if the breaker just tripped.
     pub fn after_response(&self, status: u16, latency_ms: u64) -> Result<(), SafetyAbort> {
-        if !self
+        let healthy = self
             .breaker
-            .record_response(status, latency_ms, &self.policy)
-            || self.breaker.is_tripped()
-        {
+            .record_response(status, latency_ms, &self.policy);
+        if status == 429 {
+            self.adapt_to_rate_limit();
+        }
+        if !healthy || self.breaker.is_tripped() {
             return Err(SafetyAbort::CircuitOpen);
         }
         Ok(())
     }
 
+    /// Back off after a 429: halve the effective RPS (floored at 1), or impose an
+    /// initial ceiling if the scan was unlimited. Marks the scan as throttled so
+    /// the report can annotate that coverage may be partial.
+    fn adapt_to_rate_limit(&self) {
+        use std::sync::atomic::Ordering;
+        self.throttled.store(true, Ordering::SeqCst);
+        let cur = self.effective_rps.load(Ordering::SeqCst);
+        let next = if cur == 0 {
+            THROTTLE_INITIAL_RPS
+        } else {
+            (cur / 2).max(1)
+        };
+        self.effective_rps.store(next, Ordering::SeqCst);
+        tracing::warn!(
+            "HTTP 429 from target — throttling active scan to {} req/s (429s seen: {})",
+            next,
+            self.breaker.throttle_429_count()
+        );
+    }
+
+    /// Whether the target has rate-limited (429'd) this scan.
+    pub fn was_throttled(&self) -> bool {
+        self.throttled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Total HTTP 429 responses observed during this scan.
+    pub fn throttle_count(&self) -> usize {
+        self.breaker.throttle_429_count()
+    }
+
     async fn wait_for_rps(&self) {
-        let max = self.policy.max_rps;
+        let max = self.effective_rps.load(std::sync::atomic::Ordering::SeqCst);
         if max == 0 {
             return;
         }
@@ -426,6 +483,46 @@ mod tests {
         assert!(!p.attack_mode);
         assert_eq!(p.max_rps, 5);
         assert!(SafetyPolicy::from_profile("unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn gate_throttles_on_429() {
+        use std::sync::atomic::Ordering;
+        let gate = HttpSafetyGate::new(SafetyPolicy {
+            max_rps: 50,
+            ..Default::default()
+        });
+        assert!(!gate.was_throttled());
+
+        // First 429 halves the ceiling and marks the scan throttled.
+        let _ = gate.after_response(429, 10);
+        assert!(gate.was_throttled());
+        assert_eq!(gate.throttle_count(), 1);
+        assert_eq!(gate.effective_rps.load(Ordering::SeqCst), 25);
+
+        // Repeated 429s keep halving, floored at 1 (never 0 = unlimited).
+        for _ in 0..10 {
+            let _ = gate.after_response(429, 10);
+        }
+        assert_eq!(gate.effective_rps.load(Ordering::SeqCst), 1);
+
+        // A 429 is back-pressure, not a 5xx — it must not trip the breaker.
+        assert!(!gate.is_tripped());
+    }
+
+    #[tokio::test]
+    async fn gate_imposes_ceiling_on_unlimited_after_429() {
+        use std::sync::atomic::Ordering;
+        let gate = HttpSafetyGate::new(SafetyPolicy {
+            max_rps: 0, // unlimited
+            ..Default::default()
+        });
+        let _ = gate.after_response(429, 10);
+        assert_eq!(
+            gate.effective_rps.load(Ordering::SeqCst),
+            THROTTLE_INITIAL_RPS
+        );
+        assert!(gate.was_throttled());
     }
 
     #[tokio::test]
