@@ -953,6 +953,20 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                 .unwrap_or_default();
 
             for (key, _) in &params {
+                // Benign control: same parameter, a value that should match nothing.
+                // An app that simply ignores unknown/typed params returns the same
+                // response for the operator payload as for this control, so a real
+                // operator injection must differ from BOTH the untouched baseline
+                // and this control (never confirm on a stable 200 — see #21).
+                let control_url = target.url.replace(
+                    &format!("{}=", key),
+                    &format!("{}=rustzap_nonexistent_val", key),
+                );
+                let control_body = get_body(client, &control_url)
+                    .await
+                    .map(|(_, b)| b)
+                    .unwrap_or_default();
+
                 for (suffix, label) in get_payloads {
                     let new_url = target
                         .url
@@ -960,17 +974,23 @@ impl ScanPlugin for NoSqlInjectionPlugin {
 
                     if let Some((status, body)) = get_body(client, &new_url).await {
                         // Confirmed only when the operator response is a 200 that
-                        // meaningfully diverges from the untouched-query baseline.
-                        let diverges = crate::verify::body_similarity(&baseline_body, &body) < 0.85;
-                        let grew = body.len() > baseline_body.len() + 32;
-                        if status == 200 && diverges && grew {
+                        // meaningfully diverges from BOTH the untouched baseline and
+                        // the benign control, and broadens the result set beyond the
+                        // control (the operator reached the database).
+                        let diverges_baseline =
+                            crate::verify::body_similarity(&baseline_body, &body) < 0.85;
+                        let diverges_control =
+                            crate::verify::body_similarity(&control_body, &body) < 0.85;
+                        let grew = body.len() > baseline_body.len() + 32
+                            && body.len() > control_body.len() + 32;
+                        if status == 200 && diverges_baseline && diverges_control && grew {
                             return vec![
                                 Finding::new(
                                     "NoSQL Injection — MongoDB GET Operator",
                                     Severity::High,
                                     &target.url,
                                     format!(
-                                        "A MongoDB query operator injected via GET parameter ({}) changed the result set versus the untouched query, indicating the operator reached the database.",
+                                        "A MongoDB query operator injected via GET parameter ({}) broadened the result set versus both the untouched query and a benign non-matching control, indicating the operator reached the database.",
                                         label
                                     ),
                                     "Validate and sanitize all query parameters. Reject unexpected object types.",
@@ -978,8 +998,8 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                                 )
                                 .with_parameter(key)
                                 .with_evidence(format!(
-                                    "Param `{}` with `{}` → HTTP 200, response diverged from baseline ({}B vs {}B)",
-                                    key, suffix, body.len(), baseline_body.len()
+                                    "Param `{}` with `{}` → HTTP 200 ({}B); baseline {}B; benign control {}B — operator diverged from both",
+                                    key, suffix, body.len(), baseline_body.len(), control_body.len()
                                 ))
                                 .with_cwe(943)
                                 .with_owasp("A03:2021 – Injection")
