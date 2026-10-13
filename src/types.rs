@@ -369,6 +369,7 @@ pub enum UrlSource {
     Sitemap,
     OpenApi,
     Har,
+    PathsFile,
 }
 
 /// Roll-up of one module's contribution to the scan. See SDD §9.1.

@@ -45,6 +45,10 @@ pub struct ScanConfig {
     pub openapi_url: Option<String>,
     /// HAR recording path; same-origin requests become scan seeds (optional).
     pub har_path: Option<String>,
+    /// Plain list of routes/paths to import into the scan surface (optional).
+    pub paths_file: Option<String>,
+    /// Probe common OpenAPI/Swagger spec locations when no spec is supplied.
+    pub discover_openapi: bool,
     /// Opt-in: spawn ProjectDiscovery Nuclei against the target.
     pub nuclei: bool,
     /// Opt-in: parse existing Nuclei `-jsonl` output (no spawn).
@@ -151,6 +155,21 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
     if let Some(ref har_path) = config.har_path {
         let urls = crate::har::load_har_file(har_path, &config.target_url)?;
         merge_discovered(&mut discovered, urls);
+    }
+    if let Some(ref pf) = config.paths_file {
+        let (urls, info) = crate::openapi::load_paths_file(pf, &config.target_url)?;
+        merge_discovered(&mut discovered, urls);
+        findings.lock().await.push(info);
+    }
+    // Auto-probe common spec locations only when the user supplied none, so a
+    // headless API whose root 404s still gets a meaningful scan surface.
+    if config.discover_openapi && !openapi_imported {
+        if let Some((urls, info)) =
+            crate::openapi::discover_openapi(&client, &config.target_url).await
+        {
+            merge_discovered(&mut discovered, urls);
+            findings.lock().await.push(info);
+        }
     }
 
     let passive_pb =
@@ -408,6 +427,27 @@ pub async fn run_scan_with_events(
             Err(e) => {
                 let _ = tx.send(ScanEvent::Log(format!("HAR import failed: {e}")));
             }
+        }
+    }
+    if let Some(ref pf) = config.paths_file {
+        match crate::openapi::load_paths_file(pf, &config.target_url) {
+            Ok((urls, info)) => {
+                merge_discovered(&mut discovered, urls);
+                let _ = tx.send(ScanEvent::Finding(Box::new(info.clone())));
+                import_findings.push(info);
+            }
+            Err(e) => {
+                let _ = tx.send(ScanEvent::Log(format!("paths import failed: {e}")));
+            }
+        }
+    }
+    if config.discover_openapi && !openapi_imported {
+        if let Some((urls, info)) =
+            crate::openapi::discover_openapi(&client, &config.target_url).await
+        {
+            merge_discovered(&mut discovered, urls);
+            let _ = tx.send(ScanEvent::Finding(Box::new(info.clone())));
+            import_findings.push(info);
         }
     }
 

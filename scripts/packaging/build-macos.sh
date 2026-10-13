@@ -62,6 +62,19 @@ fi
 codesign --verify --verbose=2 "$UNIVERSAL_BIN"
 
 mkdir -p "$OUT_DIR"
+
+# Raw, signed CLI binary as a plain tarball — for `curl | sh` and CI use that
+# does not want to mount a .dmg. Packaged from the same signed universal binary.
+TAR_ROOT="$WORK/tarroot"
+mkdir -p "$TAR_ROOT"
+install -m 755 "$UNIVERSAL_BIN" "$TAR_ROOT/rustzap"
+install -m 644 README.md "$TAR_ROOT/README.md"
+install -m 644 LICENSE "$TAR_ROOT/LICENSE"
+TAR_OUT="$OUT_DIR/rustzap-${VERSION}-macos-universal.tar.gz"
+rm -f "$TAR_OUT"
+tar -C "$TAR_ROOT" -czf "$TAR_OUT" rustzap README.md LICENSE
+echo "Built $TAR_OUT"
+
 DMG_ROOT="$WORK/dmgroot"
 mkdir -p "$DMG_ROOT"
 install -m 755 "$UNIVERSAL_BIN" "$DMG_ROOT/rustzap"

@@ -353,17 +353,45 @@ Tool-generated findings remain authoritative; an LLM observation is not treated 
 
 # Installation
 
+## Quick install (one line)
+
+**Linux / macOS** — downloads the latest release binary, verifies its SHA-256, and installs it to `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/souayb/rustZAP/main/scripts/install.sh | sh
+```
+
+Pin a version or change the location:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/souayb/rustZAP/main/scripts/install.sh | sh -s -- --version 0.1.2 --bin-dir /usr/local/bin
+```
+
+**Windows (PowerShell)** — installs the console CLI (`rustzap.exe`), not the GUI installer:
+
+```powershell
+irm https://raw.githubusercontent.com/souayb/rustZAP/main/scripts/install.ps1 | iex
+```
+
+The installers verify each download against the release's `SHA256SUMS`. For manual installs or package formats, see below.
+
 ## Prebuilt releases
 
-Tagged releases provide native installers for:
+Tagged releases provide native installers plus a **raw, console CLI binary** for
+headless/CI use:
 
-| Platform | Formats                  |
-| -------- | ------------------------ |
-| Linux    | `.deb`, `.rpm`, AppImage |
-| Windows  | `.exe`                   |
-| macOS    | `.dmg`                   |
+| Platform | Installers               | Raw CLI binary (headless/CI)          |
+| -------- | ------------------------ | ------------------------------------- |
+| Linux    | `.deb`, `.rpm`, AppImage | `rustzap-<version>-linux-<arch>.tar.gz` |
+| Windows  | `.exe` (GUI installer)   | `rustzap-<version>-windows-x64.zip`     |
+| macOS    | `.dmg`                   | `rustzap-<version>-macos-universal.tar.gz` |
 
 Linux builds are available for x86_64 and ARM64. macOS releases use universal binaries.
+
+> **CI / automation:** use the raw CLI binary, not the installer. On Windows the
+> `.exe` is the Inno Setup **GUI installer** (GUI subsystem — it writes nothing to
+> stdout when piped); the `.zip` contains the real console `rustzap.exe` that works
+> in pipes and CI. See [Headless / CI usage](#headless--ci-usage).
 
 Download a release from the project's GitHub Releases page and verify the checksum before installation.
 
@@ -394,15 +422,62 @@ open rustzap-<version>-macos-universal.dmg
 
 ### Windows
 
-Run:
+For a desktop install, run the GUI installer:
 
 ```text
 rustzap-<version>-windows-x64.exe
 ```
 
+For scripting or CI, unzip the console binary instead (the installer above is
+GUI-subsystem and produces no stdout when piped):
+
+```powershell
+Expand-Archive rustzap-<version>-windows-x64.zip -DestinationPath .
+.\rustzap.exe --version
+```
+
 Release artifacts are currently not code-signed, so Windows and macOS may display publisher/trust warnings.
 
 Always verify the SHA-256 checksum before bypassing an operating-system warning.
+
+---
+
+# Headless / CI usage
+
+RustZAP runs non-interactively out of the box — the TUI only launches for the
+bare `rustzap` command (or `rustzap tui`). Any subcommand writes normal
+stdout/stderr and exits with a status code, so it drops straight into pipelines:
+
+```bash
+# Linux/macOS: extract the raw binary and scan headlessly
+tar -xzf rustzap-<version>-linux-x86_64.tar.gz
+./rustzap scan -t https://api.example.com -y --fail-on high
+```
+
+```powershell
+# Windows CI: use the console binary from the .zip (NOT the GUI installer .exe)
+Expand-Archive rustzap-<version>-windows-x64.zip -DestinationPath .
+.\rustzap.exe scan -t https://api.example.com -y --fail-on high
+```
+
+### Giving a headless API a real scan surface
+
+When the target root returns 404 and exposes no linked spec, the spider finds
+little to test. RustZAP can still build a surface:
+
+- **Auto-discovery (default):** common spec locations are probed when you supply
+  no spec — `/openapi.json`, `/swagger.json`, `/swagger/v1/swagger.json`,
+  `/v3/api-docs`, `/v2/api-docs`, `/api-docs`, `/.well-known/openapi.json`.
+  Disable with `--no-openapi-discovery`.
+- **Explicit spec:** `--openapi-path <file>` or `--openapi-url <url>`.
+- **Plain route list:** `--paths routes.txt`, one entry per line, optionally
+  prefixed with a method (`#` lines are comments):
+
+  ```text
+  /health
+  POST /api/items
+  GET /api/users/{id}
+  ```
 
 ---
 
@@ -1124,6 +1199,29 @@ The scope also controls:
 Network operations without a valid scope are rejected.
 
 ---
+
+# SBOM license policy (scoped)
+
+Apply a license policy to a CycloneDX SBOM, scoped so a container's **base-OS/distro
+packages** (`bash`, `apt`, fonts, …) don't drown the signal that matters — the
+license posture of the application's **own** dependencies. OS packages shipped under
+mere aggregation are reported informationally by default rather than failing the gate.
+
+```bash
+# Default: enforce Deny/Review on application dependencies only
+rustzap license sbom.cdx.json --fail-on-deny
+
+# Enforce on everything (application + OS/base image)
+rustzap license sbom.cdx.json --scope all --fail-on-deny
+
+# Exempt specific packages (one name per line)
+rustzap license sbom.cdx.json --os-allowlist allow.txt
+```
+
+Components are classified by origin from their `purl` type (`pkg:deb/…`, `pkg:apk/…`,
+`pkg:rpm/…` → OS; `pkg:cargo/…`, `pkg:npm/…`, … → application). The report is split
+into **Application dependencies** and **Base image / OS**, and the gate fails only on
+enforced `DENY` licenses in scope.
 
 # Capture and replay
 

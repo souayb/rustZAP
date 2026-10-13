@@ -80,6 +80,19 @@ jobs:
           mv dist/*.rpm "dist/rustzap-${V}-linux-${A}.rpm"
       - name: Build AppImage
         run: bash scripts/packaging/build-appimage.sh ${{ matrix.target }} dist
+      - name: Package raw CLI binary (headless/CI use)
+        # A standalone, console binary with no package manager, no FUSE, and no
+        # installer GUI — this is what `curl | sh` and CI pipelines consume.
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          A="${{ matrix.arch }}"
+          STAGE="$(mktemp -d)"
+          install -m 755 "target/${{ matrix.target }}/release/rustzap" "$STAGE/rustzap"
+          install -m 644 README.md "$STAGE/README.md"
+          install -m 644 LICENSE "$STAGE/LICENSE"
+          tar -C "$STAGE" -czf "dist/rustzap-${V}-linux-${A}.tar.gz" rustzap README.md LICENSE
+          rm -rf "$STAGE"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
@@ -110,6 +123,20 @@ jobs:
         run: >
           pwsh scripts/packaging/sign-windows.ps1
           target\x86_64-pc-windows-msvc\release\rustzap.exe
+        shell: pwsh
+      - name: Package raw CLI binary (headless/CI use)
+        # The published *.exe below is the Inno Setup GUI installer, which is
+        # GUI-subsystem and writes nothing to stdout — unusable in a pipe/CI.
+        # Ship the signed console rustzap.exe as a plain .zip too, so scripted
+        # and CI scanning has a real command-line binary to run.
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $stage = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'cli-zip')
+          Copy-Item target\x86_64-pc-windows-msvc\release\rustzap.exe (Join-Path $stage 'rustzap.exe')
+          Copy-Item README.md (Join-Path $stage 'README.md')
+          Copy-Item LICENSE (Join-Path $stage 'LICENSE')
+          Compress-Archive -Force -Path (Join-Path $stage '*') `
+            -DestinationPath "dist\rustzap-${{ needs.version.outputs.version }}-windows-x64.zip"
         shell: pwsh
       - name: Build installer
         run: |

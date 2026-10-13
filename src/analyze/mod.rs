@@ -16,6 +16,7 @@ pub mod checkov;
 mod gitignore;
 pub mod gitleaks;
 pub mod inventory;
+pub mod license;
 pub mod native;
 pub mod semgrep;
 pub mod static_report;
@@ -684,6 +685,8 @@ pub async fn run_audit_cli(
             openapi_path: None,
             openapi_url: None,
             har_path: None,
+            paths_file: None,
+            discover_openapi: true,
             nuclei: false,
             nuclei_jsonl: None,
             active_all_paths,

@@ -74,6 +74,12 @@ enum Commands {
         /// Fetch OpenAPI 3.x JSON from a URL once
         #[arg(long)]
         openapi_url: Option<String>,
+        /// Import a plain list of routes/paths (one per line; optional "METHOD /path")
+        #[arg(long, value_name = "FILE")]
+        paths: Option<String>,
+        /// Disable auto-probing of common OpenAPI/Swagger spec locations (/openapi.json, /v3/api-docs, ...)
+        #[arg(long)]
+        no_openapi_discovery: bool,
         /// Import same-origin requests from a HAR recording
         #[arg(long)]
         har_path: Option<String>,
@@ -595,6 +601,25 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// Apply a license policy to a CycloneDX SBOM, scoped to application deps vs OS packages
+    License {
+        /// Path to a CycloneDX JSON SBOM
+        #[arg(value_name = "SBOM_JSON")]
+        sbom: String,
+
+        /// Which components the Deny/Review policy is enforced on
+        #[arg(long, value_name = "app|all", default_value = "app")]
+        scope: String,
+
+        /// Allowlist file (one package name per line) exempted from the policy
+        #[arg(long, value_name = "FILE")]
+        os_allowlist: Option<String>,
+
+        /// Exit non-zero if any enforced DENY license is found in scope
+        #[arg(long)]
+        fail_on_deny: bool,
+    },
 }
 
 /// Stack for the thread that actually runs the CLI. Building the clap command
@@ -662,6 +687,8 @@ async fn run() -> anyhow::Result<()> {
             plugins,
             openapi_path,
             openapi_url,
+            paths,
+            no_openapi_discovery,
             har_path,
             nuclei,
             nuclei_jsonl,
@@ -693,6 +720,8 @@ async fn run() -> anyhow::Result<()> {
                 openapi_path,
                 openapi_url,
                 har_path,
+                paths_file: paths,
+                discover_openapi: !no_openapi_discovery,
                 nuclei,
                 nuclei_jsonl,
                 active_all_paths,
@@ -1065,6 +1094,21 @@ async fn run() -> anyhow::Result<()> {
             if summary.failed > 0 || summary.status_diverged > 0 {
                 std::process::exit(1);
             }
+        }
+
+        Commands::License {
+            sbom,
+            scope,
+            os_allowlist,
+            fail_on_deny,
+        } => {
+            let scope = analyze::license::LicenseScope::parse(&scope)?;
+            analyze::license::run_license_check(
+                &sbom,
+                scope,
+                os_allowlist.as_deref(),
+                fail_on_deny,
+            )?;
         }
     }
 
