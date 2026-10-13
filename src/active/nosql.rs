@@ -100,10 +100,9 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                     .clear()
                     .extend_pairs(cpairs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             }
-            let (control_status, control_body) =
-                get_response_body(client, &control_url.to_string())
-                    .await
-                    .unwrap_or((0, String::new()));
+            let (control_status, control_body) = get_response_body(client, control_url.as_str())
+                .await
+                .unwrap_or((0, String::new()));
 
             if let Some((test_status, test_body)) = get_response_body(client, &ne_url_str).await {
                 let is_bypass = operator_bypass_confirmed(
