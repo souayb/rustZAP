@@ -74,6 +74,12 @@ enum Commands {
         /// Fetch OpenAPI 3.x JSON from a URL once
         #[arg(long)]
         openapi_url: Option<String>,
+        /// Import a plain list of routes/paths (one per line; optional "METHOD /path")
+        #[arg(long, value_name = "FILE")]
+        paths: Option<String>,
+        /// Disable auto-probing of common OpenAPI/Swagger spec locations (/openapi.json, /v3/api-docs, ...)
+        #[arg(long)]
+        no_openapi_discovery: bool,
         /// Import same-origin requests from a HAR recording
         #[arg(long)]
         har_path: Option<String>,
@@ -662,6 +668,8 @@ async fn run() -> anyhow::Result<()> {
             plugins,
             openapi_path,
             openapi_url,
+            paths,
+            no_openapi_discovery,
             har_path,
             nuclei,
             nuclei_jsonl,
@@ -693,6 +701,8 @@ async fn run() -> anyhow::Result<()> {
                 openapi_path,
                 openapi_url,
                 har_path,
+                paths_file: paths,
+                discover_openapi: !no_openapi_discovery,
                 nuclei,
                 nuclei_jsonl,
                 active_all_paths,
