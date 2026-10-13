@@ -228,7 +228,31 @@ impl ActiveScanner {
             .buffer_unordered(self.concurrency);
 
         let results: Vec<Vec<Finding>> = findings_stream.collect().await;
-        let all_findings = results.into_iter().flatten().collect();
+        let mut all_findings: Vec<Finding> = results.into_iter().flatten().collect();
+
+        // If the target rate-limited us, say so loudly: a 429-starved active scan
+        // that found nothing must not be misread as "clean" (#21).
+        if self.gate.was_throttled() {
+            let n = self.gate.throttle_count();
+            let target = urls.first().map(|u| u.url.as_str()).unwrap_or("");
+            all_findings.push(
+                Finding::new(
+                    "Active Scan Throttled by Target Rate Limiting",
+                    Severity::Info,
+                    target,
+                    format!(
+                        "The target returned HTTP 429 (Too Many Requests) {n} time(s) during the \
+                         active scan. RustZAP automatically reduced its request rate, but some \
+                         payloads may not have reached the application. Treat active-scan coverage \
+                         as PARTIAL — the absence of findings here is not evidence the target is clean."
+                    ),
+                    "Re-run against a non-rate-limited environment, or with a lower --max-rps so \
+                     fewer requests are rejected, before treating active results as complete.",
+                    "active/rate-limit-throttled",
+                )
+                .with_owasp("A05:2021 – Security Misconfiguration"),
+            );
+        }
 
         Ok(all_findings)
     }
@@ -1348,13 +1372,30 @@ pub fn parse_allow_header(value: &str) -> Vec<String> {
     out
 }
 
-/// Return the subset of `methods` that are considered dangerous to expose
-/// without authentication.
+/// Return the subset of `methods` that are genuinely dangerous to expose: the
+/// cross-site-tracing / proxy verbs `TRACE`, `TRACK`, and `CONNECT`.
+///
+/// Standard REST write verbs (`PUT`/`PATCH`/`DELETE`) are intentionally **not**
+/// included — on a resource-oriented API they are the expected verbs, so
+/// flagging them produces false positives. They are surfaced separately as
+/// informational via [`writable_methods`].
 pub fn dangerous_methods(methods: &[String]) -> Vec<String> {
-    let dangerous = ["PUT", "DELETE", "PATCH", "TRACE", "CONNECT"];
+    let dangerous = ["TRACE", "TRACK", "CONNECT"];
     methods
         .iter()
         .filter(|m| dangerous.contains(&m.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Return the standard REST write verbs advertised by the endpoint. These are
+/// expected on REST APIs, so they are reported informationally (confirm they
+/// enforce authn/authz) rather than as a vulnerability.
+pub fn writable_methods(methods: &[String]) -> Vec<String> {
+    let writable = ["PUT", "PATCH", "DELETE"];
+    methods
+        .iter()
+        .filter(|m| writable.contains(&m.as_str()))
         .cloned()
         .collect()
 }
@@ -1365,7 +1406,7 @@ impl ScanPlugin for HttpMethodsPlugin {
         "http-methods"
     }
     fn description(&self) -> &str {
-        "HTTP method enumeration — OPTIONS probe, flags dangerous combos (PUT/DELETE/TRACE)"
+        "HTTP method enumeration — OPTIONS probe; flags XST verbs (TRACE/TRACK/CONNECT), reports REST write verbs informationally"
     }
 
     fn always_run(&self) -> bool {
@@ -1397,23 +1438,45 @@ impl ScanPlugin for HttpMethodsPlugin {
         };
 
         let methods = parse_allow_header(&allow_value);
-        let bad = dangerous_methods(&methods);
 
-        if !bad.is_empty() {
+        // Genuinely risky: cross-site-tracing / proxy verbs.
+        let xst = dangerous_methods(&methods);
+        if !xst.is_empty() {
             findings.push(
                 Finding::new(
-                    "Dangerous HTTP Methods Allowed",
+                    "Dangerous HTTP Methods (XST) Allowed",
                     Severity::Medium,
                     &target.url,
                     format!(
-                        "The endpoint advertises methods that are often unnecessary and risky: {}.",
-                        bad.join(", ")
+                        "The endpoint advertises cross-site-tracing / proxy methods that should be disabled: {}.",
+                        xst.join(", ")
                     ),
-                    "Restrict allowed methods at the web server / framework layer. Disable TRACE, and require auth for PUT/DELETE/PATCH.",
+                    "Disable TRACE, TRACK, and CONNECT at the web server / proxy layer.",
                     "active/http-methods",
                 )
                 .with_evidence(format!("Allow: {}", allow_value))
                 .with_cwe(650)
+                .with_owasp("A05:2021 – Security Misconfiguration"),
+            );
+        }
+
+        // Expected on REST APIs — informational, so the signal isn't lost but it
+        // is not reported as a vulnerability (see #21).
+        let writable = writable_methods(&methods);
+        if !writable.is_empty() {
+            findings.push(
+                Finding::new(
+                    "Write HTTP Methods Enabled",
+                    Severity::Info,
+                    &target.url,
+                    format!(
+                        "The endpoint allows write methods ({}). On a REST API these are expected; confirm each one requires authentication and authorization.",
+                        writable.join(", ")
+                    ),
+                    "Informational: ensure write methods enforce authn/authz and object-level access control. Not a finding on its own for a REST API.",
+                    "active/http-methods",
+                )
+                .with_evidence(format!("Allow: {}", allow_value))
                 .with_owasp("A05:2021 – Security Misconfiguration"),
             );
         }
@@ -1849,18 +1912,35 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_methods_flags_destructive_verbs() {
-        let methods: Vec<String> = ["GET", "POST", "PUT", "TRACE"]
+    fn dangerous_methods_flags_only_xst_verbs() {
+        // PUT is a legitimate REST verb and must NOT be flagged as dangerous (#21);
+        // only TRACE/TRACK/CONNECT are.
+        let methods: Vec<String> = ["GET", "POST", "PUT", "TRACE", "CONNECT"]
             .into_iter()
             .map(String::from)
             .collect();
         let bad = dangerous_methods(&methods);
-        assert_eq!(bad, vec!["PUT".to_string(), "TRACE".to_string()]);
+        assert_eq!(bad, vec!["TRACE".to_string(), "CONNECT".to_string()]);
     }
 
     #[test]
-    fn dangerous_methods_silent_on_safe_set() {
-        let methods: Vec<String> = ["GET", "HEAD", "OPTIONS"]
+    fn writable_methods_reported_separately() {
+        let methods: Vec<String> = ["GET", "POST", "PUT", "PATCH", "DELETE", "TRACE"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        // REST write verbs are surfaced on their own, not as "dangerous".
+        assert_eq!(
+            writable_methods(&methods),
+            vec!["PUT".to_string(), "PATCH".to_string(), "DELETE".to_string()]
+        );
+        assert_eq!(dangerous_methods(&methods), vec!["TRACE".to_string()]);
+    }
+
+    #[test]
+    fn dangerous_methods_silent_on_rest_set() {
+        // A standard REST method set has no XST verbs.
+        let methods: Vec<String> = ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]
             .into_iter()
             .map(String::from)
             .collect();
