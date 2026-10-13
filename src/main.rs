@@ -1,3 +1,7 @@
+// See src/lib.rs: `#[async_trait]` output trips clippy's `double_must_use` under
+// Rust 1.99; the attribute is macro-generated and harmless.
+#![allow(clippy::double_must_use)]
+
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use colored::*;
