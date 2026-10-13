@@ -1200,6 +1200,29 @@ Network operations without a valid scope are rejected.
 
 ---
 
+# SBOM license policy (scoped)
+
+Apply a license policy to a CycloneDX SBOM, scoped so a container's **base-OS/distro
+packages** (`bash`, `apt`, fonts, …) don't drown the signal that matters — the
+license posture of the application's **own** dependencies. OS packages shipped under
+mere aggregation are reported informationally by default rather than failing the gate.
+
+```bash
+# Default: enforce Deny/Review on application dependencies only
+rustzap license sbom.cdx.json --fail-on-deny
+
+# Enforce on everything (application + OS/base image)
+rustzap license sbom.cdx.json --scope all --fail-on-deny
+
+# Exempt specific packages (one name per line)
+rustzap license sbom.cdx.json --os-allowlist allow.txt
+```
+
+Components are classified by origin from their `purl` type (`pkg:deb/…`, `pkg:apk/…`,
+`pkg:rpm/…` → OS; `pkg:cargo/…`, `pkg:npm/…`, … → application). The report is split
+into **Application dependencies** and **Base image / OS**, and the gate fails only on
+enforced `DENY` licenses in scope.
+
 # Capture and replay
 
 HTTP operations performed by the agent can be captured.

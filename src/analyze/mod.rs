@@ -16,6 +16,7 @@ pub mod checkov;
 mod gitignore;
 pub mod gitleaks;
 pub mod inventory;
+pub mod license;
 pub mod native;
 pub mod semgrep;
 pub mod static_report;
