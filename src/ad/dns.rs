@@ -23,8 +23,11 @@ impl LiveDns {
         let resolver = match dc_ip.parse::<IpAddr>() {
             Ok(ip) => {
                 // Query the DC directly over UDP+TCP on port 53.
-                let config =
-                    ResolverConfig::from_parts(None, vec![], vec![NameServerConfig::udp_and_tcp(ip)]);
+                let config = ResolverConfig::from_parts(
+                    None,
+                    vec![],
+                    vec![NameServerConfig::udp_and_tcp(ip)],
+                );
                 Self::from_config(config)
             }
             Err(_) => TokioResolver::builder_tokio()
