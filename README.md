@@ -353,6 +353,28 @@ Tool-generated findings remain authoritative; an LLM observation is not treated 
 
 # Installation
 
+## Quick install (one line)
+
+**Linux / macOS** — downloads the latest release binary, verifies its SHA-256, and installs it to `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/souayb/rustZAP/main/scripts/install.sh | sh
+```
+
+Pin a version or change the location:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/souayb/rustZAP/main/scripts/install.sh | sh -s -- --version 0.1.2 --bin-dir /usr/local/bin
+```
+
+**Windows (PowerShell)** — installs the console CLI (`rustzap.exe`), not the GUI installer:
+
+```powershell
+irm https://raw.githubusercontent.com/souayb/rustZAP/main/scripts/install.ps1 | iex
+```
+
+The installers verify each download against the release's `SHA256SUMS`. For manual installs or package formats, see below.
+
 ## Prebuilt releases
 
 Tagged releases provide native installers for:
