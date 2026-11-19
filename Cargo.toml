@@ -26,7 +26,7 @@ reqwest = { version = "0.11", features = ["json", "cookies", "gzip", "deflate", 
 # Proxy server
 hyper = { version = "0.14", features = ["full"] }
 hyper-rustls = "0.24"
-rustls = "0.21"
+rustls = "0.23"
 tokio-rustls = "0.24"
 
 # HTML parsing / spidering
