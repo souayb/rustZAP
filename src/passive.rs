@@ -505,7 +505,7 @@ fn check_mixed_content(url: &str, body: &str) -> Vec<Finding> {
     for pattern in &patterns {
         if let Ok(re) = regex::Regex::new(pattern) {
             if let Some(m) = re.find(body) {
-                let snippet = &body[m.start()..body.len().min(m.start() + 80)];
+                let snippet = crate::types::safe_truncate(&body[m.start()..], 80);
                 findings.push(
                     Finding::new(
                         "Mixed Active Content",
@@ -572,10 +572,10 @@ fn check_sensitive_data_exposure(url: &str, body: &str) -> Vec<Finding> {
     for (pattern, title, severity) in patterns {
         if let Ok(re) = regex::Regex::new(pattern) {
             if let Some(m) = re.find(body) {
-                let snippet = &body[m.start()..body.len().min(m.start() + 60)];
+                let snippet = crate::types::safe_truncate(&body[m.start()..], 60);
                 // Redact most of it
                 let redacted = if snippet.len() > 20 {
-                    format!("{}...[REDACTED]", &snippet[..20])
+                    format!("{}...[REDACTED]", crate::types::safe_truncate(snippet, 20))
                 } else {
                     snippet.to_string()
                 };
@@ -1761,5 +1761,23 @@ Policy: https://example.com/policy\n";
             "<html><body>no forms here</body></html>"
         )
         .is_empty());
+    }
+
+    // Regression: a match followed by multi-byte text used to panic when the
+    // redaction cut landed inside a character ("end byte index 20 is not a char boundary").
+    #[test]
+    fn sensitive_data_redaction_respects_utf8_boundaries() {
+        // "x@example.de " is 13 bytes, so byte 20 falls inside the third '•'.
+        let body = "x@example.de •••••••••••••••••••••• Stand";
+        let findings = check_sensitive_data_exposure("https://t.example/", body);
+        let email = findings
+            .iter()
+            .find(|f| f.title == "Email Address Disclosed")
+            .expect("email finding");
+        assert!(email
+            .evidence
+            .as_deref()
+            .unwrap()
+            .ends_with("...[REDACTED]"));
     }
 }
