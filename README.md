@@ -733,6 +733,12 @@ rustzap scan --target https://example.com --output report.csv
 rustzap scan --target https://example.com --output report.html
 ```
 
+Re-render a saved JSON report in another format, without scanning again:
+
+```bash
+rustzap render report.json --output report.html
+```
+
 SARIF:
 
 ```bash

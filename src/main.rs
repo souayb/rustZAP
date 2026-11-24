@@ -602,6 +602,17 @@ enum Commands {
         verbose: bool,
     },
 
+    /// Re-render a saved JSON report as HTML, CSV, SARIF or JSON (by output extension), without rescanning
+    Render {
+        /// RustZAP JSON report (from scan/analyze/audit --output *.json)
+        #[arg(value_name = "REPORT_JSON")]
+        input: String,
+
+        /// Output path (.html/.csv/.sarif/.json by extension)
+        #[arg(short, long)]
+        output: String,
+    },
+
     /// Apply a license policy to a CycloneDX SBOM, scoped to application deps vs OS packages
     License {
         /// Path to a CycloneDX JSON SBOM
@@ -1094,6 +1105,20 @@ async fn run() -> anyhow::Result<()> {
             if summary.failed > 0 || summary.status_diverged > 0 {
                 std::process::exit(1);
             }
+        }
+
+        Commands::Render { input, output } => {
+            let raw =
+                std::fs::read_to_string(&input).with_context(|| format!("read report {input}"))?;
+            let report: rustzap::report::Report = serde_json::from_str(&raw)
+                .with_context(|| format!("{input} is not a RustZAP JSON report"))?;
+            report.save(&output).await?;
+            println!(
+                "{} {} findings written to {}",
+                "✓".green(),
+                report.summary.total_findings,
+                output
+            );
         }
 
         Commands::License {
