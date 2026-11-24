@@ -201,20 +201,48 @@ impl Report {
         Ok(())
     }
 
+    /// Write the report in the format its extension names (.html, .csv, .sarif, else JSON).
+    pub async fn save(&self, path: &str) -> Result<()> {
+        if path.ends_with(".sarif") {
+            crate::sarif::write_sarif(self, path)
+        } else if path.ends_with(".csv") {
+            self.save_csv(path).await
+        } else if path.ends_with(".html") {
+            self.save_html(path).await
+        } else {
+            self.save_json(path).await
+        }
+    }
+
     pub async fn save_html(&self, path: &str) -> Result<()> {
+        tokio::fs::write(path, self.to_html()).await?;
+        Ok(())
+    }
+
+    pub fn to_html(&self) -> String {
         let mut html = String::from(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline';\"><title>RustZAP Report</title><style>body { font-family: sans-serif; } table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #ddd; padding: 8px; }</style></head><body>"
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline';\"><title>RustZAP Report</title><style>body { font-family: sans-serif; margin: 2em; } table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; text-align: left; } td.ev { font-family: monospace; white-space: pre-wrap; word-break: break-all; } .counts td { text-align: center; }</style></head><body>"
         );
         html.push_str(&format!(
             "<h1>RustZAP Scan Report: {}</h1>",
             html_escape(&self.meta.target)
         ));
         html.push_str(&format!(
-            "<p>Total Findings: {} | Risk Score: {}</p>",
-            self.summary.total_findings, self.summary.risk_score
+            "<p>Scanner {} {} | Scan date {} | Duration {:.0} s | URLs {} | Risk score {}</p>",
+            html_escape(&self.meta.scanner),
+            html_escape(&self.meta.version),
+            html_escape(&self.meta.scan_date),
+            self.meta.duration_secs,
+            self.summary.total_urls,
+            self.summary.risk_score
+        ));
+        let s = &self.summary;
+        html.push_str(&format!(
+            "<table class=\"counts\"><tr><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Info</th><th>Total</th></tr><tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr></table>",
+            s.critical, s.high, s.medium, s.low, s.info, s.total_findings
         ));
 
-        html.push_str("<table><tr><th>Severity</th><th>Confidence</th><th>Title</th><th>URL</th><th>Parameter</th><th>Description</th></tr>");
+        html.push_str("<h2>Findings</h2><table><tr><th>Severity</th><th>Confidence</th><th>Title</th><th>URL</th><th>Parameter</th><th>Evidence</th><th>Description</th><th>Solution</th><th>CWE</th><th>Plugin</th></tr>");
         for f in &self.findings {
             let color = match f.severity {
                 Severity::Critical => "magenta",
@@ -228,21 +256,27 @@ impl Report {
             } else {
                 f.confidence.to_string()
             };
+            let cwe = f
+                .cwe
+                .map(|c| format!("CWE-{c}"))
+                .unwrap_or_else(|| "-".into());
             html.push_str(&format!(
-                "<tr><td style='color: {}'><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td style='color: {}'><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"ev\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 color,
                 html_escape(&f.severity.to_string()),
                 html_escape(&confidence),
                 html_escape(&f.title),
                 html_escape(&f.url),
                 html_escape(f.parameter.as_deref().unwrap_or("-")),
-                html_escape(&f.description)
+                html_escape(f.evidence.as_deref().unwrap_or("-")),
+                html_escape(&f.description),
+                html_escape(&f.solution),
+                html_escape(&cwe),
+                html_escape(&f.plugin)
             ));
         }
         html.push_str("</table></body></html>");
-
-        tokio::fs::write(path, html).await?;
-        Ok(())
+        html
     }
 }
 
@@ -448,6 +482,47 @@ mod tests {
         );
         assert!(!escaped.contains('<'));
         assert!(!escaped.contains('>'));
+    }
+
+    #[test]
+    fn html_report_includes_evidence_and_solution_escaped() {
+        let finding = Finding {
+            id: "id-1".to_string(),
+            title: "Host header reflected".to_string(),
+            severity: Severity::Medium,
+            url: "https://example.test/api/config".to_string(),
+            parameter: Some("Host".to_string()),
+            evidence: Some("<script>redirectUri</script>".to_string()),
+            description: "d".to_string(),
+            solution: "Send Cache-Control: no-store".to_string(),
+            cwe: Some(644),
+            owasp_category: None,
+            nist_control: None,
+            disa_stig_id: None,
+            plugin: "host-header-injection".to_string(),
+            source_tool: None,
+            location: None,
+            correlated_with: vec![],
+            poc_validated: false,
+            poc: None,
+            confidence: Default::default(),
+            found_at: chrono::Utc::now(),
+        };
+        let report = Report::new(
+            "https://example.test",
+            vec![],
+            vec![],
+            vec![finding],
+            Duration::from_secs(3),
+        );
+        // Round-trip through JSON, as `rustzap render` does.
+        let json = serde_json::to_string(&report).unwrap();
+        let html = serde_json::from_str::<Report>(&json).unwrap().to_html();
+        assert!(html.contains("&lt;script&gt;redirectUri&lt;/script&gt;"));
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("Send Cache-Control: no-store"));
+        assert!(html.contains("CWE-644"));
+        assert!(html.contains("<td>0</td><td>0</td><td>1</td><td>0</td><td>0</td><td>1</td>"));
     }
 
     #[test]
