@@ -422,7 +422,7 @@ impl ScanPlugin for SqliUnionPlugin {
                                 .with_parameter(&param)
                                 .with_evidence(format!(
                                     "UNION SELECT with {} cols, canary at pos {} reflected in response. Payload: `{}`",
-                                    col_count, canary_pos + 1, &payload[..payload.len().min(120)]
+                                    col_count, canary_pos + 1, crate::types::safe_truncate(&payload, 120)
                                 ))
                                 .with_cwe(89)
                                 .with_owasp("A03:2021 – Injection")
@@ -919,7 +919,7 @@ impl ScanPlugin for NoSqlInjectionPlugin {
                                 .with_parameter(param)
                                 .with_evidence(format!(
                                     "Operator {} → HTTP {} success; benign control → HTTP {} (no success). Body: `{}`",
-                                    op_label, status, control_status, &body[..body.len().min(80)]
+                                    op_label, status, control_status, crate::types::safe_truncate(&body, 80)
                                 ))
                                 .with_cwe(943)
                                 .with_owasp("A03:2021 – Injection")
@@ -1118,7 +1118,7 @@ impl ScanPlugin for SqliFingerprintPlugin {
                                 .with_parameter(&param)
                                 .with_evidence(format!(
                                     "DB: {} — banner `{}` (new vs baseline) via payload `{}`",
-                                    db, sig, &payload[..payload.len().min(80)]
+                                    db, sig, crate::types::safe_truncate(payload, 80)
                                 ))
                                 .with_cwe(200)
                                 .with_owasp("A05:2021 – Security Misconfiguration")

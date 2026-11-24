@@ -147,7 +147,10 @@ impl ScanPlugin for BolaPlugin {
 
                         if is_idor {
                             let snippet = if test_body.len() > 80 {
-                                format!("{}...[TRUNCATED]", &test_body[..80])
+                                format!(
+                                    "{}...[TRUNCATED]",
+                                    crate::types::safe_truncate(&test_body, 80)
+                                )
                             } else {
                                 test_body.clone()
                             };
@@ -198,7 +201,10 @@ impl ScanPlugin for BolaPlugin {
                                 || (baseline_status == 403 || baseline_status == 404)
                             {
                                 let snippet = if test_body.len() > 80 {
-                                    format!("{}...[TRUNCATED]", &test_body[..80])
+                                    format!(
+                                        "{}...[TRUNCATED]",
+                                        crate::types::safe_truncate(&test_body, 80)
+                                    )
                                 } else {
                                     test_body.clone()
                                 };

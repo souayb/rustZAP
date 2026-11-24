@@ -71,7 +71,7 @@ fn item_to_finding(item: &GitleaksFinding, repo_root: &Path) -> Result<Finding> 
         .as_ref()
         .map(|s| {
             if s.len() > 8 {
-                format!("{}…[REDACTED]", &s[..4])
+                format!("{}…[REDACTED]", crate::types::safe_truncate(s, 4))
             } else {
                 "[REDACTED]".to_string()
             }
