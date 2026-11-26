@@ -16,6 +16,7 @@ pub mod checkov;
 mod git_status;
 mod gitignore;
 pub mod gitleaks;
+pub mod grype;
 pub mod inventory;
 pub mod license;
 pub mod native;
@@ -31,6 +32,7 @@ pub enum AnalyzeTool {
     Gitleaks,
     Native,
     Checkov,
+    Grype,
 }
 
 impl AnalyzeTool {
@@ -41,11 +43,12 @@ impl AnalyzeTool {
             AnalyzeTool::Gitleaks => "secrets/gitleaks",
             AnalyzeTool::Native => "sast/inventory",
             AnalyzeTool::Checkov => "iac/checkov",
+            AnalyzeTool::Grype => "sca/grype",
         }
     }
 }
 
-/// Parse comma-separated tool names (`semgrep`, `trivy`, `gitleaks`, `native`, `checkov`).
+/// Parse comma-separated tool names (`semgrep`, `trivy`, `gitleaks`, `native`, `checkov`, `grype`).
 pub fn parse_tools(spec: &str) -> Result<Vec<AnalyzeTool>> {
     let mut out = Vec::new();
     for part in spec.split(',') {
@@ -59,8 +62,9 @@ pub fn parse_tools(spec: &str) -> Result<Vec<AnalyzeTool>> {
             "gitleaks" | "secrets" => AnalyzeTool::Gitleaks,
             "native" => AnalyzeTool::Native,
             "checkov" | "iac" => AnalyzeTool::Checkov,
+            "grype" => AnalyzeTool::Grype,
             other => bail!(
-                "Unknown analyze tool '{}'. Supported: semgrep, trivy, gitleaks, native, checkov",
+                "Unknown analyze tool '{}'. Supported: semgrep, trivy, gitleaks, native, checkov, grype",
                 other
             ),
         };
@@ -300,6 +304,7 @@ pub struct StaticInputs {
     pub tools_explicit: bool,
     pub semgrep_json: Option<PathBuf>,
     pub trivy_json: Option<PathBuf>,
+    pub grype_json: Option<PathBuf>,
     pub gitleaks_json: Option<PathBuf>,
     pub checkov_json: Option<PathBuf>,
     /// Controls the native repo walk (`.gitignore` / symlink handling).
@@ -389,6 +394,8 @@ pub async fn run_static_analysis(inputs: &StaticInputs) -> Result<StaticRunResul
         push_ran(&mut tools_ran, AnalyzeTool::Native);
     }
 
+    grype::merge_trivy_overlap(&mut all);
+
     // Label secrets committed-vs-working-tree before risk roll-up so the
     // severity bump for committed secrets feeds into the static score.
     git_status::label_secrets(&inputs.repo, &mut all);
@@ -420,6 +427,7 @@ async fn run_one_static_tool(tool: AnalyzeTool, inputs: &StaticInputs) -> Result
         AnalyzeTool::Trivy => Ok(ToolChunk::Findings(run_trivy(inputs).await?)),
         AnalyzeTool::Gitleaks => Ok(ToolChunk::Findings(run_gitleaks(inputs).await?)),
         AnalyzeTool::Checkov => Ok(ToolChunk::Findings(run_checkov_tool(inputs).await?)),
+        AnalyzeTool::Grype => Ok(ToolChunk::Findings(run_grype(inputs).await?)),
         AnalyzeTool::Native => {
             let native = native::run(&inputs.repo)
                 .await
@@ -449,6 +457,17 @@ async fn run_trivy(inputs: &StaticInputs) -> Result<Vec<Finding>> {
         .await
         .context("Running Trivy failed")?;
     trivy::parse_trivy_json_str(&json).context("Parsing Trivy stdout JSON")
+}
+
+async fn run_grype(inputs: &StaticInputs) -> Result<Vec<Finding>> {
+    if let Some(path) = &inputs.grype_json {
+        return grype::parse_grype_json_file(&path.to_string_lossy())
+            .with_context(|| format!("Parsing Grype JSON: {}", path.display()));
+    }
+    let json = grype::run_grype_dir(&inputs.repo)
+        .await
+        .context("Running Grype failed")?;
+    grype::parse_grype_json_str(&json).context("Parsing Grype stdout JSON")
 }
 
 async fn run_gitleaks(inputs: &StaticInputs) -> Result<Vec<Finding>> {
@@ -592,6 +611,7 @@ pub async fn run_analyze(
     tools: String,
     semgrep_json: Option<String>,
     trivy_json: Option<String>,
+    grype_json: Option<String>,
     gitleaks_json: Option<String>,
     checkov_json: Option<String>,
     correlate: bool,
@@ -611,6 +631,7 @@ pub async fn run_analyze(
         tools_explicit,
         semgrep_json: semgrep_json.map(PathBuf::from),
         trivy_json: trivy_json.map(PathBuf::from),
+        grype_json: grype_json.map(PathBuf::from),
         gitleaks_json: gitleaks_json.map(PathBuf::from),
         checkov_json: checkov_json.map(PathBuf::from),
         walk: crate::analyze::inventory::WalkConfig {
@@ -646,6 +667,7 @@ pub async fn run_analyze_cli(
     tools: String,
     semgrep_json: Option<String>,
     trivy_json: Option<String>,
+    grype_json: Option<String>,
     gitleaks_json: Option<String>,
     checkov_json: Option<String>,
     correlate: bool,
@@ -661,6 +683,7 @@ pub async fn run_analyze_cli(
         tools,
         semgrep_json,
         trivy_json,
+        grype_json,
         gitleaks_json,
         checkov_json,
         correlate,
@@ -682,6 +705,7 @@ pub async fn run_audit_cli(
     tools: String,
     semgrep_json: Option<String>,
     trivy_json: Option<String>,
+    grype_json: Option<String>,
     gitleaks_json: Option<String>,
     checkov_json: Option<String>,
     correlate: bool,
@@ -711,6 +735,7 @@ pub async fn run_audit_cli(
         tools_explicit,
         semgrep_json: semgrep_json.map(PathBuf::from),
         trivy_json: trivy_json.map(PathBuf::from),
+        grype_json: grype_json.map(PathBuf::from),
         gitleaks_json: gitleaks_json.map(PathBuf::from),
         checkov_json: checkov_json.map(PathBuf::from),
         walk: crate::analyze::inventory::WalkConfig {
@@ -1026,6 +1051,7 @@ mod tests {
             tools_explicit: false,
             semgrep_json: None,
             trivy_json: None,
+            grype_json: None,
             gitleaks_json: None,
             checkov_json: None,
             walk: WalkConfig::default(),
@@ -1049,6 +1075,7 @@ mod tests {
             tools_explicit: true,
             semgrep_json: None,
             trivy_json: None,
+            grype_json: None,
             gitleaks_json: None,
             checkov_json: None,
             walk: WalkConfig::default(),
@@ -1075,6 +1102,7 @@ mod tests {
             tools_explicit: true,
             semgrep_json: None,
             trivy_json: None,
+            grype_json: None,
             gitleaks_json: None,
             checkov_json: Some(root.join("tests/fixtures/checkov_small.json")),
             walk: WalkConfig::default(),
@@ -1099,6 +1127,7 @@ mod tests {
             tools_explicit: true,
             semgrep_json: None,
             trivy_json: None,
+            grype_json: None,
             gitleaks_json: None,
             checkov_json: None,
             walk: WalkConfig::default(),
@@ -1211,6 +1240,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             out.to_string_lossy().to_string(),
             None,
@@ -1254,6 +1284,7 @@ mod tests {
             tools_explicit: true,
             semgrep_json: None,
             trivy_json: None,
+            grype_json: None,
             gitleaks_json: None,
             checkov_json: Some(root.join("tests/fixtures/checkov_small.json")),
             walk: WalkConfig::default(),
@@ -1279,6 +1310,7 @@ mod tests {
             tools_explicit: true,
             semgrep_json: None,
             trivy_json: None,
+            grype_json: None,
             gitleaks_json: None,
             checkov_json: Some(root.join("tests/fixtures/checkov_small.json")),
             walk: WalkConfig::default(),
@@ -1379,6 +1411,7 @@ mod tests {
                     .to_string_lossy()
                     .to_string(),
             ),
+            None,
             Some(
                 root.join("tests/fixtures/gitleaks_small.json")
                     .to_string_lossy()
@@ -1409,6 +1442,71 @@ mod tests {
         assert!(json.contains("\"sast/semgrep\""));
         assert!(json.contains("\"sca/trivy\""));
         assert!(json.contains("\"secrets/gitleaks\""));
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[tokio::test]
+    async fn grype_json_import_merges_trivy_overlap() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tools = parse_tools("trivy,grype").expect("parse");
+        assert_eq!(AnalyzeTool::Grype.module_id(), "sca/grype");
+        let run = run_static_analysis(&StaticInputs {
+            repo: root.to_path_buf(),
+            tools,
+            tools_explicit: true,
+            semgrep_json: None,
+            trivy_json: Some(root.join("tests/fixtures/trivy_small.json")),
+            grype_json: Some(root.join("tests/fixtures/grype_small.json")),
+            gitleaks_json: None,
+            checkov_json: None,
+            walk: WalkConfig::default(),
+        })
+        .await
+        .expect("trivy+grype fixtures");
+        assert_eq!(run.tools_ran, vec![AnalyzeTool::Trivy, AnalyzeTool::Grype]);
+        // 1 Trivy + 3 Grype, minus the openssl/CVE-2024-1234 overlap.
+        assert_eq!(run.findings.len(), 3);
+        assert_eq!(
+            run.findings
+                .iter()
+                .filter(|f| f.plugin == "sca/grype")
+                .count(),
+            2
+        );
+        let modules = build_module_summaries(&run.findings, &run.tools_ran, &[]);
+        assert!(modules.iter().any(|m| m.name == "sca/grype" && !m.quiet));
+        assert!(modules.iter().any(|m| m.name == "sca/trivy" && !m.quiet));
+    }
+
+    #[tokio::test]
+    async fn analyze_cli_accepts_grype_json() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = std::env::temp_dir().join(format!("rustzap-grype-{}.json", uuid()));
+        run_analyze_cli(
+            root.to_string_lossy().to_string(),
+            "grype".to_string(),
+            None,
+            None,
+            Some(
+                root.join("tests/fixtures/grype_small.json")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            None,
+            None,
+            false,
+            out.to_string_lossy().to_string(),
+            None,
+            true,
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("analyze grype");
+        let json = std::fs::read_to_string(&out).expect("read report");
+        assert!(json.contains("\"sca/grype\""));
+        assert!(json.contains("GHSA-35jh-r3h4-6jhm"));
         let _ = std::fs::remove_file(out);
     }
 

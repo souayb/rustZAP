@@ -69,6 +69,55 @@ pub enum ScanStatus {
     Partial,
 }
 
+/// Outcome of one assessment input (#19): DAST, container image, dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputOutcome {
+    Assessed,
+    /// The operator supplied no input for this part — it was NOT assessed.
+    MissingInput,
+    Skipped,
+    Failed,
+}
+
+impl std::fmt::Display for InputOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            InputOutcome::Assessed => "assessed",
+            InputOutcome::MissingInput => "missing_input",
+            InputOutcome::Skipped => "skipped",
+            InputOutcome::Failed => "failed",
+        })
+    }
+}
+
+/// What was (or was not) assessed for one input of a unified `scan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssessmentInput {
+    /// `dast`, `image`, or `dependencies`.
+    pub kind: String,
+    pub outcome: InputOutcome,
+    /// Image reference, lockfile path, imported JSON path, or target URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Exit code of the external tool when it ran and failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i32>,
+    /// Redacted reason for any outcome other than `assessed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vulnerability_db_updated_at: Option<String>,
+    #[serde(default)]
+    pub findings: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Coverage {
     pub status: ScanStatus,
@@ -76,6 +125,9 @@ pub struct Coverage {
     pub records: Vec<ExecutionRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omitted: Vec<OmittedRecord>,
+    /// Unified-assessment inputs (#19); absent on reports that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<AssessmentInput>,
 }
 
 impl Coverage {
@@ -97,7 +149,17 @@ impl Coverage {
             },
             records,
             omitted,
+            inputs: Vec::new(),
         }
+    }
+
+    /// Attach assessment inputs; a `failed` input makes the run `partial`.
+    pub fn with_inputs(mut self, inputs: Vec<AssessmentInput>) -> Self {
+        if inputs.iter().any(|i| i.outcome == InputOutcome::Failed) {
+            self.status = ScanStatus::Partial;
+        }
+        self.inputs = inputs;
+        self
     }
 
     pub fn outcome_counts(&self) -> BTreeMap<Outcome, usize> {

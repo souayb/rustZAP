@@ -10,6 +10,7 @@ pub mod active;
 pub mod ad;
 pub mod agent;
 pub mod analyze;
+pub mod assess;
 pub mod browser_discovery;
 pub mod cache_abuse;
 pub mod correlate;

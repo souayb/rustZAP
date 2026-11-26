@@ -271,6 +271,17 @@ impl Report {
                 .map(|r| format!(" | Revision: {}", html_escape(r)))
                 .unwrap_or_default()
         ));
+        for l in self
+            .meta
+            .coverage_limitations
+            .iter()
+            .filter(|l| l.starts_with("NOT ASSESSED"))
+        {
+            html.push_str(&format!(
+                "<p style=\"background:#fdd;border:2px solid #c00;padding:8px\"><b>{}</b></p>",
+                html_escape(&redact(l))
+            ));
+        }
         if !self.meta.coverage_limitations.is_empty() {
             html.push_str("<p>Coverage limitations:</p><ul>");
             for l in &self.meta.coverage_limitations {
@@ -351,6 +362,25 @@ fn coverage_html(c: &crate::coverage::Coverage) -> String {
                 r.requests_completed,
                 r.requests_attempted,
                 html_escape(&r.reason)
+            ));
+        }
+        s.push_str("</table>");
+    }
+    if !c.inputs.is_empty() {
+        s.push_str("<h3>Assessment inputs</h3><table><tr><th>Input</th><th>Outcome</th><th>Source</th><th>Exit</th><th>Image digest</th><th>Revision</th><th>Vuln DB</th><th>Findings</th><th>Diagnostic</th></tr>");
+        for i in &c.inputs {
+            let opt = |o: &Option<String>| html_escape(o.as_deref().unwrap_or("-"));
+            s.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&i.kind),
+                i.outcome,
+                opt(&i.source),
+                i.exit_status.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                opt(&i.image_digest),
+                opt(&i.repository_revision),
+                opt(&i.vulnerability_db_updated_at),
+                i.findings,
+                opt(&i.diagnostic)
             ));
         }
         s.push_str("</table>");

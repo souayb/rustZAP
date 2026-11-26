@@ -312,6 +312,14 @@ fn merge_discovered(into: &mut Vec<DiscoveredUrl>, extra: Vec<DiscoveredUrl>) {
 
 /// Entry point for a full scan
 pub async fn run_scan(config: ScanConfig) -> Result<Report> {
+    run_scan_assessed(config, &crate::assess::AssessInputs::default()).await
+}
+
+/// [`run_scan`] plus opt-in container-image / dependency inputs (#19).
+pub async fn run_scan_assessed(
+    config: ScanConfig,
+    assess: &crate::assess::AssessInputs,
+) -> Result<Report> {
     let start = Instant::now();
 
     println!(
@@ -335,7 +343,9 @@ pub async fn run_scan(config: ScanConfig) -> Result<Report> {
     }
     println!();
 
-    let collected = collect_scan(config.clone()).await?;
+    let mut collected = collect_scan(config.clone()).await?;
+    let (sca_findings, inputs) = crate::assess::run(&config.target_url, assess).await;
+    collected.findings.extend(sca_findings);
     let elapsed = start.elapsed();
 
     print_summary(&collected.discovered, &collected.findings, elapsed);
@@ -345,8 +355,12 @@ pub async fn run_scan(config: ScanConfig) -> Result<Report> {
         "▶ Coverage:".bright_white().bold(),
         collected.coverage.summary_line()
     );
+    let not_assessed = crate::assess::not_assessed_lines(&inputs);
+    for line in &not_assessed {
+        println!("{}", format!("  ⚠ {line}").on_red().white().bold());
+    }
 
-    let report = with_evidence_context(
+    let mut report = with_evidence_context(
         Report::new(
             &config.target_url,
             collected.modules,
@@ -356,7 +370,8 @@ pub async fn run_scan(config: ScanConfig) -> Result<Report> {
         ),
         &config,
     )
-    .with_coverage(collected.coverage);
+    .with_coverage(collected.coverage.with_inputs(inputs));
+    report.meta.coverage_limitations.extend(not_assessed);
 
     if config.output_file.ends_with(".sarif") {
         crate::sarif::write_sarif(&report, &config.output_file)?;
@@ -694,7 +709,10 @@ pub async fn run_scan_with_events(
         openapi_imported,
         nuclei_ran,
     );
-    let report = with_evidence_context(
+    // The TUI takes no image/dependency inputs: record them as not assessed.
+    let (_, inputs) =
+        crate::assess::run(&config.target_url, &crate::assess::AssessInputs::default()).await;
+    let mut report = with_evidence_context(
         Report::new(
             &config.target_url,
             modules,
@@ -704,7 +722,13 @@ pub async fn run_scan_with_events(
         ),
         &config,
     )
-    .with_coverage(crate::coverage::Coverage::new(coverage_records, Vec::new()));
+    .with_coverage(
+        crate::coverage::Coverage::new(coverage_records, Vec::new()).with_inputs(inputs.clone()),
+    );
+    report
+        .meta
+        .coverage_limitations
+        .extend(crate::assess::not_assessed_lines(&inputs));
 
     let total_findings = report.summary.total_findings;
     let risk_score = report.summary.risk_score;

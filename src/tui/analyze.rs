@@ -180,6 +180,7 @@ pub fn spawn_analyze(
             None,
             None,
             None,
+            None,
             correlate,
             output.clone(),
             sarif_out,
@@ -293,7 +294,7 @@ pub fn draw_analyze(
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Tools: native (default), semgrep, trivy, gitleaks, checkov",
+            "  Tools: native (default), semgrep, trivy, gitleaks, checkov, grype",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),

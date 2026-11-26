@@ -1,0 +1,35 @@
+{
+  "name": "rustzap",
+  "version": "0.0.0-dev",
+  "description": "A Rust-based web application security scanner inspired by OWASP ZAP (installs the prebuilt rustzap binary)",
+  "license": "MIT",
+  "homepage": "https://github.com/souayb/rustZAP",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/souayb/rustZAP.git"
+  },
+  "bin": {
+    "rustzap": "bin/rustzap.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js",
+    "test": "node --test"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md"
+  ],
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

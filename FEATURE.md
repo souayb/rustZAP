@@ -92,6 +92,9 @@ that need human follow-up (e.g. dispatched OOB payloads) are `tentative`.
 | **I10** | Redacted evidence contract (#49) | `src/evidence.rs` — export-time redaction for JSON/CSV/HTML/SARIF, agent captures, traces; finding `fingerprint` (SARIF `partialFingerprints.rustzapFindingId/v1`), `validation_status`, optional `method`, `identity_role`, `expected`, `actual`; meta `source_revision`, `coverage_limitations` |
 | **I11** | OpenAPI JSON-body fuzzing (#53) | `src/active.rs` `injection_points` — schema-valid bodies; `sqli`, `cmd-injection`, `ssti`, `path-traversal`, `nosql-injection` fuzz each string body field (`body.<field>`); uses the operation's method (never DELETE); blocked by `--read-only-safe` |
 | **I12** | Finding hygiene (#54) | `src/finding_dedup.rs` (`instances[]`), `src/jwt.rs` (`passive/jwt`: `alg:none`, missing `exp`, opt-in `--jwt-crack`), `src/analyze/git_status.rs` (`[committed]` vs `[working-tree-only]` secrets) |
+| **I13** | Unified assessment (#19) | `src/assess.rs` — `scan --image/--image-json`, `--manifest/--manifest-json` (Trivy; `sca/image`, `sca/manifest`); dependency scope; cross-source advisory dedup; `coverage.inputs[]` outcomes (`assessed`, `missing_input`, `skipped`, `failed`) and a NOT ASSESSED banner; **opt-in**; `audit` and SBOM/license folding not included |
+| **I14** | Grype (#23) | `src/analyze/grype.rs` — `--tools grype`, `--grype-json`; plugin `sca/grype`; overlap with Trivy merged; **opt-in**; installer: Homebrew on macOS only |
+| **I15** | npm installer (#24) | `npm/` — wrapper package whose postinstall downloads and checksum-verifies the release binary; published by the release `npm` job when the `NPM_TOKEN` secret is set |
 
 Tier **E** tracks **E6** (`serve`) remains **planned**. Agentic tester (**E7**) is shipped with G1–G3 hardening — see IMPLEMENTATION_PLAN Phase 5.
 

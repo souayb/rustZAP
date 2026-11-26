@@ -1,0 +1,50 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "registry.example/app:1.0",
+  "ArtifactType": "container_image",
+  "Metadata": {
+    "ImageID": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "RepoDigests": [
+      "registry.example/app@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    ],
+    "ImageConfig": {
+      "config": {
+        "Labels": {
+          "org.opencontainers.image.revision": "0123abcd"
+        }
+      }
+    }
+  },
+  "Results": [
+    {
+      "Target": "registry.example/app:1.0 (debian 12.5)",
+      "Class": "os-pkgs",
+      "Type": "debian",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2024-0001",
+          "PkgName": "openssl",
+          "InstalledVersion": "3.0.11-1",
+          "Severity": "CRITICAL",
+          "Title": "openssl: example base-image flaw",
+          "Description": "Fixture base-OS vulnerability."
+        }
+      ]
+    },
+    {
+      "Target": "app/package-lock.json",
+      "Class": "lang-pkgs",
+      "Type": "npm",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2021-23337",
+          "PkgName": "lodash",
+          "InstalledVersion": "4.17.19",
+          "Severity": "HIGH",
+          "Title": "lodash: command injection via template",
+          "Description": "Fixture application-package vulnerability shared with the lockfile result."
+        }
+      ]
+    }
+  ]
+}

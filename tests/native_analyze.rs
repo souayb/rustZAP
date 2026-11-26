@@ -67,6 +67,7 @@ async fn run_static_analysis_native_attaches_static_block() {
         tools_explicit: true,
         semgrep_json: None,
         trivy_json: None,
+        grype_json: None,
         gitleaks_json: None,
         checkov_json: None,
         walk: rustzap::analyze::inventory::WalkConfig::default(),

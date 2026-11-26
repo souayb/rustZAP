@@ -128,6 +128,12 @@ const TOOLS: &[Tool] = &[
         arch: Some("$SUDO pacman -S --noconfirm trivy"),
         alpine: Some("$SUDO apk add --no-cache trivy"),
     },
+    // Only Homebrew (checksum-verified bottles); upstream's other route is `curl | sh`.
+    Tool {
+        name: "grype",
+        macos: Some("brew install grype"),
+        debian: None, fedora: None, arch: None, alpine: None,
+    },
     Tool {
         name: "gitleaks",
         macos: Some("brew install gitleaks"),
