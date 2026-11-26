@@ -319,6 +319,10 @@ enum Commands {
         /// Cap outbound HTTP requests per second (0 = unlimited)
         #[arg(long)]
         max_rps: Option<u32>,
+
+        /// Credentials for the DAST portion (same as `scan`)
+        #[command(flatten)]
+        creds: scanner::AuthArgs,
     },
 
     /// Detect Active Directory / NTLM-relay attack vectors (LDAP + SPN + NTLM).
@@ -743,6 +747,13 @@ async fn run() -> anyhow::Result<()> {
             if attack && !read_only_safe {
                 safety::print_attack_mode_warning(&target);
             }
+            let creds = scanner::AuthArgs {
+                cookies,
+                auth,
+                api_key,
+                basic_auth,
+            }
+            .resolve();
             let config = ScanConfig {
                 target_url: target,
                 max_depth: depth,
@@ -752,10 +763,10 @@ async fn run() -> anyhow::Result<()> {
                 sarif_out,
                 timeout_secs: timeout,
                 user_agent,
-                cookies,
-                auth_header: auth,
-                api_key,
-                basic_auth,
+                cookies: creds.cookies,
+                auth_header: creds.auth,
+                api_key: creds.api_key,
+                basic_auth: creds.basic_auth,
                 insecure,
                 plugins: plugins.split(',').map(|s| s.trim().to_string()).collect(),
                 openapi_path,
@@ -899,6 +910,7 @@ async fn run() -> anyhow::Result<()> {
             attack,
             read_only_safe,
             max_rps,
+            creds,
         } => {
             if attack && !read_only_safe {
                 if let Some(ref t) = target {
@@ -932,6 +944,7 @@ async fn run() -> anyhow::Result<()> {
                 active_all_paths,
                 passive_all_methods,
                 safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
+                creds.resolve(),
             )
             .await?;
         }

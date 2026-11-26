@@ -42,7 +42,7 @@ Before saying work is complete:
 cargo test
 ```
 
-(There are **565** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, TUI analyze helpers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
+(There are **566** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, TUI analyze helpers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
 
 ### Smoke run (after build)
 
