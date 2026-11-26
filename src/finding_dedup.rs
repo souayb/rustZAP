@@ -6,8 +6,9 @@
 //! included). Single findings are left untouched so their JSON is unchanged.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 
-use crate::types::{Finding, Severity};
+use crate::types::Finding;
 
 /// One human-readable location string for a finding occurrence.
 fn instance_of(f: &Finding) -> String {
@@ -18,10 +19,21 @@ fn instance_of(f: &Finding) -> String {
 }
 
 pub fn collapse(findings: Vec<Finding>) -> Vec<Finding> {
+    collapse_by(findings, |f| {
+        (f.plugin.clone(), f.title.clone(), f.severity.clone())
+    })
+}
+
+/// [`collapse`] with a caller-chosen identity, e.g. one advisory ID across
+/// image and lockfile results (#19). The first occurrence stays primary.
+pub fn collapse_by<K: Hash + Eq>(
+    findings: Vec<Finding>,
+    key: impl Fn(&Finding) -> K,
+) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::with_capacity(findings.len());
-    let mut index: HashMap<(String, String, Severity), usize> = HashMap::new();
+    let mut index: HashMap<K, usize> = HashMap::new();
     for f in findings {
-        let key = (f.plugin.clone(), f.title.clone(), f.severity.clone());
+        let key = key(&f);
         match index.get(&key) {
             Some(&i) => {
                 let primary = &mut out[i];
@@ -63,6 +75,7 @@ pub fn collapse(findings: Vec<Finding>) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Severity;
 
     fn mk(title: &str, sev: Severity, url: &str) -> Finding {
         Finding::new(title, sev, url, "d", "s", "passive/missing-headers")

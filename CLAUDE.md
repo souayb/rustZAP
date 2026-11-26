@@ -42,7 +42,7 @@ Before saying work is complete:
 cargo test
 ```
 
-(There are **566** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, TUI analyze helpers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
+(There are **576** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, TUI analyze helpers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
 
 ### Smoke run (after build)
 
@@ -71,6 +71,9 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 | `src/browser_discovery.rs` | Opt-in headless-browser discovery over CDP (scope, budgets, exclusions enforced) |
 | `src/coverage.rs` | Execution coverage: `ExecutionRecord`/`Outcome`/`Coverage`; request counts via a task-local fed by `HttpSafetyGate` |
 | `src/evidence.rs` | Shared export redaction + finding fingerprint (single source of truth; `agent::trace::redact` re-exports it) |
+| `src/assess.rs` | Opt-in image/dependency inputs for `scan` (Trivy), assessment outcomes, NOT ASSESSED banner |
+| `src/analyze/grype.rs` | Opt-in Grype SCA (`--tools grype`, `--grype-json`); overlap with Trivy merged |
+| `npm/` | npm wrapper package (postinstall downloads and checksum-verifies the release binary; version written from Cargo.toml by the release `npm` job; tests: `node --test`) |
 | `src/finding_dedup.rs`, `src/jwt.rs` | Finding dedup into `instances[]`; `passive/jwt` pass (`--jwt-crack` opt-in) |
 | `src/analyze/native/rust_auth.rs`, `transport_encryption.rs` | `sast/rust-auth` (syn; fixtures in `tests/fixtures/rust_auth/` are data only); `iac/*-encryption` |
 | `src/cache_abuse.rs` | Opt-in `cache-deception` / `cache-poisoning` plugins |

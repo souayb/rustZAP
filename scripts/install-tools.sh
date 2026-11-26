@@ -121,6 +121,8 @@ cmd_for() {
     trivy/arch)        echo "$SUDO pacman -S --noconfirm trivy || echo 'install via AUR: yay -S trivy-bin'" ;;
     trivy/alpine)      echo "$SUDO apk add --no-cache trivy || echo 'use community repo'" ;;
 
+    grype/macos)       echo "brew install grype" ;;
+
     gitleaks/macos)    echo "brew install gitleaks" ;;
     gitleaks/debian) echo "$SUDO apt-get install -y gitleaks" ;;
     gitleaks/fedora)   echo "$SUDO dnf install -y gitleaks || (GLV=8.18.4 && curl -sSL \"https://github.com/gitleaks/gitleaks/releases/download/v\${GLV}/gitleaks_\${GLV}_linux_x64.tar.gz\" | $SUDO tar -xz -C /usr/local/bin gitleaks)" ;;
@@ -191,7 +193,7 @@ cmd_for() {
   esac
 }
 
-TOOLS=(semgrep trivy gitleaks checkov nuclei wifite nmap nikto wapiti tshark hashcat john hydra medusa aircrack-ng)
+TOOLS=(semgrep trivy grype gitleaks checkov nuclei wifite nmap nikto wapiti tshark hashcat john hydra medusa aircrack-ng)
 
 if [ -n "$ONLY_TOOL" ]; then
   found=0

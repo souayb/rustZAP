@@ -118,6 +118,9 @@ enum Commands {
         fail_on: Option<String>,
         #[command(flatten)]
         browser: rustzap::browser_discovery::BrowserDiscoveryArgs,
+        /// Container-image / dependency (SCA) inputs (#19)
+        #[command(flatten)]
+        assess: Box<rustzap::assess::AssessInputs>,
     },
 
     /// Opt-in, state-changing auth-lifecycle checks (reset/change/refresh/logout)
@@ -183,7 +186,7 @@ enum Commands {
         #[arg(short, long)]
         repo: Option<String>,
 
-        /// Tools to run: semgrep,trivy,gitleaks,native,checkov [default: semgrep]
+        /// Tools to run: semgrep,trivy,gitleaks,native,checkov,grype [default: semgrep]
         #[arg(long)]
         tools: Option<String>,
 
@@ -194,6 +197,10 @@ enum Commands {
         /// Optional Trivy JSON input file (skip running Trivy)
         #[arg(long)]
         trivy_json: Option<String>,
+
+        /// Optional Grype JSON input file (skip running Grype; select with --tools grype)
+        #[arg(long)]
+        grype_json: Option<String>,
 
         /// Optional Gitleaks JSON input file (skip running Gitleaks)
         #[arg(long)]
@@ -242,7 +249,7 @@ enum Commands {
         #[arg(short, long)]
         target: Option<String>,
 
-        /// Tools to run: semgrep,trivy,gitleaks,native,checkov [default: semgrep,trivy,gitleaks]
+        /// Tools to run: semgrep,trivy,gitleaks,native,checkov,grype [default: semgrep,trivy,gitleaks]
         #[arg(long)]
         tools: Option<String>,
 
@@ -251,6 +258,9 @@ enum Commands {
 
         #[arg(long)]
         trivy_json: Option<String>,
+
+        #[arg(long)]
+        grype_json: Option<String>,
 
         #[arg(long)]
         gitleaks_json: Option<String>,
@@ -743,6 +753,7 @@ async fn run() -> anyhow::Result<()> {
             max_rps,
             fail_on,
             browser,
+            assess,
         } => {
             if attack && !read_only_safe {
                 safety::print_attack_mode_warning(&target);
@@ -787,7 +798,7 @@ async fn run() -> anyhow::Result<()> {
                     matrix: authz_matrix,
                 },
             };
-            let report = scanner::run_scan(config).await?;
+            let report = scanner::run_scan_assessed(config, &assess).await?;
 
             if let Some(ref fail_severity) = fail_on {
                 if let Ok(threshold) = fail_severity.parse::<rustzap::types::Severity>() {
@@ -854,6 +865,7 @@ async fn run() -> anyhow::Result<()> {
             tools,
             semgrep_json,
             trivy_json,
+            grype_json,
             gitleaks_json,
             checkov_json,
             correlate,
@@ -871,6 +883,7 @@ async fn run() -> anyhow::Result<()> {
                 tools,
                 semgrep_json,
                 trivy_json,
+                grype_json,
                 gitleaks_json,
                 checkov_json,
                 correlate,
@@ -891,6 +904,7 @@ async fn run() -> anyhow::Result<()> {
             tools,
             semgrep_json,
             trivy_json,
+            grype_json,
             gitleaks_json,
             checkov_json,
             correlate,
@@ -926,6 +940,7 @@ async fn run() -> anyhow::Result<()> {
                 tools,
                 semgrep_json,
                 trivy_json,
+                grype_json,
                 gitleaks_json,
                 checkov_json,
                 correlate,

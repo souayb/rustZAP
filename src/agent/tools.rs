@@ -539,6 +539,7 @@ async fn analyze_repo(args: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         tools_explicit: true,
         semgrep_json: None,
         trivy_json: None,
+        grype_json: None,
         gitleaks_json: None,
         checkov_json: None,
         walk: crate::analyze::inventory::WalkConfig {

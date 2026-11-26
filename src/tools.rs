@@ -66,6 +66,14 @@ fn definitions() -> Vec<ToolDef> {
             false,
         ),
         (
+            "Grype",
+            "grype",
+            "SCA",
+            "Dependency vuln scanning",
+            vec!["dir:.", "--quiet", "-o", "json"],
+            false,
+        ),
+        (
             "Gitleaks",
             "gitleaks",
             "Secrets",

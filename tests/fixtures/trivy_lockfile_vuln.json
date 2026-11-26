@@ -1,0 +1,34 @@
+{
+  "SchemaVersion": 2,
+  "ArtifactName": "package-lock.json",
+  "ArtifactType": "filesystem",
+  "Results": [
+    {
+      "Target": "package-lock.json",
+      "Class": "lang-pkgs",
+      "Type": "npm",
+      "Packages": [
+        { "Name": "lodash", "Version": "4.17.20" },
+        { "Name": "mocha", "Version": "8.0.0", "Dev": true }
+      ],
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2021-23337",
+          "PkgName": "lodash",
+          "InstalledVersion": "4.17.20",
+          "Severity": "HIGH",
+          "Title": "lodash: command injection via template",
+          "Description": "Fixture application-package vulnerability shared with the image result."
+        },
+        {
+          "VulnerabilityID": "CVE-2023-9999",
+          "PkgName": "mocha",
+          "InstalledVersion": "8.0.0",
+          "Severity": "LOW",
+          "Title": "mocha: example dev-tooling flaw",
+          "Description": "Fixture development-only dependency vulnerability."
+        }
+      ]
+    }
+  ]
+}

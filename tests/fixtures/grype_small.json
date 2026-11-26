@@ -1,0 +1,59 @@
+{
+  "matches": [
+    {
+      "vulnerability": {
+        "id": "GHSA-35jh-r3h4-6jhm",
+        "dataSource": "https://github.com/advisories/GHSA-35jh-r3h4-6jhm",
+        "namespace": "github:language:javascript",
+        "severity": "High",
+        "fix": { "versions": ["4.17.21"], "state": "fixed" }
+      },
+      "relatedVulnerabilities": [
+        {
+          "id": "CVE-2021-23337",
+          "severity": "High",
+          "description": "Command injection via the template function (fixture)."
+        }
+      ],
+      "artifact": {
+        "name": "lodash",
+        "version": "4.17.20",
+        "type": "npm",
+        "locations": [{ "path": "/package-lock.json" }],
+        "purl": "pkg:npm/lodash@4.17.20"
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "CVE-2022-0001",
+        "severity": "Negligible",
+        "description": "Fixture vulnerability with no published fix.",
+        "fix": { "versions": [], "state": "not-fixed" }
+      },
+      "relatedVulnerabilities": [],
+      "artifact": {
+        "name": "libfoo",
+        "version": "2.0.0",
+        "type": "deb",
+        "locations": [{ "path": "/var/lib/dpkg/status" }]
+      }
+    },
+    {
+      "vulnerability": {
+        "id": "GHSA-xxxx-openssl",
+        "severity": "High",
+        "description": "Same advisory as the Trivy fixture (CVE-2024-1234).",
+        "fix": { "versions": ["1.1.2"], "state": "fixed" }
+      },
+      "relatedVulnerabilities": [
+        { "id": "CVE-2024-1234", "severity": "High" }
+      ],
+      "artifact": {
+        "name": "openssl",
+        "version": "1.1.1",
+        "type": "rust-crate",
+        "locations": [{ "path": "/Cargo.lock" }]
+      }
+    }
+  ]
+}

@@ -373,6 +373,14 @@ curl -fsSL https://raw.githubusercontent.com/souayb/rustZAP/main/scripts/install
 irm https://raw.githubusercontent.com/souayb/rustZAP/main/scripts/install.ps1 | iex
 ```
 
+**npm** — once the package is published to the npm registry (it ships with the next tagged release):
+
+```bash
+npm install -g rustzap   # or: npx rustzap
+```
+
+The package downloads the release's console binary for your platform (Linux x64/arm64, macOS, Windows x64) and verifies it against `SHA256SUMS`. Set `RUSTZAP_SKIP_DOWNLOAD=1` to skip the download; `HTTPS_PROXY` is not supported by the npm installer.
+
 The installers verify each download against the release's `SHA256SUMS`. For manual installs or package formats, see below.
 
 ## Prebuilt releases
@@ -845,6 +853,24 @@ rustzap scan --target URL --auth "Bearer <jwt>" --jwt-crack
 - **`--paths` entries** may include a query and fragment (`GET /api/items?search=probe`); absolute URLs must be on the target origin.
 - **Coverage**: scans print `▶ Coverage:` and reports carry a `coverage` block. `partial` means some checks did not complete, so zero findings is not proof the target is clean.
 - **Reports**: identical findings are collapsed into one with `instances[]`; every finding has a stable `fingerprint` and `validation_status`; exports are redacted. CSV gains `Instances`, `Fingerprint`, `ValidationStatus` columns.
+
+---
+
+# Image and dependency assessment
+
+A URL scan tests the running application only. To cover the container image and the declared dependencies in the same report, pass them explicitly (both use Trivy and are opt-in):
+
+```bash
+rustzap scan --target https://app.example.com \
+  --image registry.example.com/app:1.4.2 \
+  --manifest package-lock.json --manifest Cargo.lock
+```
+
+- `--image REF` / `--image-json FILE`: container-image CVEs (`sca/image`). `--manifest LOCKFILE` / `--manifest-json FILE` (repeatable): dependency advisories (`sca/manifest`). The `-json` forms import a precomputed Trivy report.
+- Each finding records its scope (`base-os`, `application`, `development`). An advisory found in both the image and a lockfile is one finding listing every affected component.
+- When no image or dependency input is given, the terminal, JSON (`coverage.inputs`) and HTML report show **NOT ASSESSED** for that part, so a DAST-only scan is not mistaken for a full assessment. A missing Trivy binary is reported as `failed`, never silently skipped.
+
+**Grype** can run next to Trivy in `analyze` and `audit`: add `grype` to `--tools` (opt-in, plugin `sca/grype`) or import a saved report with `--grype-json FILE`. When Trivy and Grype report the same advisory for the same package, only the Trivy finding is kept and annotated. `rustzap install` installs Grype through Homebrew on macOS only; elsewhere install it yourself.
 
 ---
 
