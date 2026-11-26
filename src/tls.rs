@@ -15,11 +15,13 @@
 //!   exact match against DNS SANs only; wildcard support is limited)
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use rustls::client::{ServerCertVerified, ServerCertVerifier, ServerName};
-use rustls::{Certificate, ClientConfig};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{ring, verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -47,12 +49,16 @@ pub struct TlsSummary {
 /// TLS probes are best-effort, and any host that doesn't respond is silently
 /// dropped from reporting.
 pub async fn probe_tls(host: &str, port: u16) -> Option<TlsSummary> {
-    let config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier))
+    // Explicit provider: does not depend on a process-wide default being installed.
+    let provider = Arc::new(ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier(provider)))
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(host).ok()?;
+    let server_name = ServerName::try_from(host.to_string()).ok()?;
 
     let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host, port)))
         .await
@@ -75,9 +81,9 @@ pub async fn probe_tls(host: &str, port: u16) -> Option<TlsSummary> {
 }
 
 /// Parse the first cert in `chain` (the leaf) into a `TlsSummary`.
-fn summarize_chain(host: &str, port: u16, chain: &[Certificate]) -> Option<TlsSummary> {
+fn summarize_chain(host: &str, port: u16, chain: &[CertificateDer<'_>]) -> Option<TlsSummary> {
     let leaf = chain.first()?;
-    let (_, cert) = X509Certificate::from_der(&leaf.0).ok()?;
+    let (_, cert) = X509Certificate::from_der(leaf.as_ref()).ok()?;
     let subject = cert.subject().to_string();
     let issuer = cert.issuer().to_string();
 
@@ -271,21 +277,54 @@ pub fn hostname_matches(host: &str, sans: &[String]) -> bool {
     false
 }
 
-/// A rustls `ServerCertVerifier` that trusts everything. We *only* use it to
-/// inspect certificates — we don't tunnel real traffic through this client.
-struct AcceptAnyVerifier;
+/// A rustls `ServerCertVerifier` that trusts every certificate chain. We *only*
+/// use it to inspect certificates — we don't tunnel real traffic through this
+/// client. Handshake signatures are still checked, as before the rustls 0.23 move.
+#[derive(Debug)]
+struct AcceptAnyVerifier(Arc<CryptoProvider>);
 
 impl ServerCertVerifier for AcceptAnyVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _server_name: &ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: SystemTime,
+        _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 

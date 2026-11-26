@@ -709,7 +709,7 @@ fn print_summary(urls: &[DiscoveredUrl], findings: &[Finding], elapsed: std::tim
                 println!("    Param: {}", param.bright_magenta());
             }
             if let Some(ev) = &f.evidence {
-                let truncated = if ev.len() > 80 { &ev[..80] } else { ev };
+                let truncated = crate::types::safe_truncate(ev, 80);
                 println!("    Evidence: {}", truncated.yellow());
             }
             println!();
