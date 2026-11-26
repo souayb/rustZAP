@@ -198,6 +198,9 @@ impl Default for ConfigForm {
 
 impl ConfigForm {
     fn to_scan_config(&self) -> ScanConfig {
+        // No credential fields in the form: secrets come from RUSTZAP_* env vars so they
+        // never appear on screen.
+        let creds = crate::scanner::AuthArgs::default().resolve();
         ScanConfig {
             target_url: self.target.clone(),
             max_depth: self.depth,
@@ -207,10 +210,10 @@ impl ConfigForm {
             sarif_out: None,
             timeout_secs: 10,
             user_agent: None,
-            cookies: None,
-            auth_header: None,
-            api_key: None,
-            basic_auth: None,
+            cookies: creds.cookies,
+            auth_header: creds.auth,
+            api_key: creds.api_key,
+            basic_auth: creds.basic_auth,
             insecure: self.insecure,
             plugins: self
                 .plugins
@@ -1980,6 +1983,14 @@ fn draw_scan(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("  [i] Insecure TLS ", Style::default().fg(Color::Cyan)),
             Span::raw(if app.config.insecure { "ON" } else { "OFF" }),
+        ]),
+        Line::from(vec![
+            Span::styled("      Auth         ", Style::default().fg(Color::Cyan)),
+            Span::raw(if crate::scanner::AuthArgs::default().resolve().is_set() {
+                "from environment (RUSTZAP_COOKIES / _AUTH / _API_KEY / _BASIC_AUTH)"
+            } else {
+                "none (set RUSTZAP_AUTH, RUSTZAP_COOKIES, ... before starting)"
+            }),
         ]),
         Line::from(""),
         Line::from(Span::styled(
