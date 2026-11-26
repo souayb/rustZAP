@@ -10,7 +10,7 @@ use crate::analyze::inventory::{
 use crate::analyze::native::SOURCE_TOOL;
 use crate::types::{CodeLocation, Finding, Severity};
 
-const MAX_SINK_FINDINGS: usize = 80;
+pub(crate) const MAX_SINK_FINDINGS: usize = 80;
 
 pub const PLUGIN_DOM: &str = "sast/dom-sinks";
 pub const PLUGIN_COOKIES: &str = "sast/js-cookies";

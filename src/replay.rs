@@ -67,6 +67,8 @@ pub async fn run_replay_file(file_path: &Path, config: &ReplayConfig) -> Result<
             }
         }
 
+        // Replay logs go through the shared evidence redaction (query tokens etc.).
+        let shown_url = crate::evidence::redact_string(&target_url);
         let method = reqwest::Method::from_bytes(txn.request.method.as_bytes())
             .unwrap_or(reqwest::Method::GET);
         let mut req = client.request(method.clone(), &target_url);
@@ -94,7 +96,7 @@ pub async fn run_replay_file(file_path: &Path, config: &ReplayConfig) -> Result<
                         idx + 1,
                         transactions.len(),
                         method.to_string().bright_cyan(),
-                        target_url.dimmed(),
+                        shown_url.dimmed(),
                         status.to_string().bright_green()
                     );
                 } else {
@@ -104,7 +106,7 @@ pub async fn run_replay_file(file_path: &Path, config: &ReplayConfig) -> Result<
                         idx + 1,
                         transactions.len(),
                         method.to_string().bright_cyan(),
-                        target_url.dimmed(),
+                        shown_url.dimmed(),
                         status.to_string().bright_yellow(),
                         expected_status.to_string().bright_white()
                     );
@@ -117,8 +119,8 @@ pub async fn run_replay_file(file_path: &Path, config: &ReplayConfig) -> Result<
                     idx + 1,
                     transactions.len(),
                     method.to_string().bright_cyan(),
-                    target_url.dimmed(),
-                    format!("ERROR: {e}").bright_red()
+                    shown_url.dimmed(),
+                    crate::evidence::redact_string(&format!("ERROR: {e}")).bright_red()
                 );
             }
         }

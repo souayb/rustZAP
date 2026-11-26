@@ -21,6 +21,9 @@ struct SarifLog {
 struct SarifRun {
     tool: SarifTool,
     results: Vec<SarifResult>,
+    /// Run property bag: execution coverage (#41), revision and limitations (#49).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    properties: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -41,6 +44,9 @@ struct SarifResult {
     message: SarifMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     locations: Option<Vec<SarifLocation>>,
+    /// Stable finding fingerprint shared with JSON/HTML/CSV exports.
+    partialFingerprints: serde_json::Value,
+    properties: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -90,26 +96,85 @@ fn build_sarif(report: &Report) -> SarifLog {
                     version: report.meta.version.clone(),
                 },
             },
-            results: report.findings.iter().map(finding_to_result).collect(),
+            results: report
+                .export_findings()
+                .iter()
+                .map(finding_to_result)
+                .collect(),
+            properties: run_properties(report),
         }],
     }
 }
 
+fn run_properties(report: &Report) -> Option<serde_json::Value> {
+    let m = &report.meta;
+    let mut p = serde_json::Map::new();
+    if let Some(c) = &report.coverage {
+        p.insert("coverage".into(), serde_json::json!(c));
+    }
+    if m.source_revision.is_some() || !m.coverage_limitations.is_empty() {
+        p.insert(
+            "sourceRevision".into(),
+            serde_json::json!(m.source_revision),
+        );
+        p.insert(
+            "coverageLimitations".into(),
+            serde_json::json!(m.coverage_limitations),
+        );
+    }
+    (!p.is_empty()).then(|| crate::evidence::redact(&serde_json::Value::Object(p)))
+}
+
+/// `f` must already be an exported (fingerprinted + redacted) finding.
 fn finding_to_result(f: &Finding) -> SarifResult {
-    let (uri, region) = location_for(f);
+    let mut locs = vec![location_for(f)];
+    // Deduped findings: primary location first, then every other instance.
+    locs.extend(f.instances.iter().skip(1).map(|i| instance_location(i)));
     SarifResult {
         ruleId: f.plugin.clone(),
         level: severity_to_level(&f.severity).to_string(),
         message: SarifMessage {
             text: format!("{} — {}", f.title, f.description),
         },
-        locations: Some(vec![SarifLocation {
-            physicalLocation: SarifPhysicalLocation {
-                artifactLocation: SarifArtifactLocation { uri },
-                region,
-            },
-        }]),
+        locations: Some(
+            locs.into_iter()
+                .map(|(uri, region)| SarifLocation {
+                    physicalLocation: SarifPhysicalLocation {
+                        artifactLocation: SarifArtifactLocation { uri },
+                        region,
+                    },
+                })
+                .collect(),
+        ),
+        partialFingerprints: serde_json::json!({
+            "rustzapFindingId/v1": f.fingerprint.as_deref().unwrap_or_default(),
+        }),
+        properties: serde_json::json!({
+            "confidence": f.confidence,
+            "validated": f.poc_validated,
+            "validationStatus": f.validation_status,
+            "method": f.method,
+            "parameter": f.parameter,
+        }),
     }
+}
+
+/// Instance strings are `url` or `url [param]`; `file://…#L<n>` carries a line.
+fn instance_location(inst: &str) -> (String, Option<SarifRegion>) {
+    let url = inst.split(" [").next().unwrap_or(inst);
+    if let Some((file, line)) = url.rsplit_once("#L") {
+        if let Ok(n) = line.parse::<u32>() {
+            let file = file.strip_prefix("file://").unwrap_or(file);
+            return (
+                file.to_string(),
+                Some(SarifRegion {
+                    startLine: n,
+                    endLine: None,
+                }),
+            );
+        }
+    }
+    (url.to_string(), None)
 }
 
 fn location_for(f: &Finding) -> (String, Option<SarifRegion>) {
@@ -165,5 +230,35 @@ mod tests {
         assert_eq!(sarif.runs.len(), 1);
         assert_eq!(sarif.runs[0].results.len(), 1);
         assert_eq!(sarif.runs[0].results[0].level, "error");
+    }
+
+    #[test]
+    fn sarif_emits_one_location_per_instance() {
+        let mk =
+            |url: &str| Finding::new("Missing CSP", Severity::Medium, url, "d", "s", "passive/x");
+        let report = Report::new(
+            "https://example.com",
+            vec![],
+            vec![],
+            vec![
+                mk("https://example.com/a"),
+                mk("https://example.com/b").with_parameter("q"),
+                mk("file:///repo/.env#L3"),
+            ],
+            std::time::Duration::from_secs(1),
+        );
+        let sarif = build_sarif(&report);
+        assert_eq!(sarif.runs[0].results.len(), 1);
+        let locs = sarif.runs[0].results[0].locations.as_ref().unwrap();
+        assert_eq!(locs.len(), 3);
+        assert_eq!(
+            locs[1].physicalLocation.artifactLocation.uri,
+            "https://example.com/b"
+        );
+        assert_eq!(locs[2].physicalLocation.artifactLocation.uri, "/repo/.env");
+        assert_eq!(
+            locs[2].physicalLocation.region.as_ref().unwrap().startLine,
+            3
+        );
     }
 }

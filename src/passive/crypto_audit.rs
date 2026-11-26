@@ -42,12 +42,13 @@ pub fn check_crypto_posture_passive(
         }
     }
 
-    findings
+    findings.into_iter().map(super::regex_only).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Confidence;
 
     #[test]
     fn test_passive_crypto_posture() {
@@ -56,5 +57,26 @@ mod tests {
         let findings = check_crypto_posture_passive("https://example.com/api", &headers, body);
         assert_eq!(findings.len(), 1);
         assert!(findings[0].title.contains("Weak Cryptographic Hash (MD5)"));
+        assert_eq!(findings[0].confidence, Confidence::Tentative);
+    }
+
+    #[test]
+    fn des_prose_and_skus_are_quiet_but_real_des_fires() {
+        let headers = reqwest::header::HeaderMap::new();
+        let quiet = "<p>La liste des produits et des services</p><span>Réf. DES-005</span>\
+                     <script>const r=window.indexedDB.open(\"des\")</script>";
+        assert!(check_crypto_posture_passive("https://e.com/fr", &headers, quiet).is_empty());
+
+        let bundle = "!function(){var c=CryptoJS.DES.encrypt(m,k)}();";
+        let f = check_crypto_posture_passive("https://e.com/app.js", &headers, bundle);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::High);
+        assert_eq!(f[0].confidence, Confidence::Tentative);
+
+        // NTLM dump is Critical natively, but a regex-only passive hit caps at High.
+        let ntlm = "admin:500:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::";
+        let f = check_crypto_posture_passive("https://e.com/dump", &headers, ntlm);
+        assert!(!f.is_empty());
+        assert!(f.iter().all(|x| x.severity != Severity::Critical));
     }
 }

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::types::{CodeLocation, Finding, Severity};
 
 const PLUGIN: &str = "iac/checkov";
-const MAX_FINDINGS: usize = 500;
+pub(crate) const MAX_FINDINGS: usize = 500;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]

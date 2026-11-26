@@ -12,7 +12,7 @@ use crate::analyze::native::SOURCE_TOOL;
 use crate::report::AttackPlanEntry;
 use crate::types::{CodeLocation, Confidence, Finding, Severity};
 
-const MAX_FORM_FINDINGS: usize = 60;
+pub(crate) const MAX_FORM_FINDINGS: usize = 60;
 
 pub struct FormScanResult {
     pub findings: Vec<Finding>,

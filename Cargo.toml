@@ -1,6 +1,6 @@
 [package]
 name = "rustzap"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "A Rust-based web application security scanner inspired by OWASP ZAP"
 authors = ["RustZAP Contributors"]
@@ -76,10 +76,18 @@ hex = "0.4"
 
 # C1: TLS certificate inspection (parses peer certs returned by rustls)
 x509-parser = "0.16"
+# Mozilla roots for chain-trust checks (already in Cargo.lock via reqwest; no extra download)
+webpki-roots = "0.25"
 
 # F1: Active Directory / NTLM-relay detector (LDAP + DNS; NTLM flags hand-rolled)
 ldap3 = { version = "0.11", default-features = false, features = ["tls-rustls"] }
 hickory-resolver = "0.26"
+
+# #44: syntax-aware Rust auth analyzer (already in Cargo.lock via proc macros).
+# span-locations gives real line numbers when parsing outside a proc macro.
+syn = { version = "2", features = ["full", "visit", "printing"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [profile.release]
 opt-level = 3

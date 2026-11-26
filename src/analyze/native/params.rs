@@ -12,7 +12,7 @@ use crate::analyze::native::SOURCE_TOOL;
 use crate::report::AttackPlanEntry;
 use crate::types::{CodeLocation, Finding, Severity};
 
-const MAX_PARAM_FINDINGS: usize = 80;
+pub(crate) const MAX_PARAM_FINDINGS: usize = 80;
 
 pub struct ParamScanResult {
     pub findings: Vec<Finding>,

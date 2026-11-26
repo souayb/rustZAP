@@ -266,12 +266,16 @@ impl HttpSafetyGate {
         method: &str,
         body: Option<&str>,
     ) -> Result<(), SafetyAbort> {
-        if self.breaker.is_tripped() {
-            return Err(SafetyAbort::CircuitOpen);
+        let res = if self.breaker.is_tripped() {
+            Err(SafetyAbort::CircuitOpen)
+        } else {
+            is_request_safe(method, body, &self.policy).map_err(SafetyAbort::Policy)
+        };
+        crate::coverage::note_before(res.err().map(|e| e.to_string()));
+        if res.is_ok() {
+            self.wait_for_rps().await;
         }
-        is_request_safe(method, body, &self.policy).map_err(SafetyAbort::Policy)?;
-        self.wait_for_rps().await;
-        Ok(())
+        res
     }
 
     /// Reject if circuit is open or either URL/body violates policy; then wait for RPS.
@@ -281,19 +285,25 @@ impl HttpSafetyGate {
         url: &str,
         body: Option<&str>,
     ) -> Result<(), SafetyAbort> {
-        if self.breaker.is_tripped() {
-            return Err(SafetyAbort::CircuitOpen);
+        let res = if self.breaker.is_tripped() {
+            Err(SafetyAbort::CircuitOpen)
+        } else {
+            is_request_safe(method, Some(url), &self.policy)
+                .and_then(|_| {
+                    body.map_or(Ok(()), |b| is_request_safe(method, Some(b), &self.policy))
+                })
+                .map_err(SafetyAbort::Policy)
+        };
+        crate::coverage::note_before(res.err().map(|e| e.to_string()));
+        if res.is_ok() {
+            self.wait_for_rps().await;
         }
-        is_request_safe(method, Some(url), &self.policy).map_err(SafetyAbort::Policy)?;
-        if let Some(b) = body {
-            is_request_safe(method, Some(b), &self.policy).map_err(SafetyAbort::Policy)?;
-        }
-        self.wait_for_rps().await;
-        Ok(())
+        res
     }
 
     /// Record metrics; returns `Err(CircuitOpen)` if the breaker just tripped.
     pub fn after_response(&self, status: u16, latency_ms: u64) -> Result<(), SafetyAbort> {
+        crate::coverage::note_response(status);
         let healthy = self
             .breaker
             .record_response(status, latency_ms, &self.policy);

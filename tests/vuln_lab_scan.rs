@@ -35,7 +35,10 @@ fn scan_config(target: &str) -> ScanConfig {
         nuclei_jsonl: None,
         active_all_paths: true,
         passive_all_methods: false,
+        jwt_crack: false,
         safety: rustzap::safety::SafetyPolicy::default(),
+        browser_discovery: None,
+        authz: Default::default(),
     }
 }
 

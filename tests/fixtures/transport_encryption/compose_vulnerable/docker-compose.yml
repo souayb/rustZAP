@@ -1,0 +1,29 @@
+# Intentionally insecure fixture for iac/transport-encryption + iac/backup-encryption.
+services:
+  api:
+    image: example/api:1.0
+    env_file:
+      - app.env
+    environment:
+      DATABASE_URL: postgres://app:fixturepass@db:5432/app?sslmode=${PG_SSLMODE:-disable}
+      REDIS_URL: redis://cache:6379/0
+      BILLING_URL: http://billing:8080/api
+      SMTP_HOST: mail.example.com
+      SMTP_PORT: "587"
+      PAYMENTS_URL: ${PAYMENTS_URL}
+  worker:
+    image: example/worker:1.0
+    environment:
+      - BROKER_URL=amqp://guest:fixturepass@queue:5672/
+      - DATABASE_URL=${WORKER_DB_URL}
+  backup:
+    image: postgres:16
+    command: sh -c "pg_dump postgres://app:fixturepass@db/app > /backups/app.sql"
+  billing:
+    image: example/billing:1.0
+  db:
+    image: postgres:16
+  cache:
+    image: redis:7
+  queue:
+    image: rabbitmq:3

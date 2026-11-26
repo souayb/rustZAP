@@ -366,9 +366,53 @@ pub fn shannon_entropy(s: &str) -> f64 {
     entropy
 }
 
+/// Published processor test PANs (Stripe/Braintree/Adyen docs) — never real cardholder data.
+const TEST_PANS: &[&str] = &[
+    "4111111111111111",
+    "4242424242424242",
+    "4012888888881881",
+    "4000056655665556",
+    "5555555555554444",
+    "5105105105105100",
+    "2223003122003222",
+    "378282246310005",
+    "371449635398431",
+    "6011111111111117",
+    "3056930009020004",
+    "3566002020360505",
+];
+
+/// True when the digit match is a fragment of a longer token: a UUID / dotted
+/// float / version (`…-1234-1234-…`, `0.1914876…`) or a longer digit run.
+fn is_embedded_number(text: &str, start: usize, end: usize) -> bool {
+    let joined = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let mut before = text[..start].chars().rev();
+    let mut after = text[end..].chars();
+    let (b1, b2) = (before.next(), before.next());
+    let (a1, a2) = (after.next(), after.next());
+    joined(b1)
+        || joined(a1)
+        || (matches!(b1, Some('-' | '.')) && joined(b2))
+        || (matches!(a1, Some('-' | '.')) && joined(a2))
+}
+
+/// Up to ~32 bytes either side of a match, clamped to char boundaries.
+fn context_window(text: &str, start: usize, end: usize) -> &str {
+    let mut lo = start.saturating_sub(32);
+    while !text.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    let mut hi = (end + 32).min(text.len());
+    while !text.is_char_boundary(hi) {
+        hi += 1;
+    }
+    &text[lo..hi]
+}
+
 /// Scanner for DLP and PII in text content.
 pub struct DlpScanner {
     cc_regex: Regex,
+    card_context_regex: Regex,
     ssn_regex: Regex,
     iban_regex: Regex,
     slack_regex: Regex,
@@ -391,6 +435,8 @@ impl DlpScanner {
         Self {
             // Match numbers formatted with spaces/dashes or contiguous 13-19 digits
             cc_regex: Regex::new(r"\b(?:\d[ -]*?){13,19}\b").unwrap(),
+            card_context_regex: Regex::new(r"(?i)card|payment|(?:^|[^a-z])(?:cc|pan)(?:[^a-z]|$)")
+                .unwrap(),
             // US SSN format: 9 digits formatted as 3-2-4 or with space
             ssn_regex: Regex::new(r"\b\d{3}[- ]\d{2}[- ]\d{4}\b").unwrap(),
             // IBAN: 2 letters followed by 2 digits and 10 to 30 alphanumerics
@@ -427,7 +473,12 @@ impl DlpScanner {
             let digits_only: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
             if digits_only.len() >= 13
                 && digits_only.len() <= 19
+                && !is_embedded_number(text, mat.start(), mat.end())
+                && !TEST_PANS.contains(&digits_only.as_str())
+                && self.card_context_regex.is_match(context_window(text, mat.start(), mat.end()))
                 && validate_luhn(&digits_only)
+                // A Luhn pass alone is 1-in-10; require a real card-network IIN.
+                && identify_card_brand(&digits_only) != CreditCardBrand::Unknown
                 && seen_raw.insert(digits_only.clone())
             {
                 let brand = identify_card_brand(&digits_only);
@@ -537,7 +588,7 @@ use crate::analyze::native::SOURCE_TOOL;
 use crate::types::CodeLocation;
 use std::path::{Path, PathBuf};
 
-const MAX_DLP_FINDINGS: usize = 100;
+pub(crate) const MAX_DLP_FINDINGS: usize = 100;
 
 pub fn scan(root: &Path, files: &[PathBuf]) -> Vec<Finding> {
     let scanner = DlpScanner::new();
@@ -677,7 +728,7 @@ mod tests {
         let scanner = DlpScanner::new();
         let payload = r#"
             User profile export:
-            Payment method: 4111 1111 1111 1111
+            Payment method: 4539 1488 0343 6467
             SSN: 219-45-7890
             Bank: DE89370400440532013000
             API: ghp_123456789012345678901234567890123456
@@ -701,5 +752,36 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| matches!(f.dlp_type, DlpType::ApiSecret(_))));
+    }
+
+    fn cards(text: &str) -> usize {
+        DlpScanner::new()
+            .scan_text(text)
+            .iter()
+            .filter(|m| matches!(m.dlp_type, DlpType::CreditCard(_)))
+            .count()
+    }
+
+    #[test]
+    fn card_false_positives_are_rejected() {
+        // Luhn-valid digits with no card context (Prometheus float sum, bare id).
+        assert_eq!(cards("http_request_duration_sum 19148762699999997"), 0);
+        assert_eq!(cards("order id 4539148803436467 shipped"), 0);
+        // Numeric UUID fragments, even next to card words.
+        assert_eq!(cards("card_id: 45391488-0343-6467-1234-123456789012"), 0);
+        // Embedded in a float or a longer digit run.
+        assert_eq!(cards("payment ratio 0.4539148803436467"), 0);
+        assert_eq!(cards("payment ref 45391488034364671234567"), 0);
+        // Published test PANs.
+        assert_eq!(cards("card: 4111 1111 1111 1111"), 0);
+        assert_eq!(cards("cc=4242424242424242"), 0);
+        assert_eq!(cards("pan 5555555555554444"), 0);
+    }
+
+    #[test]
+    fn card_true_positives_still_fire() {
+        assert_eq!(cards("card_number: 4539 1488 0343 6467"), 1);
+        assert_eq!(cards(r#"{"cc":"4539148803436467"}"#), 1);
+        assert_eq!(cards("PAN=4539-1488-0343-6467."), 1);
     }
 }

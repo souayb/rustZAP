@@ -1,0 +1,20 @@
+# Fixed counterpart of compose_vulnerable: verified TLS everywhere, encrypted backup.
+services:
+  api:
+    image: example/api:1.0
+    environment:
+      DATABASE_URL: postgres://app:fixturepass@db:5432/app?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem
+      REDIS_URL: rediss://cache:6380/0
+      BILLING_URL: https://billing:8443/api
+      SMTP_HOST: mail.example.com
+      SMTP_PORT: "587"
+      SMTP_STARTTLS: "required"
+  worker:
+    image: example/worker:1.0
+    environment:
+      - BROKER_URL=amqps://worker:fixturepass@queue:5671/
+  backup:
+    image: postgres:16
+    command: sh -c "pg_dump -h db -U app app | gpg --encrypt --recipient backup@example.com > /backups/app.sql.gpg"
+  billing:
+    image: example/billing:1.0

@@ -271,6 +271,10 @@ pub async fn run_agent(cfg: AgentConfig, mut brain: Box<dyn AgentBrain>) -> Resu
     let captures = ctx.take_captures();
     if !captures.is_empty() {
         let cap_path = captures_path(&cfg.output);
+        let captures: Vec<_> = captures
+            .iter()
+            .map(crate::evidence::redact_transaction)
+            .collect();
         match serde_json::to_string_pretty(&captures) {
             Ok(js) => {
                 let write_res = {

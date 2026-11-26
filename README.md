@@ -811,6 +811,35 @@ Always obtain asset-owner approval before testing operational technology environ
 
 ---
 
+# Authorization, auth lifecycle and coverage
+
+All of the following are **opt-in** and only for targets you are authorized to test.
+
+```bash
+# Two-identity BOLA/IDOR (A = low privilege, B = victim/admin), or an explicit matrix
+rustzap scan --target URL --auth-a "Bearer <A>" --auth-b "Bearer <B>"
+rustzap scan --target URL --authz-matrix authz.yaml
+
+# Auth lifecycle against a synthetic account you own (state-changing)
+rustzap auth-lifecycle --auth-scenario scenario.yaml -o auth-lifecycle-report.json
+
+# Browser-assisted SPA discovery (needs Chrome, Chromium or Edge 112+ installed)
+rustzap scan --target URL --browser-discovery
+
+# Offline weak-secret check for HS256 bearer tokens
+rustzap scan --target URL --auth "Bearer <jwt>" --jwt-crack
+```
+
+- **Authz matrix**: `identities[]` (`name`, `role`, `tenant`, `auth`, `cookies`, `check_url`) and `checks[]` (`url`, `operation: read|list|download|export|write`, `method`, `id`, `owner`, `tenant`, `allow`). Writes run only when declared and are blocked by `--read-only-safe`.
+- **Auth lifecycle**: the scenario must declare `synthetic_identity.synthetic: true` and `mutation_scope.acknowledge_state_changes: true`; it is refused under `--read-only-safe`. Add a `cleanup` step to restore the account.
+- **Browser discovery**: auto-detects the browser, or use `--browser-path` / `RUSTZAP_BROWSER`; each run uses a temporary profile. Budgets: `--browser-max-navigations`, `--browser-max-requests`; scope: `--browser-allow-origin`, `--browser-exclude`; login: `--browser-login FILE` (secrets via `value_env`). In root containers set `RUSTZAP_BROWSER_NO_SANDBOX=1`. If no browser is found the scan continues and reports "Browser Discovery Unavailable".
+- **OpenAPI JSON bodies**: with an imported spec, injection plugins also fuzz string fields of JSON request bodies using the operation's own method (POST/PUT/PATCH, never DELETE). Use `--read-only-safe` to prevent this.
+- **`--paths` entries** may include a query and fragment (`GET /api/items?search=probe`); absolute URLs must be on the target origin.
+- **Coverage**: scans print `▶ Coverage:` and reports carry a `coverage` block. `partial` means some checks did not complete, so zero findings is not proof the target is clean.
+- **Reports**: identical findings are collapsed into one with `instances[]`; every finding has a stable `fingerprint` and `validation_status`; exports are redacted. CSV gains `Instances`, `Fingerprint`, `ValidationStatus` columns.
+
+---
+
 # Repository analysis
 
 RustZAP can analyze local repositories.

@@ -13,8 +13,8 @@ use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
 
-/// Header names whose values must never be persisted to the trace.
-const REDACT_HEADERS: &[&str] = &["authorization", "cookie", "set-cookie", "x-api-key"];
+/// Redaction lives in `crate::evidence` (single source of truth for every export).
+pub use crate::evidence::{redact, redact_string};
 
 /// One line in the trace file.
 #[derive(Debug, Serialize)]
@@ -84,66 +84,10 @@ impl Trace {
             kind: kind.to_string(),
             tool: None,
             args: None,
-            detail: Some(detail.into()),
+            // Exception/log text can echo request URLs or headers.
+            detail: Some(redact_string(&detail.into())),
         });
     }
-}
-
-/// Redact sensitive header values anywhere in the args JSON. Recurses objects
-/// and arrays; any object key matching a sensitive header (case-insensitive)
-/// has its value replaced with `"[REDACTED]"`.
-pub fn redact(v: &Value) -> Value {
-    match v {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, val) in map {
-                if REDACT_HEADERS.iter().any(|h| k.eq_ignore_ascii_case(h)) {
-                    out.insert(k.clone(), Value::String("[REDACTED]".into()));
-                } else {
-                    out.insert(k.clone(), redact(val));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(redact).collect()),
-        Value::String(s) => Value::String(redact_string(s)),
-        other => other.clone(),
-    }
-}
-
-/// Redact embedded secrets (Bearer tokens, passwords, api keys) within arbitrary text.
-pub fn redact_string(s: &str) -> String {
-    let mut result = s.to_string();
-    let patterns = [
-        "bearer ",
-        "password=",
-        "api_key=",
-        "apikey=",
-        "token=",
-        "secret=",
-    ];
-    for p in patterns {
-        let mut start_idx = 0;
-        while let Some(pos) = result[start_idx..].to_lowercase().find(p) {
-            let actual_pos = start_idx + pos + p.len();
-            let end_pos = result[actual_pos..]
-                .find(|c: char| {
-                    c.is_whitespace() || c == '&' || c == '"' || c == '\'' || c == ',' || c == ';'
-                })
-                .map(|e| actual_pos + e)
-                .unwrap_or(result.len());
-            if end_pos > actual_pos {
-                result.replace_range(actual_pos..end_pos, "[REDACTED]");
-                start_idx = actual_pos + "[REDACTED]".len();
-            } else {
-                start_idx = actual_pos;
-            }
-            if start_idx >= result.len() {
-                break;
-            }
-        }
-    }
-    result
 }
 
 #[cfg(test)]
