@@ -504,7 +504,7 @@ async fn run(
         .kill_on_drop(true);
     let res = match cmd.spawn() {
         Ok(mut child) => {
-            let res = drive(&mut child, cfg, target, seeds, st).await;
+            let res = drive(&mut child, &profile, cfg, target, seeds, st).await;
             if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
                 let _ = child.kill().await;
             }
@@ -522,27 +522,68 @@ async fn run(
     res
 }
 
+/// The DevTools WebSocket URL: announced on stderr, or (when stderr is not
+/// delivered) read from the `DevToolsActivePort` file the browser writes into its profile.
+fn devtools_endpoint(stderr: &str, profile: &Path) -> Option<String> {
+    if let Some(u) = stderr
+        .lines()
+        .find_map(|l| l.find("ws://").map(|i| l[i..].trim().to_string()))
+    {
+        return Some(u);
+    }
+    let f = std::fs::read_to_string(profile.join("DevToolsActivePort")).ok()?;
+    let mut it = f.lines();
+    let (port, path) = (it.next()?.trim(), it.next()?.trim());
+    port.parse::<u16>().ok()?;
+    Some(format!("ws://127.0.0.1:{port}{path}"))
+}
+
 async fn drive(
     child: &mut tokio::process::Child,
+    profile: &Path,
     cfg: &BrowserDiscoveryConfig,
     target: &Url,
     seeds: &[DiscoveredUrl],
     st: &mut State,
 ) -> Result<()> {
     let stderr = child.stderr.take().context("browser stderr")?;
-    let mut lines = BufReader::new(stderr).lines();
-    let ws_url = timeout(Duration::from_secs(20), async {
-        while let Some(l) = lines.next_line().await? {
-            if let Some(i) = l.find("ws://") {
-                return Ok::<String, anyhow::Error>(l[i..].trim().to_string());
+    // Drain stderr for the whole run (a full pipe would block the browser) and
+    // keep its tail: it announces the endpoint and explains a failed launch.
+    let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = log.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            let mut s = sink.lock().unwrap();
+            if s.len() > 8192 {
+                s.clear();
             }
+            s.push_str(&l);
+            s.push('\n');
         }
-        bail!("browser exited before exposing a DevTools endpoint")
-    })
-    .await
-    .map_err(|_| anyhow!("timed out waiting for the DevTools endpoint"))??;
-    // Keep draining so a chatty browser never blocks on a full pipe.
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    });
+    let tail = || {
+        let s = log.lock().unwrap();
+        let t: Vec<char> = s.trim().chars().rev().take(300).collect();
+        t.into_iter().rev().collect::<String>()
+    };
+    // Cold browser starts on CI runners can take well over 20s.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let ws_url = loop {
+        if let Some(u) = devtools_endpoint(&log.lock().unwrap(), profile) {
+            break u;
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "browser exited ({status}) before exposing a DevTools endpoint: {}",
+                tail()
+            );
+        }
+        if Instant::now() > deadline {
+            bail!("timed out waiting for the DevTools endpoint: {}", tail());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
 
     let (w, rx) = ws_connect(&ws_url).await?;
     let mut d = Driver {
@@ -1057,6 +1098,31 @@ mod tests {
         assert!(st.on_request(&req("GET", "https://app.example.com/app.js"), "Script"));
         assert_eq!(st.allowed, 1);
         assert!(st.found.is_empty());
+    }
+
+    #[test]
+    fn devtools_endpoint_from_stderr_or_port_file() {
+        let dir = std::env::temp_dir().join(format!("rz-dtap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(devtools_endpoint("starting\n", &dir), None);
+        assert_eq!(
+            devtools_endpoint(
+                "DevTools listening on ws://127.0.0.1:9/devtools/browser/a\n",
+                &dir
+            )
+            .as_deref(),
+            Some("ws://127.0.0.1:9/devtools/browser/a")
+        );
+        std::fs::write(
+            dir.join("DevToolsActivePort"),
+            "4321\n/devtools/browser/b\n",
+        )
+        .unwrap();
+        assert_eq!(
+            devtools_endpoint("", &dir).as_deref(),
+            Some("ws://127.0.0.1:4321/devtools/browser/b")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -24,6 +24,10 @@ fn config(login: Option<LoginScript>) -> BrowserDiscoveryConfig {
 }
 
 fn no_browser() -> bool {
+    // Ubuntu 24.04+ (incl. CI runners) blocks the unprivileged user namespaces the
+    // browser sandbox needs; the fixtures here are local and trusted.
+    #[cfg(target_os = "linux")]
+    std::env::set_var("RUSTZAP_BROWSER_NO_SANDBOX", "1");
     let missing = find_browser(None).is_none();
     if missing {
         eprintln!("skipping: no Chromium/Chrome/Edge installed");
