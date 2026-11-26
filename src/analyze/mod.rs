@@ -13,6 +13,7 @@ use crate::scanner::{collect_scan, ScanConfig};
 use crate::types::{summarize_modules, DiscoveredUrl, Finding, ModuleSummary};
 
 pub mod checkov;
+mod git_status;
 mod gitignore;
 pub mod gitleaks;
 pub mod inventory;
@@ -311,6 +312,8 @@ pub struct StaticRunResult {
     pub static_analysis: Option<StaticAnalysis>,
     /// Tools that actually executed (skipped missing binaries are omitted).
     pub tools_ran: Vec<AnalyzeTool>,
+    /// Source-analysis caps that were hit (#41).
+    pub omitted: Vec<crate::coverage::OmittedRecord>,
 }
 
 /// Run selected static tools and return findings (+ `static{}` when native is on).
@@ -321,6 +324,7 @@ pub async fn run_static_analysis(inputs: &StaticInputs) -> Result<StaticRunResul
     let mut inventory = None;
     let mut attack_plan = Vec::new();
     let mut tools_ran = Vec::new();
+    let mut omitted = Vec::new();
     let mut idx = 0;
 
     while idx < queue.len() {
@@ -328,10 +332,19 @@ pub async fn run_static_analysis(inputs: &StaticInputs) -> Result<StaticRunResul
         idx += 1;
         match run_one_static_tool(tool, inputs).await {
             Ok(ToolChunk::Findings(findings)) => {
+                if tool == AnalyzeTool::Checkov && findings.len() >= checkov::MAX_FINDINGS {
+                    omitted.push(crate::coverage::OmittedRecord {
+                        source: "iac/checkov".to_string(),
+                        limit: checkov::MAX_FINDINGS,
+                        omitted: None,
+                        reason: "Checkov failed checks truncated at the finding cap".to_string(),
+                    });
+                }
                 all.extend(findings);
                 push_ran(&mut tools_ran, tool);
             }
             Ok(ToolChunk::Native(native)) => {
+                omitted.extend(native.omitted);
                 all.extend(native.findings);
                 inventory = Some(native.inventory);
                 attack_plan = native.attack_plan;
@@ -369,11 +382,16 @@ pub async fn run_static_analysis(inputs: &StaticInputs) -> Result<StaticRunResul
         let native = native::run_with(&inputs.repo, inputs.walk)
             .await
             .context("Running native static analyzers")?;
+        omitted.extend(native.omitted);
         all.extend(native.findings);
         inventory = Some(native.inventory);
         attack_plan = native.attack_plan;
         push_ran(&mut tools_ran, AnalyzeTool::Native);
     }
+
+    // Label secrets committed-vs-working-tree before risk roll-up so the
+    // severity bump for committed secrets feeds into the static score.
+    git_status::label_secrets(&inputs.repo, &mut all);
 
     let static_analysis =
         inventory.map(|inv| static_report::build_static_analysis(inv, &all, attack_plan));
@@ -381,6 +399,7 @@ pub async fn run_static_analysis(inputs: &StaticInputs) -> Result<StaticRunResul
         findings: all,
         static_analysis,
         tools_ran,
+        omitted,
     })
 }
 
@@ -483,12 +502,41 @@ pub async fn write_report(
     target: &str,
     modules: Vec<ModuleSummary>,
     urls: Vec<DiscoveredUrl>,
+    findings: Vec<Finding>,
+    correlate: bool,
+    elapsed: std::time::Duration,
+    output: &str,
+    sarif_out: Option<&str>,
+    static_analysis: Option<StaticAnalysis>,
+) -> Result<Report> {
+    write_report_with_coverage(
+        target,
+        modules,
+        urls,
+        findings,
+        correlate,
+        elapsed,
+        output,
+        sarif_out,
+        static_analysis,
+        None,
+    )
+    .await
+}
+
+/// [`write_report`] plus an optional execution-coverage block (#41).
+#[allow(clippy::too_many_arguments)]
+pub async fn write_report_with_coverage(
+    target: &str,
+    modules: Vec<ModuleSummary>,
+    urls: Vec<DiscoveredUrl>,
     mut findings: Vec<Finding>,
     correlate: bool,
     elapsed: std::time::Duration,
     output: &str,
     sarif_out: Option<&str>,
     static_analysis: Option<StaticAnalysis>,
+    coverage: Option<crate::coverage::Coverage>,
 ) -> Result<Report> {
     let correlations = if correlate {
         correlate_findings(&mut findings)
@@ -501,6 +549,10 @@ pub async fn write_report(
     if let Some(block) = static_analysis {
         report = report.with_static(block);
     }
+    if let Some(c) = coverage {
+        report = report.with_coverage(c);
+    }
+    report.meta.source_revision = git_head(target);
 
     if output.ends_with(".csv") {
         report.save_csv(output).await?;
@@ -515,6 +567,19 @@ pub async fn write_report(
     }
 
     Ok(report)
+}
+
+/// `git rev-parse HEAD` of `dir` when it is a local git checkout.
+fn git_head(dir: &str) -> Option<String> {
+    if !Path::new(dir).is_dir() {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .args(["-C", dir, "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    let rev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !rev.is_empty()).then_some(rev)
 }
 
 /// Run static analysis, write the report, and return it.
@@ -560,7 +625,7 @@ pub async fn run_analyze(
     let modules = build_module_summaries(&run.findings, &run.tools_ran, &[]);
     let target = repo_path.to_string_lossy().to_string();
 
-    write_report(
+    write_report_with_coverage(
         &target,
         modules,
         vec![],
@@ -570,6 +635,7 @@ pub async fn run_analyze(
         &output,
         sarif_out.as_deref(),
         run.static_analysis,
+        Some(crate::coverage::Coverage::new(Vec::new(), run.omitted)),
     )
     .await
 }
@@ -659,6 +725,8 @@ pub async fn run_audit_cli(
     let mut findings = run.findings;
     let static_analysis = run.static_analysis;
     let tools_ran = run.tools_ran;
+    let omitted = run.omitted;
+    let mut records = Vec::new();
     let mut urls = Vec::new();
     let mut dast_modules = Vec::new();
 
@@ -691,17 +759,21 @@ pub async fn run_audit_cli(
             nuclei_jsonl: None,
             active_all_paths,
             passive_all_methods,
+            jwt_crack: false,
             safety,
+            browser_discovery: None,
+            authz: Default::default(),
         };
         let collected = collect_scan(scan_config).await?;
         findings.extend(collected.findings);
         urls = collected.discovered;
         dast_modules = collected.modules;
+        records = collected.coverage.records;
     }
 
     let modules = build_module_summaries(&findings, &tools_ran, &dast_modules);
 
-    write_report(
+    write_report_with_coverage(
         &report_target,
         modules,
         urls,
@@ -711,6 +783,7 @@ pub async fn run_audit_cli(
         &output,
         sarif_out.as_deref(),
         static_analysis,
+        Some(crate::coverage::Coverage::new(records, omitted)),
     )
     .await
     .map(|_| ())

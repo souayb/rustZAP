@@ -145,7 +145,7 @@ impl PassiveScanner {
         findings.extend(check_tech_fingerprint(url, &headers, &body));
         findings.extend(check_jwt_surface(url, &body));
         findings.extend(check_csrf_missing_token(url, &body));
-        findings.extend(dlp::check_dlp_exposure(url, &body));
+        findings.extend(dlp::check_dlp_exposure(url, &headers, &body));
         findings.extend(crypto_audit::check_crypto_posture_passive(
             url, &headers, &body,
         ));
@@ -180,7 +180,7 @@ pub fn check_response_passive(
     findings.extend(check_tech_fingerprint(url, headers, body));
     findings.extend(check_jwt_surface(url, body));
     findings.extend(check_csrf_missing_token(url, body));
-    findings.extend(dlp::check_dlp_exposure(url, body));
+    findings.extend(dlp::check_dlp_exposure(url, headers, body));
     findings.extend(crypto_audit::check_crypto_posture_passive(
         url, headers, body,
     ));
@@ -538,11 +538,6 @@ fn check_sensitive_data_exposure(url: &str, body: &str) -> Vec<Finding> {
             Severity::High,
         ),
         (
-            r#"(?i)password\s*[=:]\s*['"][^'"]{4,}"#,
-            "Password Exposed in Response",
-            Severity::Critical,
-        ),
-        (
             r#"(?i)secret[_-]?key\s*[=:]\s*['"]?[a-zA-Z0-9_\-]{16,}"#,
             "Secret Key Exposed",
             Severity::High,
@@ -569,35 +564,135 @@ fn check_sensitive_data_exposure(url: &str, body: &str) -> Vec<Finding> {
         ),
     ];
 
+    let push = |findings: &mut Vec<Finding>, start: usize, title: &str, severity: Severity| {
+        let snippet = crate::types::safe_truncate(&body[start..], 60);
+        // Redact most of it
+        let redacted = if snippet.len() > 20 {
+            format!("{}...[REDACTED]", crate::types::safe_truncate(snippet, 20))
+        } else {
+            snippet.to_string()
+        };
+
+        findings.push(regex_only(
+            Finding::new(
+                title,
+                severity,
+                url,
+                format!(
+                    "Sensitive data pattern detected in response body: {}",
+                    title
+                ),
+                "Remove sensitive data from responses. Use environment variables for secrets.",
+                "passive/sensitive-data",
+            )
+            .with_evidence(redacted)
+            .with_cwe(200)
+            .with_owasp("A02:2021 – Cryptographic Failures"),
+        ));
+    };
+
     for (pattern, title, severity) in patterns {
         if let Ok(re) = regex::Regex::new(pattern) {
             if let Some(m) = re.find(body) {
-                let snippet = crate::types::safe_truncate(&body[m.start()..], 60);
-                // Redact most of it
-                let redacted = if snippet.len() > 20 {
-                    format!("{}...[REDACTED]", crate::types::safe_truncate(snippet, 20))
-                } else {
-                    snippet.to_string()
-                };
-
-                findings.push(
-                    Finding::new(
-                        title,
-                        severity,
-                        url,
-                        format!("Sensitive data pattern detected in response body: {}", title),
-                        "Remove sensitive data from responses. Use environment variables for secrets.",
-                        "passive/sensitive-data",
-                    )
-                    .with_evidence(redacted)
-                    .with_cwe(200)
-                    .with_owasp("A02:2021 – Cryptographic Failures"),
-                );
+                push(&mut findings, m.start(), title, severity);
             }
         }
     }
 
+    // Passwords: field labels and validation strings are skipped; placeholder
+    // examples are reported as Info; only plausible real literals rate High.
+    let pw_re = regex::Regex::new(r#"(?i)password['"]?\s*[=:]\s*['"]([^'"]{4,})"#).unwrap();
+    let mut placeholder = None;
+    for cap in pw_re.captures_iter(body) {
+        let start = cap.get(0).map_or(0, |m| m.start());
+        match password_literal_kind(cap.get(1).map_or("", |m| m.as_str())) {
+            PasswordLiteral::Credential => {
+                placeholder = None;
+                push(
+                    &mut findings,
+                    start,
+                    "Password Exposed in Response",
+                    Severity::High,
+                );
+                break;
+            }
+            PasswordLiteral::Placeholder => {
+                placeholder.get_or_insert(start);
+            }
+            PasswordLiteral::Label => {}
+        }
+    }
+    if let Some(start) = placeholder {
+        push(
+            &mut findings,
+            start,
+            "Placeholder Password Literal in Response",
+            Severity::Info,
+        );
+    }
+
     findings
+}
+
+enum PasswordLiteral {
+    /// UI label, i18n key, or validation message (`"Mot de passe"`, `"Password is required"`).
+    Label,
+    /// Synthetic example / template value (`"changeme"`, `"********"`, `"{{password}}"`).
+    Placeholder,
+    /// Plausible real credential literal.
+    Credential,
+}
+
+fn password_literal_kind(value: &str) -> PasswordLiteral {
+    let lower = value.to_lowercase();
+    let mut chars = value.chars();
+    let first = chars.next().unwrap_or(' ');
+    let title_case_word =
+        first.is_uppercase() && chars.all(|c| c.is_alphabetic() && c.is_lowercase());
+    let i18n_key = value.contains('.')
+        && value
+            .split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphabetic() || c == '_'));
+    if value.chars().any(char::is_whitespace)
+        || lower.contains("passw")
+        || title_case_word
+        || i18n_key
+    {
+        return PasswordLiteral::Label;
+    }
+    const EXAMPLES: &[&str] = &[
+        "changeme",
+        "example",
+        "dummy",
+        "placeholder",
+        "redacted",
+        "secret",
+        "string",
+        "test",
+        "your_password",
+        "yourpassword",
+        "null",
+        "undefined",
+        "none",
+        "true",
+        "false",
+    ];
+    if EXAMPLES.contains(&lower.as_str())
+        || value.chars().all(|c| c == first)
+        || ['<', '{', '$', '%'].contains(&first)
+    {
+        return PasswordLiteral::Placeholder;
+    }
+    PasswordLiteral::Credential
+}
+
+/// Regex-only passive evidence needs manual validation: mark it tentative and keep
+/// it below `Critical`, which is reserved for confirmed impact.
+pub(crate) fn regex_only(mut f: Finding) -> Finding {
+    if f.severity == Severity::Critical {
+        f.severity = Severity::High;
+    }
+    f.tentative()
 }
 
 /// Check for verbose error messages
@@ -872,6 +967,16 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Option<(u16, String)
         .await
         .ok()?;
     let status = resp.status().as_u16();
+    // RFC 9116 §3: security.txt MUST be text/plain. A 200 with any other media
+    // type (typically an SPA's index.html fallback) means the file is absent.
+    let plain = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.trim().to_ascii_lowercase().starts_with("text/plain"));
+    if status == 200 && !plain {
+        return Some((404, String::new()));
+    }
     let body = resp.text().await.unwrap_or_default();
     Some((status, body))
 }
@@ -1779,5 +1884,32 @@ Policy: https://example.com/policy\n";
             .as_deref()
             .unwrap()
             .ends_with("...[REDACTED]"));
+    }
+
+    fn password_findings(body: &str) -> Vec<Finding> {
+        check_sensitive_data_exposure("https://t.example/main.js", body)
+            .into_iter()
+            .filter(|f| f.title.contains("Password"))
+            .collect()
+    }
+
+    #[test]
+    fn password_labels_and_validation_strings_are_not_credentials() {
+        // Minified i18n / form-label bundle (en + fr + de), validation messages, i18n keys.
+        let bundle = r#"{password:"Password",confirmPassword:"Confirm password",password:"Mot de passe",password:"Passwort",password:"Password must be at least 8 characters",password:"auth.errors.required"}"#;
+        assert!(password_findings(bundle).is_empty());
+    }
+
+    #[test]
+    fn password_placeholders_are_info_and_real_literals_high() {
+        let f = password_findings(r#"{"password":"********","user":"x"}"#);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Info);
+
+        let f = password_findings(r#"const cfg={db_user:"svc",password:"Tr0ub4dor&3"}"#);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "Password Exposed in Response");
+        assert_eq!(f[0].severity, Severity::High);
+        assert_eq!(f[0].confidence, crate::types::Confidence::Tentative);
     }
 }

@@ -1,0 +1,54 @@
+# Fixed counterpart of k8s_vulnerable.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  DB_HOST: postgres.data.svc.cluster.local
+  MAIL_HOST: smtp.example.com
+  MAIL_USE_TLS: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          image: example/api:1.0
+          envFrom:
+            - configMapRef:
+                name: app-config
+          env:
+            - name: DATABASE_URL
+              value: postgres://app@$(DB_HOST):5432/app?sslmode=verify-full
+            - name: SEARCH_URL
+              value: https://search.default.svc:9200
+            - name: REDIS_URL
+              value: rediss://redis:6380
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-backup
+spec:
+  schedule: "0 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: dump
+              image: postgres:16
+              command: ["/bin/sh", "-c"]
+              args: ["pg_dump \"$DATABASE_URL\" | age -r age1fixturerecipient > /backup/db.sql.age"]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis
+stringData:
+  url: rediss://redis:6380

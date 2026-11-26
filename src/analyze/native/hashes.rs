@@ -45,14 +45,23 @@ impl Default for CryptoAuditor {
 impl CryptoAuditor {
     pub fn new() -> Self {
         Self {
-            // MD5 in hash/password/token context
-            md5_context_regex: Regex::new(r#"(?i)(?:password|hash|checksum|token|secret|digest|md5)\s*[:=]\s*['"]?([a-f0-9]{32})['"]?"#).unwrap(),
-            // SHA1 in security context
-            sha1_context_regex: Regex::new(r#"(?i)(?:password|secret_key|api_key|token|sha1)\s*[:=]\s*['"]?([a-f0-9]{40})['"]?"#).unwrap(),
+            // MD5 in hash/password/token context. The trailing `\b` rejects the first
+            // 32 hex chars of a longer digest (e.g. Cargo.lock `checksum = "<sha256>"`).
+            md5_context_regex: Regex::new(r#"(?i)(?:password|hash|checksum|token|secret|digest|md5)\s*[:=]\s*['"]?([a-f0-9]{32})\b['"]?"#).unwrap(),
+            // SHA1 in security context (full-token boundary, as above)
+            sha1_context_regex: Regex::new(r#"(?i)(?:password|secret_key|api_key|token|sha1)\s*[:=]\s*['"]?([a-f0-9]{40})\b['"]?"#).unwrap(),
             // NTLM / LM hash line pattern
-            ntlm_regex: Regex::new(r#"\b[a-zA-Z0-9_\-\.\$]+:\d+:[a-fA-F0-9]{32}:[a-fA-F0-9]{32}:::\b"#).unwrap(),
-            // Insecure ciphers and modes in code / config
-            insecure_cipher_regex: Regex::new(r#"(?i)\b(?:DES_EDE3_CBC|DES-CBC|DES-EDE3|RC4|ARCFOUR|AES(?:_\d+)?_ECB|AES/ECB/PKCS5Padding|Blowfish|DES)\b"#).unwrap(),
+            ntlm_regex: Regex::new(r#"\b[a-zA-Z0-9_\-\.\$]+:\d+:[a-fA-F0-9]{32}:[a-fA-F0-9]{32}:::"#).unwrap(),
+            // Insecure ciphers and modes in code / config. Bare `DES` is deliberately
+            // absent: it only counts in a crypto API / cipher-name shape, never in
+            // prose ("des" in French), SKUs (`DES-005`) or identifiers.
+            insecure_cipher_regex: Regex::new(concat!(
+                r#"(?i)\b(?:DES_EDE3_CBC|DES(?:-EDE3)?-(?:CBC|ECB|CFB|OFB)|DES-EDE3|DESede|3DES|TripleDES|RC4|ARCFOUR|AES(?:_\d+)?_ECB|AES/ECB/PKCS5Padding|Blowfish)\b"#,
+                r#"|createCipheriv\(\s*['"]des\b"#,
+                r#"|Cipher\.getInstance\(\s*"DES\b"#,
+                r#"|CryptoJS\.DES\b"#,
+            ))
+            .unwrap(),
             // Weak bcrypt cost parameter ($2a$04$, $2b$06$, etc. with cost < 10)
             bcrypt_weak_regex: Regex::new(r#"\$2[abxy]\$0([4-9])\$[./0-9A-Za-z]{22}[./0-9A-Za-z]{31}"#).unwrap(),
             // Weak Argon2 parameters (e.g. m=1024 or t=1)
@@ -202,14 +211,33 @@ use crate::analyze::native::SOURCE_TOOL;
 use crate::types::CodeLocation;
 use std::path::{Path, PathBuf};
 
-const MAX_CRYPTO_FINDINGS: usize = 100;
+pub(crate) const MAX_CRYPTO_FINDINGS: usize = 100;
+
+/// Dependency lockfiles hold integrity checksums (SHA-256/512, go.sum `h1:`), not secrets.
+fn is_lockfile(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(
+            "Cargo.lock"
+                | "package-lock.json"
+                | "npm-shrinkwrap.json"
+                | "yarn.lock"
+                | "pnpm-lock.yaml"
+                | "poetry.lock"
+                | "Pipfile.lock"
+                | "Gemfile.lock"
+                | "composer.lock"
+                | "go.sum"
+        )
+    )
+}
 
 pub fn scan(root: &Path, files: &[PathBuf]) -> Vec<Finding> {
     let auditor = CryptoAuditor::new();
     let mut out = Vec::new();
 
     for path in files {
-        if is_minified_name(path) {
+        if is_minified_name(path) || is_lockfile(path) {
             continue;
         }
         let Some((src, _truncated)) = read_text_head(path, MAX_SOURCE_BYTES) else {
@@ -293,6 +321,47 @@ mod tests {
         assert!(matches
             .iter()
             .any(|m| matches!(m.category, WeakCryptoCategory::InsecureCipher(_))));
+    }
+
+    #[test]
+    fn longer_digests_and_lockfile_checksums_are_not_md5() {
+        let auditor = CryptoAuditor::new();
+        // Cargo.lock SHA-256 checksum: the first 32 hex chars must not count as MD5.
+        let cargo =
+            r#"checksum = "f2a4d6a1c0b9e8f7d6c5b4a3928170615243f4e5d6c7b8a9f0e1d2c3b4a59687""#;
+        assert!(auditor.audit_text(cargo).is_empty());
+        let sha256 = "digest: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        assert!(auditor.audit_text(sha256).is_empty());
+        assert!(is_lockfile(Path::new("deps/Cargo.lock")));
+        assert!(!is_lockfile(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn des_requires_crypto_context() {
+        let auditor = CryptoAuditor::new();
+        for benign in [
+            "Bienvenue sur la page des utilisateurs et des produits.",
+            "SKU DES-005 is back in stock",
+            "const db = window.indexedDB.open('des');",
+            "Les DES ventes",
+        ] {
+            assert!(auditor.audit_text(benign).is_empty(), "{benign}");
+        }
+        for weak in [
+            r#"crypto.createCipheriv("des-ede", key, iv)"#,
+            r#"Cipher c = Cipher.getInstance("DES/CBC/PKCS5Padding");"#,
+            "var e = CryptoJS.DES.encrypt(msg, key);",
+            "ssl_ciphers DES-CBC3-SHA:DES-CBC-SHA;",
+            "openssl enc -des-cbc -in a",
+        ] {
+            assert!(
+                auditor
+                    .audit_text(weak)
+                    .iter()
+                    .any(|m| matches!(m.category, WeakCryptoCategory::InsecureCipher(_))),
+                "{weak}"
+            );
+        }
     }
 
     #[test]

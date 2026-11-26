@@ -140,6 +140,24 @@ pub struct Finding {
     #[serde(default)]
     pub confidence: Confidence,
     pub found_at: DateTime<Utc>,
+    /// Other URLs/locations where this same finding (plugin + title + severity)
+    /// occurred; filled by `Report::new` dedup. `url` stays the first instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<String>,
+    // Evidence contract (issue #49). `fingerprint` / `validation_status` are
+    // filled at export time by `crate::evidence::export_finding`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
 }
 
 impl Finding {
@@ -172,6 +190,13 @@ impl Finding {
             poc: None,
             confidence: Confidence::Firm,
             found_at: Utc::now(),
+            instances: vec![],
+            fingerprint: None,
+            validation_status: None,
+            method: None,
+            identity_role: None,
+            expected: None,
+            actual: None,
         }
     }
 
@@ -192,6 +217,27 @@ impl Finding {
 
     pub fn with_location(mut self, location: CodeLocation) -> Self {
         self.location = Some(location);
+        self
+    }
+
+    pub fn with_method(mut self, method: impl Into<String>) -> Self {
+        self.method = Some(method.into());
+        self
+    }
+
+    pub fn with_identity_role(mut self, role: impl Into<String>) -> Self {
+        self.identity_role = Some(role.into());
+        self
+    }
+
+    /// Expected (secure) vs actual (observed) behaviour.
+    pub fn with_behaviour(
+        mut self,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        self.expected = Some(expected.into());
+        self.actual = Some(actual.into());
         self
     }
 
@@ -320,6 +366,12 @@ impl HttpResponseCache {
         let map = self.responses.read().await;
         map.is_empty()
     }
+
+    /// All cached response header lists (used by the JWT pass).
+    pub async fn all_headers(&self) -> Vec<Vec<(String, String)>> {
+        let map = self.responses.read().await;
+        map.values().map(|r| r.headers.clone()).collect()
+    }
 }
 
 /// Discovered URL with metadata
@@ -370,6 +422,8 @@ pub enum UrlSource {
     OpenApi,
     Har,
     PathsFile,
+    /// Observed by the opt-in headless browser discovery (`--browser-discovery`).
+    Browser,
 }
 
 /// Roll-up of one module's contribution to the scan. See SDD §9.1.

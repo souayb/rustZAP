@@ -26,6 +26,9 @@ pub struct Report {
     /// Full-repo static analysis roll-up (Phase 2.5). Omitted on DAST-only reports.
     #[serde(rename = "static", default, skip_serializing_if = "Option::is_none")]
     pub static_analysis: Option<StaticAnalysis>,
+    /// Execution coverage (#41); absent in reports written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<crate::coverage::Coverage>,
     pub urls: Vec<DiscoveredUrl>,
     pub findings: Vec<Finding>,
 }
@@ -87,6 +90,12 @@ pub struct ReportMeta {
     pub target: String,
     pub scan_date: String,
     pub duration_secs: f64,
+    /// Git revision of the analyzed source / deployment, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    /// What this run could not cover (e.g. active checks disabled).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_limitations: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,14 +110,21 @@ pub struct ReportSummary {
     pub risk_score: u8,
 }
 
+/// Risk score 0–100. Low/info contributions are capped so a flood of repeated
+/// weak signals cannot saturate the score on its own (max 15 from low+info).
+fn risk_score(critical: usize, high: usize, medium: usize, low: usize, info: usize) -> u8 {
+    (critical * 20 + high * 10 + medium * 5 + (low * 2).min(10) + info.min(5)).min(100) as u8
+}
+
 impl Report {
     pub fn new(
         target: &str,
         modules: Vec<ModuleSummary>,
         urls: Vec<DiscoveredUrl>,
-        mut findings: Vec<Finding>,
+        findings: Vec<Finding>,
         elapsed: Duration,
     ) -> Self {
+        let mut findings = crate::finding_dedup::collapse(findings);
         // Sort findings by severity descending
         findings.sort_by(|a, b| b.severity.cmp(&a.severity));
 
@@ -133,9 +149,7 @@ impl Report {
             .filter(|f| f.severity == Severity::Info)
             .count();
 
-        // Simple risk score: 0–100
-        let risk_score =
-            ((critical * 20 + high * 10 + medium * 5 + low * 2 + info) as f64).min(100.0) as u8;
+        let risk_score = risk_score(critical, high, medium, low, info);
 
         Report {
             meta: ReportMeta {
@@ -144,6 +158,8 @@ impl Report {
                 target: target.to_string(),
                 scan_date: Utc::now().to_rfc3339(),
                 duration_secs: elapsed.as_secs_f64(),
+                source_revision: None,
+                coverage_limitations: Vec::new(),
             },
             summary: ReportSummary {
                 total_urls: urls.len(),
@@ -158,6 +174,7 @@ impl Report {
             modules,
             correlations: Vec::new(),
             static_analysis: None,
+            coverage: None,
             urls,
             findings,
         }
@@ -173,18 +190,43 @@ impl Report {
         self
     }
 
+    pub fn with_coverage(mut self, coverage: crate::coverage::Coverage) -> Self {
+        self.coverage = Some(coverage);
+        self
+    }
+
+    /// Findings as exported: stable fingerprint + validation status, redacted.
+    pub fn export_findings(&self) -> Vec<Finding> {
+        self.findings
+            .iter()
+            .map(crate::evidence::export_finding)
+            .collect()
+    }
+
+    /// The JSON export: every string in the report goes through the shared redaction.
+    pub fn to_export_json(&self) -> Result<String> {
+        let mut v = serde_json::to_value(self)?;
+        v["findings"] = serde_json::to_value(self.export_findings())?;
+        Ok(serde_json::to_string_pretty(&crate::evidence::redact(&v))?)
+    }
+
     pub async fn save_json(&self, path: &str) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        tokio::fs::write(path, json).await?;
+        tokio::fs::write(path, self.to_export_json()?).await?;
         Ok(())
     }
 
     pub async fn save_csv(&self, path: &str) -> Result<()> {
-        let mut csv =
-            String::from("ID,Title,Severity,Confidence,Validated,URL,Parameter,CWE,Plugin\n");
-        for f in &self.findings {
+        tokio::fs::write(path, self.to_csv()).await?;
+        Ok(())
+    }
+
+    pub fn to_csv(&self) -> String {
+        let mut csv = String::from(
+            "ID,Title,Severity,Confidence,Validated,URL,Parameter,CWE,Plugin,Instances,Fingerprint,ValidationStatus\n",
+        );
+        for f in &self.export_findings() {
             let row = format!(
-                "{},{},\"{}\",\"{}\",\"{}\",{},{},\"{}\",{}\n",
+                "{},{},\"{}\",\"{}\",\"{}\",{},{},\"{}\",{},{},{},{}\n",
                 csv_cell(&f.id),
                 csv_cell(&f.title),
                 f.severity,
@@ -194,28 +236,51 @@ impl Report {
                 csv_cell(f.parameter.as_deref().unwrap_or("")),
                 f.cwe.unwrap_or(0),
                 csv_cell(&f.plugin),
+                csv_cell(&f.instances.join("; ")),
+                csv_cell(f.fingerprint.as_deref().unwrap_or("")),
+                csv_cell(f.validation_status.as_deref().unwrap_or("")),
             );
             csv.push_str(&row);
         }
-        tokio::fs::write(path, csv).await?;
-        Ok(())
+        csv
     }
 
     pub async fn save_html(&self, path: &str) -> Result<()> {
+        tokio::fs::write(path, self.to_html()).await?;
+        Ok(())
+    }
+
+    pub fn to_html(&self) -> String {
+        let redact = crate::evidence::redact_string;
         let mut html = String::from(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline';\"><title>RustZAP Report</title><style>body { font-family: sans-serif; } table { border-collapse: collapse; width: 100%; } th, td { border: 1px solid #ddd; padding: 8px; }</style></head><body>"
         );
         html.push_str(&format!(
             "<h1>RustZAP Scan Report: {}</h1>",
-            html_escape(&self.meta.target)
+            html_escape(&redact(&self.meta.target))
         ));
         html.push_str(&format!(
-            "<p>Total Findings: {} | Risk Score: {}</p>",
-            self.summary.total_findings, self.summary.risk_score
+            "<p>Total Findings: {} | Risk Score: {} | {} {}{}</p>",
+            self.summary.total_findings,
+            self.summary.risk_score,
+            html_escape(&self.meta.scanner),
+            html_escape(&self.meta.version),
+            self.meta
+                .source_revision
+                .as_deref()
+                .map(|r| format!(" | Revision: {}", html_escape(r)))
+                .unwrap_or_default()
         ));
+        if !self.meta.coverage_limitations.is_empty() {
+            html.push_str("<p>Coverage limitations:</p><ul>");
+            for l in &self.meta.coverage_limitations {
+                html.push_str(&format!("<li>{}</li>", html_escape(&redact(l))));
+            }
+            html.push_str("</ul>");
+        }
 
-        html.push_str("<table><tr><th>Severity</th><th>Confidence</th><th>Title</th><th>URL</th><th>Parameter</th><th>Description</th></tr>");
-        for f in &self.findings {
+        html.push_str("<table><tr><th>ID</th><th>Severity</th><th>Confidence</th><th>Validation</th><th>Title</th><th>Method</th><th>URL</th><th>Parameter</th><th>Description</th><th>Evidence</th></tr>");
+        for f in &self.export_findings() {
             let color = match f.severity {
                 Severity::Critical => "magenta",
                 Severity::High => "red",
@@ -228,22 +293,99 @@ impl Report {
             } else {
                 f.confidence.to_string()
             };
+            // Evidence column: observed evidence, expected/actual, then the PoC request.
+            let evidence = [
+                f.evidence.clone(),
+                f.expected.as_ref().map(|e| format!("expected: {e}")),
+                f.actual.as_ref().map(|a| format!("actual: {a}")),
+                f.identity_role.as_ref().map(|r| format!("role: {r}")),
+                f.poc.as_ref().map(|p| p.raw_request.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+            let fp = html_escape(f.fingerprint.as_deref().unwrap_or(""));
             html.push_str(&format!(
-                "<tr><td style='color: {}'><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr id='{fp}'><td><code>{fp}</code></td><td style='color: {}'><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><pre>{}</pre></td></tr>",
                 color,
                 html_escape(&f.severity.to_string()),
                 html_escape(&confidence),
+                html_escape(f.validation_status.as_deref().unwrap_or("")),
                 html_escape(&f.title),
-                html_escape(&f.url),
+                html_escape(f.method.as_deref().unwrap_or("-")),
+                html_url_cell(f),
                 html_escape(f.parameter.as_deref().unwrap_or("-")),
-                html_escape(&f.description)
+                html_escape(&f.description),
+                html_escape(&evidence)
             ));
         }
-        html.push_str("</table></body></html>");
-
-        tokio::fs::write(path, html).await?;
-        Ok(())
+        html.push_str("</table>");
+        if let Some(c) = &self.coverage {
+            html.push_str(&redact(&coverage_html(c)));
+        }
+        html.push_str("</body></html>");
+        html
     }
+}
+
+/// HTML coverage section: status line, then only the checks that did not
+/// complete cleanly (completed/finding rows would drown the gaps).
+fn coverage_html(c: &crate::coverage::Coverage) -> String {
+    use crate::coverage::Outcome;
+    let mut s = format!("<h2>Coverage</h2><p>{}</p>", html_escape(&c.summary_line()));
+    let gaps: Vec<_> = c
+        .records
+        .iter()
+        .filter(|r| !matches!(r.outcome, Outcome::CompletedNoFinding | Outcome::Finding))
+        .collect();
+    if !gaps.is_empty() {
+        s.push_str("<table><tr><th>Outcome</th><th>Method</th><th>Endpoint</th><th>Plugin</th><th>Requests</th><th>Reason</th></tr>");
+        for r in gaps {
+            s.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}/{}</td><td>{}</td></tr>",
+                r.outcome,
+                html_escape(&r.method),
+                html_escape(&r.endpoint),
+                html_escape(&r.plugin),
+                r.requests_completed,
+                r.requests_attempted,
+                html_escape(&r.reason)
+            ));
+        }
+        s.push_str("</table>");
+    }
+    if !c.omitted.is_empty() {
+        s.push_str("<h3>Analysis limits reached</h3><ul>");
+        for o in &c.omitted {
+            s.push_str(&format!(
+                "<li>{} (limit {}): {}</li>",
+                html_escape(&o.source),
+                o.limit,
+                html_escape(&o.reason)
+            ));
+        }
+        s.push_str("</ul>");
+    }
+    s
+}
+
+/// URL cell: the primary URL, plus a collapsible list when deduped into instances.
+fn html_url_cell(f: &Finding) -> String {
+    if f.instances.is_empty() {
+        return html_escape(&f.url);
+    }
+    let items: String = f
+        .instances
+        .iter()
+        .map(|i| format!("<li>{}</li>", html_escape(i)))
+        .collect();
+    format!(
+        "{}<details><summary>{} instances</summary><ul>{}</ul></details>",
+        html_escape(&f.url),
+        f.instances.len(),
+        items
+    )
 }
 
 /// Escape text for safe embedding in HTML documents.
@@ -317,6 +459,13 @@ mod tests {
             poc: None,
             confidence: crate::types::Confidence::Firm,
             found_at: chrono::Utc::now(),
+            instances: vec![],
+            fingerprint: None,
+            validation_status: None,
+            method: None,
+            identity_role: None,
+            expected: None,
+            actual: None,
         };
 
         let report = Report::new(
@@ -436,6 +585,14 @@ mod tests {
         assert!(json.contains("/login"));
         let decoded: Report = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(decoded.static_analysis.unwrap().risk_score, 12);
+    }
+
+    #[test]
+    fn risk_score_not_saturated_by_repeated_weak_signals() {
+        assert_eq!(risk_score(0, 0, 0, 0, 500), 5);
+        assert_eq!(risk_score(0, 0, 0, 200, 200), 15);
+        assert_eq!(risk_score(1, 1, 1, 1, 1), 38);
+        assert_eq!(risk_score(5, 5, 0, 0, 0), 100);
     }
 
     #[test]

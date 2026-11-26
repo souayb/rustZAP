@@ -64,9 +64,11 @@ pub fn parse_openapi_json(json: &str, target: &str) -> Result<(Vec<DiscoveredUrl
             }
             let params = collect_param_names(item_obj.get("parameters"), op.get("parameters"));
             let headers = extract_headers(item_obj.get("parameters"), op.get("parameters"));
-            let (content_type, body) = extract_body_and_ct(op);
+            let (content_type, body) = extract_body_and_ct(&doc, op);
             let concrete = materialize_path(path_tmpl, &params);
-            let joined = join_target_path(&base, &concrete)?;
+            let Ok(joined) = join_target_path(&base, &concrete) else {
+                continue;
+            };
             let url = append_query_placeholders(&joined, &params);
             out.push(DiscoveredUrl {
                 url,
@@ -134,43 +136,160 @@ fn extract_headers(path_level: Option<&Value>, op_level: Option<&Value>) -> Vec<
     headers
 }
 
-fn extract_body_and_ct(op: &Value) -> (Option<String>, Option<String>) {
-    let Some(rb) = op.get("requestBody") else {
+fn extract_body_and_ct(doc: &Value, op: &Value) -> (Option<String>, Option<String>) {
+    let Some(rb) = op.get("requestBody").map(|rb| resolve_ref(doc, rb)) else {
         return (None, None);
     };
     let Some(content) = rb.get("content").and_then(|c| c.as_object()) else {
         return (None, None);
     };
-    if let Some(json_content) = content.get("application/json") {
+    // `application/json` first, then any `+json` / `json` media type.
+    let json_media = content.get("application/json").or_else(|| {
+        content
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase().contains("json"))
+            .map(|(_, v)| v)
+    });
+    if let Some(json_content) = json_media {
         let ct = Some("application/json".to_string());
         let body = if let Some(ex) = json_content.get("example") {
-            Some(ex.to_string())
-        } else if let Some(props) = json_content
-            .get("schema")
-            .and_then(|s| s.get("properties"))
-            .and_then(|p| p.as_object())
-        {
-            let mut sample = serde_json::Map::new();
-            for (k, v) in props {
-                let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
-                let sample_val = match typ {
-                    "integer" | "number" => serde_json::json!(1),
-                    "boolean" => serde_json::json!(true),
-                    _ => serde_json::json!("test"),
-                };
-                sample.insert(k.clone(), sample_val);
-            }
-            Some(Value::Object(sample).to_string())
+            ex.to_string()
+        } else if let Some(schema) = json_content.get("schema") {
+            sample_from_schema(doc, schema, 0).to_string()
         } else {
-            Some("{}".to_string())
+            "{}".to_string()
         };
-        return (ct, body);
+        return (ct, Some(body));
     }
     if content.get("application/x-www-form-urlencoded").is_some() {
         let ct = Some("application/x-www-form-urlencoded".to_string());
         return (ct, Some("param=test".to_string()));
     }
     (None, None)
+}
+
+/// Max object/array nesting for synthesized bodies; past it only `required`
+/// properties are emitted, and a hard cap stops recursive `$ref` cycles.
+const SCHEMA_MAX_DEPTH: usize = 6;
+
+/// Follow local `$ref`s (`#/components/schemas/X`, `#/definitions/X`).
+fn resolve_ref<'a>(doc: &'a Value, mut v: &'a Value) -> &'a Value {
+    for _ in 0..16 {
+        let Some(r) = v.get("$ref").and_then(|r| r.as_str()) else {
+            break;
+        };
+        match r.strip_prefix('#').and_then(|p| doc.pointer(p)) {
+            Some(target) => v = target,
+            None => break,
+        }
+    }
+    v
+}
+
+/// Synthesize a schema-valid sample value: honors `example`/`default`/`enum`,
+/// `$ref`, `allOf`/`oneOf`/`anyOf`, string formats, and nested objects/arrays.
+fn sample_from_schema(doc: &Value, schema: &Value, depth: usize) -> Value {
+    use serde_json::json;
+    let s = resolve_ref(doc, schema);
+    if depth > SCHEMA_MAX_DEPTH + 2 {
+        return Value::Null;
+    }
+    for key in ["example", "default", "const"] {
+        if let Some(v) = s.get(key) {
+            return v.clone();
+        }
+    }
+    if let Some(first) = s
+        .get("enum")
+        .and_then(|e| e.as_array())
+        .and_then(|e| e.first())
+    {
+        return first.clone();
+    }
+    if let Some(parts) = s.get("allOf").and_then(|a| a.as_array()) {
+        let mut merged = serde_json::Map::new();
+        for p in parts {
+            match sample_from_schema(doc, p, depth + 1) {
+                Value::Object(o) => merged.extend(o),
+                other if parts.len() == 1 => return other,
+                _ => {}
+            }
+        }
+        return Value::Object(merged);
+    }
+    for key in ["oneOf", "anyOf"] {
+        if let Some(first) = s
+            .get(key)
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+        {
+            return sample_from_schema(doc, first, depth + 1);
+        }
+    }
+    // OAS 3.1 allows `type: ["string", "null"]`.
+    let typ = match s.get("type") {
+        Some(Value::String(t)) => t.as_str(),
+        Some(Value::Array(ts)) => ts
+            .iter()
+            .filter_map(|t| t.as_str())
+            .find(|t| *t != "null")
+            .unwrap_or("null"),
+        _ if s.get("properties").is_some() => "object",
+        _ if s.get("items").is_some() => "array",
+        _ => "string",
+    };
+    match typ {
+        "object" => {
+            let required: Vec<&str> = s
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            let mut obj = serde_json::Map::new();
+            if let Some(props) = s.get("properties").and_then(|p| p.as_object()) {
+                for (k, v) in props {
+                    if depth < SCHEMA_MAX_DEPTH || required.contains(&k.as_str()) {
+                        obj.insert(k.clone(), sample_from_schema(doc, v, depth + 1));
+                    }
+                }
+            }
+            Value::Object(obj)
+        }
+        "array" => match s.get("items") {
+            Some(items) if depth < SCHEMA_MAX_DEPTH => {
+                json!([sample_from_schema(doc, items, depth + 1)])
+            }
+            _ => json!([]),
+        },
+        "integer" => s
+            .get("minimum")
+            .and_then(|m| m.as_i64())
+            .map_or(json!(1), |m| json!(m.max(1))),
+        "number" => s
+            .get("minimum")
+            .and_then(|m| m.as_f64())
+            .map_or(json!(1), |m| json!(m.max(1.0))),
+        "boolean" => json!(true),
+        "null" => Value::Null,
+        _ => {
+            let fmt = s.get("format").and_then(|f| f.as_str()).unwrap_or("");
+            let sample = match fmt {
+                "date-time" => "2024-01-01T00:00:00Z",
+                "date" => "2024-01-01",
+                "email" => "test@example.com",
+                "uuid" => "00000000-0000-4000-8000-000000000000",
+                "uri" | "url" => "https://example.com/",
+                "ipv4" => "127.0.0.1",
+                _ => "test",
+            };
+            let min = s.get("minLength").and_then(|m| m.as_u64()).unwrap_or(0) as usize;
+            if sample.len() < min {
+                json!("t".repeat(min))
+            } else {
+                json!(sample)
+            }
+        }
+    }
 }
 
 fn materialize_path(tmpl: &str, params: &[String]) -> String {
@@ -185,7 +304,15 @@ fn materialize_path(tmpl: &str, params: &[String]) -> String {
             path = path.replace(&colon, PATH_PLACEHOLDER);
         }
     }
-    // Any remaining `{…}` placeholders
+    let mut path = fill_placeholders(path);
+    if !path.starts_with('/') {
+        path = format!("/{}", path);
+    }
+    path
+}
+
+/// Replace any remaining `{…}` template placeholders.
+fn fill_placeholders(mut path: String) -> String {
     while let Some(start) = path.find('{') {
         let Some(end) = path[start..].find('}') else {
             break;
@@ -193,18 +320,20 @@ fn materialize_path(tmpl: &str, params: &[String]) -> String {
         let end = start + end;
         path.replace_range(start..=end, PATH_PLACEHOLDER);
     }
-    if !path.starts_with('/') {
-        path = format!("/{}", path);
-    }
     path
 }
 
+/// Resolve an origin-relative reference (`/p?q=1#f`) against the target. URL
+/// parsing splits path / query / fragment and keeps existing percent-encoding
+/// (`set_path` would encode `?` into the path, #40). The result must stay on
+/// the target origin (`//host` or `/\host` references are rejected).
 fn join_target_path(base: &Url, path: &str) -> Result<String> {
-    let mut joined = base.clone();
-    joined.set_query(None);
-    joined.set_fragment(None);
-    // Replace path; keep target origin.
-    joined.set_path(path);
+    let joined = base
+        .join(path)
+        .with_context(|| format!("Invalid path {}", path))?;
+    if joined.origin() != base.origin() {
+        anyhow::bail!("Path {} escapes the target origin", path);
+    }
     Ok(joined.to_string())
 }
 
@@ -292,6 +421,7 @@ pub fn load_paths_file(path: &str, target: &str) -> Result<(Vec<DiscoveredUrl>, 
     let base = Url::parse(target).context("Invalid scan target for --paths join")?;
 
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -306,10 +436,22 @@ pub fn load_paths_file(path: &str, target: &str) -> Result<(Vec<DiscoveredUrl>, 
             _ => ("GET".to_string(), line),
         };
         let url = if rest.starts_with("http://") || rest.starts_with("https://") {
-            rest.to_string()
+            // Same-origin scope policy as HAR import: off-target URLs are dropped.
+            match Url::parse(&fill_placeholders(rest.to_string())) {
+                Ok(u) if u.origin() == base.origin() => u.to_string(),
+                _ => {
+                    skipped += 1;
+                    continue;
+                }
+            }
         } else {
-            let concrete = materialize_path(rest, &[]);
-            join_target_path(&base, &concrete)?
+            match join_target_path(&base, &materialize_path(rest, &[])) {
+                Ok(u) => u,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            }
         };
         out.push(DiscoveredUrl::new(url, method, UrlSource::PathsFile));
     }
@@ -325,7 +467,11 @@ pub fn load_paths_file(path: &str, target: &str) -> Result<(Vec<DiscoveredUrl>, 
         "Review the imported paths for accuracy and scope.",
         "passive/paths-import",
     )
-    .with_evidence(format!("{} paths", out.len()));
+    .with_evidence(format!(
+        "{} paths ({} skipped: invalid or outside the target origin)",
+        out.len(),
+        skipped
+    ));
 
     Ok((out, finding))
 }
@@ -400,6 +546,93 @@ mod tests {
             .any(|u| u.method == "POST" && u.url.ends_with("/items")));
         assert!(urls.iter().any(|u| u.url.contains("/users/1")));
         assert!(urls.iter().all(|u| u.source == UrlSource::PathsFile));
+    }
+
+    #[test]
+    fn paths_file_keeps_query_fragment_and_scope() {
+        let p = std::env::temp_dir().join(format!("rz-paths-{}.txt", crate::types::uuid_v4()));
+        std::fs::write(
+            &p,
+            "GET /items?search=probe\n\
+             /multi?x=1&x=2&empty=\n\
+             /enc?q=a%26b%3Dc\n\
+             /frag?k=v#sec?not=query\n\
+             PUT /users/{id}?v={v}\n\
+             https://api.example.com/abs?a=1\n\
+             https://evil.example.net/abs?a=1\n\
+             //evil.example.net/x\n\
+             /\\evil.example.net/x\n",
+        )
+        .expect("write");
+        let (urls, finding) =
+            load_paths_file(p.to_str().unwrap(), "https://api.example.com/base?old=1")
+                .expect("load");
+        std::fs::remove_file(&p).ok();
+
+        let got: Vec<&str> = urls.iter().map(|u| u.url.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "https://api.example.com/items?search=probe",
+                "https://api.example.com/multi?x=1&x=2&empty=",
+                "https://api.example.com/enc?q=a%26b%3Dc",
+                "https://api.example.com/frag?k=v#sec?not=query",
+                "https://api.example.com/users/1?v=1",
+                "https://api.example.com/abs?a=1",
+            ]
+        );
+        assert_eq!(urls[0].parameters, vec!["search".to_string()]);
+        assert_eq!(urls[4].method, "PUT");
+        assert!(finding
+            .evidence
+            .as_deref()
+            .unwrap_or("")
+            .contains("3 skipped"));
+    }
+
+    #[test]
+    fn synthesizes_schema_valid_json_body() {
+        let spec = r##"{
+          "openapi": "3.0.0",
+          "paths": {"/orders": {"post": {"requestBody": {"$ref": "#/components/requestBodies/Order"}}}},
+          "components": {
+            "requestBodies": {"Order": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/Order"}}}}},
+            "schemas": {
+              "Order": {
+                "type": "object",
+                "required": ["customer", "qty"],
+                "properties": {
+                  "customer": {"$ref": "#/components/schemas/Customer"},
+                  "qty": {"type": "integer", "minimum": 3},
+                  "status": {"type": "string", "enum": ["open", "closed"]},
+                  "tags": {"type": "array", "items": {"type": "string"}},
+                  "child": {"$ref": "#/components/schemas/Order"}
+                }
+              },
+              "Customer": {
+                "type": "object",
+                "properties": {"email": {"type": "string", "format": "email"}, "id": {"type": "string", "format": "uuid"}}
+              }
+            }
+          }
+        }"##;
+        let (urls, _) = parse_openapi_json(spec, "https://api.example.com").expect("parse");
+        let op = &urls[0];
+        assert_eq!(op.content_type.as_deref(), Some("application/json"));
+        let body: Value = serde_json::from_str(op.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["qty"], 3);
+        assert_eq!(body["status"], "open");
+        assert_eq!(body["customer"]["email"], "test@example.com");
+        assert_eq!(body["tags"], serde_json::json!(["test"]));
+        // Recursive `$ref` terminates; deep levels keep only required fields.
+        let mut depth = 0;
+        let mut cur = &body;
+        while let Some(next) = cur.get("child") {
+            cur = next;
+            depth += 1;
+        }
+        assert!(depth <= SCHEMA_MAX_DEPTH);
+        assert!(cur.get("customer").is_some() && cur.get("qty").is_some());
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub struct ScanCollected {
     pub discovered: Vec<DiscoveredUrl>,
     pub findings: Vec<Finding>,
     pub modules: Vec<ModuleSummary>,
+    /// Endpoint × plugin execution records and scan status (#41).
+    pub coverage: crate::coverage::Coverage,
 }
 
 /// Full scan configuration
@@ -58,8 +60,14 @@ pub struct ScanConfig {
     pub active_all_paths: bool,
     /// Opt-in: run passive checks on non-GET discovered requests too.
     pub passive_all_methods: bool,
+    /// Opt-in: offline HS256 weak-secret dictionary check in the JWT pass.
+    pub jwt_crack: bool,
     /// Do-no-harm / attack-mode / RPS policy for active HTTP.
     pub safety: crate::safety::SafetyPolicy,
+    /// Opt-in headless-browser discovery (`--browser-discovery`); `None` = off.
+    pub browser_discovery: Option<crate::browser_discovery::BrowserDiscoveryConfig>,
+    /// Opt-in multi-identity BOLA / authz-matrix checks (`--auth-a/--auth-b`, `--authz-matrix`).
+    pub authz: crate::active::authz::AuthzOptions,
 }
 
 /// Shared HTTP client factory
@@ -156,6 +164,17 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         let urls = crate::har::load_har_file(har_path, &config.target_url)?;
         merge_discovered(&mut discovered, urls);
     }
+    if let Some(ref bd) = config.browser_discovery {
+        let (urls, info) = crate::browser_discovery::discover(
+            bd,
+            &config.target_url,
+            &discovered,
+            config.insecure,
+        )
+        .await;
+        crate::browser_discovery::merge(&mut discovered, urls);
+        findings.lock().await.push(info);
+    }
     if let Some(ref pf) = config.paths_file {
         let (urls, info) = crate::openapi::load_paths_file(pf, &config.target_url)?;
         merge_discovered(&mut discovered, urls);
@@ -186,6 +205,7 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
     }
 
     let mut active_module_names: Vec<String> = Vec::new();
+    let mut coverage_records = Vec::new();
     if !config.passive_only {
         let active_pb = ProgressBar::with_draw_target(
             Some(discovered.len() as u64),
@@ -200,9 +220,14 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         );
         active_module_names = active_scanner.enabled_module_names();
         let af = active_scanner.scan_all(&discovered, &active_pb).await?;
+        coverage_records.extend(active_scanner.take_coverage());
         active_pb.finish();
         let mut f = findings.lock().await;
         f.extend(af);
+    }
+    if !config.passive_only && config.authz.is_enabled() {
+        let af = crate::active::authz::run(&config.authz, &config, &discovered).await?;
+        findings.lock().await.extend(af);
     }
 
     // Opt-in Nuclei (never default-on).
@@ -220,13 +245,37 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
     let hosts = unique_hosts(&discovered);
     let mut intel_enabled = false;
     if !hosts.is_empty() {
-        let tls_findings = crate::tls::check_hosts(&hosts).await;
+        let (tls_findings, tls_records) = crate::tls::check_hosts_with_coverage(&hosts).await;
+        coverage_records.extend(tls_records);
         let intel_cfg = crate::intel::IntelConfig::from_env();
         intel_enabled = intel_cfg.is_enabled();
         let intel_findings = crate::intel::enrich_hosts(&intel_cfg, &hosts).await;
         let mut f = findings.lock().await;
         f.extend(tls_findings);
         f.extend(intel_findings);
+    }
+
+    // JWT pass: bearer tokens from --auth plus Authorization/Set-Cookie in
+    // cached response headers. Offline-only; the HS256 crack is opt-in.
+    {
+        let header_values: Vec<String> = response_cache
+            .all_headers()
+            .await
+            .into_iter()
+            .flat_map(|hs| {
+                hs.into_iter().filter_map(|(k, v)| {
+                    let kl = k.to_ascii_lowercase();
+                    (kl == "authorization" || kl == "set-cookie").then_some(v)
+                })
+            })
+            .collect();
+        let jwt_findings = crate::jwt::scan(
+            config.auth_header.as_deref(),
+            &header_values,
+            config.jwt_crack,
+            &config.target_url,
+        );
+        findings.lock().await.extend(jwt_findings);
     }
 
     let all_findings = findings.lock().await.clone();
@@ -243,6 +292,7 @@ pub async fn collect_scan(config: ScanConfig) -> Result<ScanCollected> {
         discovered,
         findings: all_findings,
         modules,
+        coverage: crate::coverage::Coverage::new(coverage_records, Vec::new()),
     })
 }
 
@@ -290,14 +340,23 @@ pub async fn run_scan(config: ScanConfig) -> Result<Report> {
 
     print_summary(&collected.discovered, &collected.findings, elapsed);
     print_module_summary_from_modules(&collected.modules);
-
-    let report = Report::new(
-        &config.target_url,
-        collected.modules,
-        collected.discovered.clone(),
-        collected.findings,
-        elapsed,
+    println!(
+        "{} {}",
+        "▶ Coverage:".bright_white().bold(),
+        collected.coverage.summary_line()
     );
+
+    let report = with_evidence_context(
+        Report::new(
+            &config.target_url,
+            collected.modules,
+            collected.discovered.clone(),
+            collected.findings,
+            elapsed,
+        ),
+        &config,
+    )
+    .with_coverage(collected.coverage);
 
     if config.output_file.ends_with(".sarif") {
         crate::sarif::write_sarif(&report, &config.output_file)?;
@@ -429,6 +488,22 @@ pub async fn run_scan_with_events(
             }
         }
     }
+    if let Some(ref bd) = config.browser_discovery {
+        let (urls, info) = crate::browser_discovery::discover(
+            bd,
+            &config.target_url,
+            &discovered,
+            config.insecure,
+        )
+        .await;
+        let _ = tx.send(ScanEvent::Log(format!(
+            "Browser discovery observed {} request(s)",
+            urls.len()
+        )));
+        crate::browser_discovery::merge(&mut discovered, urls);
+        let _ = tx.send(ScanEvent::Finding(Box::new(info.clone())));
+        import_findings.push(info);
+    }
     if let Some(ref pf) = config.paths_file {
         match crate::openapi::load_paths_file(pf, &config.target_url) {
             Ok((urls, info)) => {
@@ -497,6 +572,7 @@ pub async fn run_scan_with_events(
     let mut all_findings = import_findings;
     all_findings.extend(passive_findings);
     let mut active_module_names: Vec<String> = Vec::new();
+    let mut coverage_records = Vec::new();
     let mut transport_ran = false;
     let mut intel_enabled = false;
     let mut nuclei_ran = false;
@@ -537,6 +613,7 @@ pub async fn run_scan_with_events(
         );
         active_module_names = active_scanner.enabled_module_names();
         let active_findings = active_scanner.scan_all(&discovered, &active_pb).await?;
+        coverage_records.extend(active_scanner.take_coverage());
         active_pb.finish();
         let _ = active_tick.await;
 
@@ -586,7 +663,8 @@ pub async fn run_scan_with_events(
     let hosts = unique_hosts(&discovered);
     if !hosts.is_empty() {
         transport_ran = true;
-        let tls_findings = crate::tls::check_hosts(&hosts).await;
+        let (tls_findings, tls_records) = crate::tls::check_hosts_with_coverage(&hosts).await;
+        coverage_records.extend(tls_records);
         let intel_cfg = crate::intel::IntelConfig::from_env();
         intel_enabled = intel_cfg.is_enabled();
         let intel_findings = crate::intel::enrich_hosts(&intel_cfg, &hosts).await;
@@ -616,13 +694,17 @@ pub async fn run_scan_with_events(
         openapi_imported,
         nuclei_ran,
     );
-    let report = Report::new(
-        &config.target_url,
-        modules,
-        discovered.clone(),
-        all_findings,
-        elapsed,
-    );
+    let report = with_evidence_context(
+        Report::new(
+            &config.target_url,
+            modules,
+            discovered.clone(),
+            all_findings,
+            elapsed,
+        ),
+        &config,
+    )
+    .with_coverage(crate::coverage::Coverage::new(coverage_records, Vec::new()));
 
     let total_findings = report.summary.total_findings;
     let risk_score = report.summary.risk_score;
@@ -651,6 +733,32 @@ pub async fn run_scan_with_events(
     });
 
     Ok(())
+}
+
+/// Evidence contract (issue #49): the scan's identity role on each finding and
+/// the run's known coverage limitations on the report.
+fn with_evidence_context(mut report: Report, config: &ScanConfig) -> Report {
+    let authenticated = config.cookies.is_some()
+        || config.auth_header.is_some()
+        || config.api_key.is_some()
+        || config.basic_auth.is_some();
+    let role = if authenticated {
+        "authenticated"
+    } else {
+        "anonymous"
+    };
+    for f in &mut report.findings {
+        f.identity_role.get_or_insert_with(|| role.to_string());
+    }
+    report
+        .meta
+        .coverage_limitations
+        .push(if config.passive_only {
+            "active checks disabled (--passive-only)".to_string()
+        } else {
+            "active checks only probe URLs with query parameters".to_string()
+        });
+    report
 }
 
 fn print_summary(urls: &[DiscoveredUrl], findings: &[Finding], elapsed: std::time::Duration) {

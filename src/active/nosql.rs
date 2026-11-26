@@ -8,7 +8,10 @@
 use async_trait::async_trait;
 use url::Url;
 
-use crate::active::{get_response_body, ScanPlugin};
+use crate::active::{
+    get_response_body, has_json_body, json_body_variants, send_injection_point, InjectionPoint,
+    ScanPlugin,
+};
 use crate::types::{DiscoveredUrl, Finding, Severity};
 use crate::verify::body_similarity;
 
@@ -46,6 +49,7 @@ impl ScanPlugin for NoSqlInjectionPlugin {
             return findings;
         };
 
+        findings.extend(scan_json_body(client, target).await);
         if parsed.query().is_none() {
             return findings;
         }
@@ -184,6 +188,71 @@ impl ScanPlugin for NoSqlInjectionPlugin {
 
         findings
     }
+}
+
+/// JSON request bodies (OpenAPI/HAR): swap each string field for `{"$ne": null}`
+/// and apply the same baseline + benign-control evidence model as query params.
+async fn scan_json_body(client: &reqwest::Client, target: &DiscoveredUrl) -> Vec<Finding> {
+    let mut out = Vec::new();
+    if !has_json_body(target) {
+        return out;
+    }
+    let body = target.body.as_deref().unwrap_or_default();
+    let point = |b: String| InjectionPoint {
+        param: String::new(),
+        method: target.method.clone(),
+        url: target.url.clone(),
+        body: Some(b),
+    };
+    let Some((base_status, base_body)) =
+        send_injection_point(client, &point(body.to_string())).await
+    else {
+        return out;
+    };
+    let controls = json_body_variants(body, &serde_json::json!("rustzap_nonexistent_val"));
+    let tests = json_body_variants(body, &serde_json::json!({"$ne": null}));
+    // Same traversal of the same document, so the two lists line up field by field.
+    for ((field, control), (_, test)) in controls.into_iter().zip(tests) {
+        let (control_status, control_body) = send_injection_point(client, &point(control))
+            .await
+            .unwrap_or((0, String::new()));
+        let Some((test_status, test_body)) = send_injection_point(client, &point(test)).await
+        else {
+            continue;
+        };
+        if operator_bypass_confirmed(
+            base_status,
+            &base_body,
+            control_status,
+            &control_body,
+            test_status,
+            &test_body,
+        ) {
+            out.push(
+                Finding::new(
+                    "NoSQL / MongoDB Operator Injection",
+                    Severity::High,
+                    &target.url,
+                    format!(
+                        "JSON body field `{field}` is vulnerable to NoSQL operator injection: replacing it with `{{\"$ne\": null}}` broadened the result set versus a benign non-matching control."
+                    ),
+                    "Validate request bodies against a strict schema and cast filter values to primitives before building NoSQL queries.",
+                    "active/nosql-operator",
+                )
+                .with_parameter(format!("body.{field}"))
+                .with_evidence(format!(
+                    "{} body.{field}={{\"$ne\":null}} → HTTP {test_status} ({}B); benign control → HTTP {control_status} ({}B)",
+                    target.method,
+                    test_body.len(),
+                    control_body.len()
+                ))
+                .with_cwe(943)
+                .with_owasp("A03:2021 – Injection"),
+            );
+            break;
+        }
+    }
+    out
 }
 
 /// Decide whether an operator-injection response is a genuine bypass.

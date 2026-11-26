@@ -57,6 +57,15 @@ enum Commands {
         cookies: Option<String>,
         #[arg(long)]
         auth: Option<String>,
+        /// Opt-in two-identity BOLA/privesc: Authorization value for identity A (low privilege / attacker)
+        #[arg(long, requires = "auth_b")]
+        auth_a: Option<String>,
+        /// Authorization value for identity B (victim / higher privilege); used with --auth-a
+        #[arg(long, requires = "auth_a")]
+        auth_b: Option<String>,
+        /// Opt-in ownership/role matrix (JSON or YAML) of identities, objects and allowed operations
+        #[arg(long, value_name = "FILE")]
+        authz_matrix: Option<String>,
         #[arg(long)]
         api_key: Option<String>,
         #[arg(long)]
@@ -95,6 +104,9 @@ enum Commands {
         /// Opt-in: run passive checks on non-GET discovered requests too
         #[arg(long)]
         passive_all_methods: bool,
+        /// Opt-in: offline HS256 weak-secret dictionary check on observed JWTs (no network)
+        #[arg(long)]
+        jwt_crack: bool,
         /// Block mutating HTTP verbs (POST/PUT/DELETE/PATCH) during active scan
         #[arg(long)]
         read_only_safe: bool,
@@ -104,6 +116,30 @@ enum Commands {
         /// Exit with non-zero status code if findings at or above this severity are detected (info, low, medium, high, critical)
         #[arg(long, value_name = "SEVERITY")]
         fail_on: Option<String>,
+        #[command(flatten)]
+        browser: rustzap::browser_discovery::BrowserDiscoveryArgs,
+    },
+
+    /// Opt-in, state-changing auth-lifecycle checks (reset/change/refresh/logout)
+    /// against an operator-owned SYNTHETIC account described by a scenario file.
+    /// The scenario must declare `synthetic_identity.synthetic: true` and
+    /// `mutation_scope.acknowledge_state_changes: true`; refused under --read-only-safe.
+    AuthLifecycle {
+        /// YAML/JSON scenario: steps, extraction, success predicates, expected policy
+        #[arg(long, value_name = "FILE")]
+        auth_scenario: String,
+        #[arg(short, long, default_value = "auth-lifecycle-report.json")]
+        output: String,
+        #[arg(long, default_value = "10")]
+        timeout: u64,
+        #[arg(long)]
+        insecure: bool,
+        /// Refuses to run (the scenario mutates account state)
+        #[arg(long)]
+        read_only_safe: bool,
+        /// Cap outbound HTTP requests per second (0 = unlimited). Default 50.
+        #[arg(long)]
+        max_rps: Option<u32>,
     },
 
     /// Run spider only
@@ -681,6 +717,9 @@ async fn run() -> anyhow::Result<()> {
             user_agent,
             cookies,
             auth,
+            auth_a,
+            auth_b,
+            authz_matrix,
             api_key,
             basic_auth,
             insecure,
@@ -694,10 +733,12 @@ async fn run() -> anyhow::Result<()> {
             nuclei_jsonl,
             active_all_paths,
             passive_all_methods,
+            jwt_crack,
             attack,
             read_only_safe,
             max_rps,
             fail_on,
+            browser,
         } => {
             if attack && !read_only_safe {
                 safety::print_attack_mode_warning(&target);
@@ -726,7 +767,14 @@ async fn run() -> anyhow::Result<()> {
                 nuclei_jsonl,
                 active_all_paths,
                 passive_all_methods,
+                jwt_crack,
                 safety: safety::SafetyPolicy::from_flags(attack, read_only_safe, max_rps),
+                browser_discovery: browser.into_config()?,
+                authz: active::authz::AuthzOptions {
+                    auth_a,
+                    auth_b,
+                    matrix: authz_matrix,
+                },
             };
             let report = scanner::run_scan(config).await?;
 
@@ -750,6 +798,19 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("Warning: unknown --fail-on severity value '{fail_severity}'");
                 }
             }
+        }
+
+        Commands::AuthLifecycle {
+            auth_scenario,
+            output,
+            timeout,
+            insecure,
+            read_only_safe,
+            max_rps,
+        } => {
+            let policy = safety::SafetyPolicy::from_flags(false, read_only_safe, max_rps);
+            active::auth_lifecycle::run_cli(&auth_scenario, policy, insecure, timeout, &output)
+                .await?;
         }
 
         Commands::Spider {

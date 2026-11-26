@@ -14,7 +14,7 @@ use crate::analyze::inventory::{
 use crate::analyze::native::SOURCE_TOOL;
 use crate::types::{CodeLocation, Finding, Severity};
 
-const MAX_CONFIG_FINDINGS: usize = 100;
+pub(crate) const MAX_CONFIG_FINDINGS: usize = 100;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ConfigKind {

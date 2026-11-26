@@ -15,7 +15,7 @@ use crate::analyze::inventory::{
 use crate::analyze::native::SOURCE_TOOL;
 use crate::types::{CodeLocation, Finding, Severity};
 
-const MAX_SECRET_FINDINGS: usize = 100;
+pub(crate) const MAX_SECRET_FINDINGS: usize = 100;
 
 struct SecretPatterns {
     rules: Vec<(&'static str, Regex)>,

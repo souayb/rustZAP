@@ -13,22 +13,38 @@
 //! - `transport/tls-self-signed` Low when issuer == subject
 //! - `transport/tls-hostname-mismatch` Medium when host not in SAN (stub:
 //!   exact match against DNS SANs only; wildcard support is limited)
+//! - `transport/tls-untrusted-chain` Medium when the chain does not build to a
+//!   Mozilla (webpki-roots) trust anchor
+//! - `transport/tls-inconclusive` Info whenever a check could not be decided:
+//!   failed probe, masked chain trust, and legacy TLS 1.0/1.1 acceptance
+//!   (rustls cannot offer those versions, so that check is always inconclusive)
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
 use rustls::crypto::{ring, verify_tls12_signature, verify_tls13_signature, CryptoProvider};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::pki_types::{CertificateDer, Der, ServerName, TrustAnchor, UnixTime};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::warn;
 use x509_parser::prelude::*;
 
-use crate::types::{Finding, Severity};
+use crate::types::{Confidence, Finding, Severity};
+
+/// Outcome of validating the peer chain against the Mozilla root set.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChainTrust {
+    Trusted,
+    Untrusted(String),
+    Inconclusive(String),
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // `port`, `issuer`, `not_before` are part of the public summary surface.
@@ -42,42 +58,99 @@ pub struct TlsSummary {
     pub signature_algorithm: String,
     pub subject_alt_names: Vec<String>,
     pub self_signed: bool,
+    /// Negotiated protocol (e.g. `TLSv1_3`), when the handshake reported one.
+    pub protocol_version: Option<String>,
+    pub chain_trust: ChainTrust,
 }
 
 /// Open a TCP+TLS connection to `host:port` and return a summary of the
-/// peer leaf certificate. Returns `None` on any network or parse error —
-/// TLS probes are best-effort, and any host that doesn't respond is silently
-/// dropped from reporting.
-pub async fn probe_tls(host: &str, port: u16) -> Option<TlsSummary> {
+/// peer leaf certificate. `Err` carries the reason the probe failed, which
+/// callers report as an inconclusive result.
+pub async fn probe_tls(host: &str, port: u16) -> Result<TlsSummary, String> {
     // Explicit provider: does not depend on a process-wide default being installed.
     let provider = Arc::new(ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .ok()?
+        .map_err(|e| format!("TLS config: {e}"))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier(provider)))
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyVerifier(provider.clone())))
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(host.to_string()).ok()?;
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|e| format!("invalid server name: {e}"))?;
 
     let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host, port)))
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| "TCP connect timed out".to_string())?
+        .map_err(|e| format!("TCP connect failed: {e}"))?;
 
-    let mut tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
-        .await
-        .ok()?
-        .ok()?;
+    let mut tls = tokio::time::timeout(
+        Duration::from_secs(5),
+        connector.connect(server_name.clone(), tcp),
+    )
+    .await
+    .map_err(|_| "TLS handshake timed out".to_string())?
+    .map_err(|e| format!("TLS handshake failed: {e}"))?;
 
     // The handshake completes during `connect`, so peer_certificates() is
     // already populated. We still issue a clean shutdown to be polite.
     let (_, conn) = tls.get_ref();
+    let protocol_version = conn.protocol_version().map(|v| format!("{v:?}"));
     let summary = conn
         .peer_certificates()
-        .and_then(|chain| summarize_chain(host, port, chain));
+        .ok_or_else(|| "server sent no certificate".to_string())
+        .and_then(|chain| {
+            let mut s = summarize_chain(host, port, chain)
+                .ok_or_else(|| "could not parse leaf certificate".to_string())?;
+            s.chain_trust = evaluate_chain_trust(provider, &server_name, chain, UnixTime::now());
+            s.protocol_version = protocol_version;
+            Ok(s)
+        });
     let _ = tls.shutdown().await;
     summary
+}
+
+/// Validate `chain` against the Mozilla root set. Name and expiry are
+/// reported by their own checks, so only path-building failures count as
+/// untrusted; errors that mask path building are inconclusive.
+pub fn evaluate_chain_trust(
+    provider: Arc<CryptoProvider>,
+    server_name: &ServerName<'_>,
+    chain: &[CertificateDer<'_>],
+    now: UnixTime,
+) -> ChainTrust {
+    let Some((leaf, intermediates)) = chain.split_first() else {
+        return ChainTrust::Inconclusive("server sent no certificates".into());
+    };
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .map(|ta| TrustAnchor {
+                subject: Der::from_slice(ta.subject),
+                subject_public_key_info: Der::from_slice(ta.spki),
+                name_constraints: ta.name_constraints.map(Der::from_slice),
+            })
+            .collect(),
+    };
+    let verifier =
+        match WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build() {
+            Ok(v) => v,
+            Err(e) => return ChainTrust::Inconclusive(format!("verifier setup failed: {e}")),
+        };
+    match verifier.verify_server_cert(leaf, intermediates, server_name, &[], now) {
+        Ok(_) => ChainTrust::Trusted,
+        Err(rustls::Error::InvalidCertificate(e)) => match e {
+            // rustls checks the name only after the path to a root was built.
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+                ChainTrust::Trusted
+            }
+            CertificateError::UnknownIssuer | CertificateError::BadSignature => {
+                ChainTrust::Untrusted(format!("{e:?}"))
+            }
+            other => ChainTrust::Inconclusive(format!("chain trust masked by {other:?}")),
+        },
+        Err(e) => ChainTrust::Inconclusive(e.to_string()),
+    }
 }
 
 /// Parse the first cert in `chain` (the leaf) into a `TlsSummary`.
@@ -123,6 +196,8 @@ fn summarize_chain(host: &str, port: u16, chain: &[CertificateDer<'_>]) -> Optio
         signature_algorithm,
         subject_alt_names,
         self_signed,
+        protocol_version: None,
+        chain_trust: ChainTrust::Inconclusive("not evaluated".into()),
     })
 }
 
@@ -135,27 +210,78 @@ pub fn known_plugin_names() -> &'static [&'static str] {
         "transport/tls-weak-signature",
         "transport/tls-self-signed",
         "transport/tls-hostname-mismatch",
+        "transport/tls-untrusted-chain",
+        "transport/tls-inconclusive",
     ]
+}
+
+/// Explicit "could not decide" result for one TLS check on `host`.
+pub fn inconclusive_finding(host: &str, check: &str, reason: &str) -> Finding {
+    Finding::new(
+        "TLS Check Inconclusive",
+        Severity::Info,
+        format!("https://{host}"),
+        format!("The TLS `{check}` check for {host} is inconclusive: {reason}."),
+        "Verify manually (e.g. `openssl s_client` / testssl.sh) against an authorized target.",
+        "transport/tls-inconclusive",
+    )
+    .with_parameter(check)
+    .with_evidence(reason.to_string())
+    .with_confidence(Confidence::Tentative)
 }
 
 /// Probe each unique host in `hosts` (port 443) and convert into findings.
 pub async fn check_hosts(hosts: &[String]) -> Vec<Finding> {
+    check_hosts_with_coverage(hosts).await.0
+}
+
+/// Like [`check_hosts`], plus one execution record per host so a failed probe
+/// is reported as an `error`, not as a clean certificate evaluation (#41).
+pub async fn check_hosts_with_coverage(
+    hosts: &[String],
+) -> (Vec<Finding>, Vec<crate::coverage::ExecutionRecord>) {
+    use crate::coverage::{ExecutionRecord, Outcome};
     let mut seen = std::collections::HashSet::new();
     let mut findings = Vec::new();
+    let mut records = Vec::new();
     for host in hosts {
         if !seen.insert(host.clone()) {
             continue;
         }
-        match probe_tls(host, 443).await {
-            Some(summary) => {
-                findings.extend(evaluate_tls_summary(&summary, Utc::now()));
+        let (outcome, completed, reason) = match probe_tls(host, 443).await {
+            Ok(summary) => {
+                let f = evaluate_tls_summary(&summary, Utc::now());
+                // Inconclusive notes (e.g. legacy-protocol check) are not findings.
+                let outcome = if f.iter().all(|x| x.plugin == "transport/tls-inconclusive") {
+                    Outcome::CompletedNoFinding
+                } else {
+                    Outcome::Finding
+                };
+                findings.extend(f);
+                (outcome, 1, String::new())
             }
-            None => {
-                warn!("TLS probe failed for {}", host);
+            Err(reason) => {
+                warn!("TLS probe failed for {}: {}", host, reason);
+                findings.push(inconclusive_finding(host, "probe", &reason));
+                (
+                    Outcome::Error,
+                    0,
+                    format!("TLS probe failed ({reason}); certificate was NOT evaluated"),
+                )
             }
-        }
+        };
+        records.push(ExecutionRecord {
+            endpoint: format!("{host}:443"),
+            method: "TLS".to_string(),
+            plugin: "transport/tls".to_string(),
+            identity: None,
+            requests_attempted: 1,
+            requests_completed: completed,
+            outcome,
+            reason,
+        });
     }
-    findings
+    (findings, records)
 }
 
 /// Pure evaluator — separated for unit testing.
@@ -254,6 +380,40 @@ pub fn evaluate_tls_summary(summary: &TlsSummary, now: DateTime<Utc>) -> Vec<Fin
         );
     }
 
+    // Chain trust.
+    match &summary.chain_trust {
+        ChainTrust::Trusted => {}
+        ChainTrust::Untrusted(reason) => findings.push(
+            Finding::new(
+                "Untrusted TLS Certificate Chain",
+                Severity::Medium,
+                &target,
+                format!(
+                    "The certificate chain for {} does not build to a trusted public root.",
+                    summary.host
+                ),
+                "Serve the full intermediate chain from a publicly trusted CA.",
+                "transport/tls-untrusted-chain",
+            )
+            .with_evidence(reason.clone())
+            .with_cwe(295)
+            .with_owasp("A02:2021 – Cryptographic Failures"),
+        ),
+        ChainTrust::Inconclusive(reason) => {
+            findings.push(inconclusive_finding(&summary.host, "chain-trust", reason))
+        }
+    }
+
+    // Legacy protocol acceptance: rustls only speaks TLS 1.2/1.3.
+    findings.push(inconclusive_finding(
+        &summary.host,
+        "legacy-protocols",
+        &format!(
+            "TLS 1.0/1.1 acceptance not tested (rustls cannot offer those versions); negotiated {}",
+            summary.protocol_version.as_deref().unwrap_or("unknown")
+        ),
+    ));
+
     findings
 }
 
@@ -343,7 +503,70 @@ mod tests {
             signature_algorithm: "1.2.840.113549.1.1.11".into(), // SHA-256 with RSA
             subject_alt_names: sans.into_iter().map(String::from).collect(),
             self_signed: false,
+            protocol_version: Some("TLSv1_3".into()),
+            chain_trust: ChainTrust::Trusted,
         }
+    }
+
+    fn non_inconclusive(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|f| f.plugin != "transport/tls-inconclusive")
+            .collect()
+    }
+
+    #[test]
+    fn legacy_protocol_check_is_explicitly_inconclusive() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let findings = evaluate_tls_summary(&sample("example.com", vec!["example.com"]), now);
+        let f = findings
+            .iter()
+            .find(|f| f.parameter.as_deref() == Some("legacy-protocols"))
+            .expect("legacy inconclusive");
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.description.contains("inconclusive"));
+        assert!(f.evidence.as_deref().unwrap().contains("TLSv1_3"));
+    }
+
+    #[test]
+    fn untrusted_and_inconclusive_chain_are_reported() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let mut s = sample("example.com", vec!["example.com"]);
+        s.chain_trust = ChainTrust::Untrusted("UnknownIssuer".into());
+        let f = evaluate_tls_summary(&s, now);
+        assert!(f
+            .iter()
+            .any(|f| f.plugin == "transport/tls-untrusted-chain"));
+        s.chain_trust = ChainTrust::Inconclusive("chain trust masked by Expired".into());
+        let f = evaluate_tls_summary(&s, now);
+        assert!(f
+            .iter()
+            .any(|f| f.parameter.as_deref() == Some("chain-trust")
+                && f.plugin == "transport/tls-inconclusive"));
+    }
+
+    #[test]
+    fn chain_trust_is_inconclusive_for_empty_or_garbage_chain() {
+        let provider = Arc::new(ring::default_provider());
+        let name = ServerName::try_from("example.com").unwrap();
+        assert!(matches!(
+            evaluate_chain_trust(provider.clone(), &name, &[], UnixTime::now()),
+            ChainTrust::Inconclusive(_)
+        ));
+        let junk = CertificateDer::from(vec![0u8; 8]);
+        assert!(!matches!(
+            evaluate_chain_trust(provider, &name, &[junk], UnixTime::now()),
+            ChainTrust::Trusted
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_probe_yields_inconclusive_reason() {
+        // Port 1 on loopback is closed in CI; the probe must fail with a reason.
+        let err = probe_tls("127.0.0.1", 1).await.expect_err("closed port");
+        assert!(!err.is_empty());
+        let f = inconclusive_finding("127.0.0.1", "probe", &err);
+        assert_eq!(f.plugin, "transport/tls-inconclusive");
     }
 
     #[test]
@@ -410,6 +633,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let s = sample("example.com", vec!["example.com"]);
         let findings = evaluate_tls_summary(&s, now);
-        assert!(findings.is_empty(), "got: {:?}", findings);
+        let real = non_inconclusive(&findings);
+        assert!(real.is_empty(), "got: {:?}", real);
     }
 }

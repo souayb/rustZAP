@@ -125,7 +125,7 @@ pub fn export_findings(
                  // Apply the solution guideline from the finding manually.\n"
             )
         });
-        let prompt = generate_patch_prompt(f, path, &code);
+        let prompt = generate_patch_prompt(&crate::evidence::export_finding(f), path, &code);
         let file_path = out_dir.join(format!("{}.md", f.id));
         fs::write(&file_path, prompt)?;
         written.push(file_path.display().to_string());

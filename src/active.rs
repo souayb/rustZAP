@@ -13,6 +13,8 @@ use url::Url;
 use crate::safety::{HttpSafetyGate, SafetyPolicy};
 use crate::types::{DiscoveredUrl, Finding, Severity};
 
+pub mod auth_lifecycle;
+pub mod authz;
 pub mod bola;
 pub mod cors;
 pub mod graphql_advanced;
@@ -39,7 +41,7 @@ fn clear_active_gate() {
     }
 }
 
-fn active_gate() -> Option<Arc<HttpSafetyGate>> {
+pub(crate) fn active_gate() -> Option<Arc<HttpSafetyGate>> {
     ACTIVE_GATE.lock().ok().and_then(|g| g.clone())
 }
 
@@ -80,6 +82,8 @@ pub struct ActiveScanner {
     /// When true, run plugins on URLs without query parameters too.
     all_paths: bool,
     gate: Arc<HttpSafetyGate>,
+    /// Per endpoint × plugin execution records from the last `scan_all` (#41).
+    coverage: std::sync::Mutex<Vec<crate::coverage::ExecutionRecord>>,
 }
 
 /// Every active plugin RustZAP ships, freshly constructed. Single source of
@@ -153,7 +157,16 @@ impl ActiveScanner {
             concurrency: concurrency.max(1),
             all_paths,
             gate: HttpSafetyGate::shared(safety),
+            coverage: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Drain the execution records collected by the last `scan_all`.
+    pub fn take_coverage(&self) -> Vec<crate::coverage::ExecutionRecord> {
+        self.coverage
+            .lock()
+            .map(|mut c| std::mem::take(&mut *c))
+            .unwrap_or_default()
     }
 
     /// Plugin ids (as they appear on `Finding::plugin`) for every plugin
@@ -173,10 +186,26 @@ impl ActiveScanner {
 
         let mut tasks = Vec::new();
         let mut remaining = vec![0usize; urls.len()];
+        let mut records = Vec::new();
         for (url_idx, du) in urls.iter().enumerate() {
-            let has_params = self.all_paths || !du.parameters.is_empty() || du.url.contains('?');
+            // JSON-body requests (OpenAPI/HAR) carry their own injection surface.
+            let has_params = self.all_paths
+                || !du.parameters.is_empty()
+                || du.url.contains('?')
+                || has_json_body(du);
             for (idx, plugin) in self.plugins.iter().enumerate() {
                 if !has_params && !plugin.always_run() {
+                    records.push(crate::coverage::ExecutionRecord {
+                        endpoint: du.url.clone(),
+                        method: du.method.clone(),
+                        plugin: format!("active/{}", plugin.name()),
+                        identity: None,
+                        requests_attempted: 0,
+                        requests_completed: 0,
+                        outcome: crate::coverage::Outcome::Skipped,
+                        reason: "URL has no query parameters; pass --all-paths to test it"
+                            .to_string(),
+                    });
                     continue;
                 }
                 remaining[url_idx] += 1;
@@ -212,7 +241,14 @@ impl ActiveScanner {
                 async move {
                     let plugin = plugins_ref[plugin_idx];
                     debug!("Running {} on {}", plugin.name(), du.url);
-                    let findings = plugin.scan(&client, &du).await;
+                    let (findings, counters) =
+                        crate::coverage::with_counters(plugin.scan(&client, &du)).await;
+                    let record = counters.record(
+                        &du.url,
+                        &du.method,
+                        &format!("active/{}", plugin.name()),
+                        !findings.is_empty(),
+                    );
                     if !findings.is_empty() {
                         for f in &findings {
                             let tag = if f.poc_validated {
@@ -239,13 +275,21 @@ impl ActiveScanner {
                         let preview = crate::types::safe_truncate(&du.url, 50);
                         pb.set_message(format!("Scanning {preview}"));
                     }
-                    findings
+                    (findings, record)
                 }
             })
             .buffer_unordered(self.concurrency);
 
-        let results: Vec<Vec<Finding>> = findings_stream.collect().await;
-        let mut all_findings: Vec<Finding> = results.into_iter().flatten().collect();
+        let results: Vec<(Vec<Finding>, crate::coverage::ExecutionRecord)> =
+            findings_stream.collect().await;
+        let mut all_findings: Vec<Finding> = Vec::new();
+        for (f, r) in results {
+            all_findings.extend(f);
+            records.push(r);
+        }
+        if let Ok(mut c) = self.coverage.lock() {
+            *c = records;
+        }
 
         // If the target rate-limited us, say so loudly: a 429-starved active scan
         // that found nothing must not be misread as "clean" (#21).
@@ -348,6 +392,162 @@ pub fn build_injection_urls_adv(target: &DiscoveredUrl, payload: &str) -> Vec<(S
     variants
 }
 
+/// One mutated request an injection plugin sends for a payload.
+pub struct InjectionPoint {
+    pub param: String,
+    pub method: String,
+    pub url: String,
+    /// JSON request body for body-field points; `None` means a plain GET of `url`.
+    pub body: Option<String>,
+}
+
+/// True when the target carries a JSON request body (OpenAPI / HAR import)
+/// worth fuzzing. DELETE bodies are never replayed with payloads.
+pub fn has_json_body(target: &DiscoveredUrl) -> bool {
+    target.body.is_some()
+        && !target.method.eq_ignore_ascii_case("DELETE")
+        && target
+            .content_type
+            .as_deref()
+            .is_some_and(|c| c.to_ascii_lowercase().contains("json"))
+}
+
+/// Every injection point for `payload`: query params / REST path segments
+/// (GET, as `build_injection_urls_adv`) plus each string field of a JSON
+/// request body, sent with the target's own method while the rest of the body
+/// stays schema-valid.
+pub fn injection_points(target: &DiscoveredUrl, payload: &str) -> Vec<InjectionPoint> {
+    let mut points: Vec<InjectionPoint> = build_injection_urls_adv(target, payload)
+        .into_iter()
+        .map(|(param, url)| InjectionPoint {
+            param,
+            method: "GET".to_string(),
+            url,
+            body: None,
+        })
+        .collect();
+    if has_json_body(target) {
+        let body = target.body.as_deref().unwrap_or_default();
+        let replacement = serde_json::Value::String(payload.to_string());
+        for (field, mutated) in json_body_variants(body, &replacement) {
+            points.push(InjectionPoint {
+                param: if field.is_empty() {
+                    "body".to_string()
+                } else {
+                    format!("body.{field}")
+                },
+                method: target.method.clone(),
+                url: target.url.clone(),
+                body: Some(mutated),
+            });
+        }
+    }
+    points
+}
+
+/// For each string leaf of a JSON document, a serialized copy with only that
+/// leaf replaced by `replacement`. Returns `(field_path, body)`, e.g.
+/// `("user.tags[0]", "{...}")`. Non-JSON input yields nothing.
+pub fn json_body_variants(body: &str, replacement: &serde_json::Value) -> Vec<(String, String)> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let mut leaves = Vec::new();
+    collect_string_leaves(&root, "", "", &mut leaves, 0);
+    leaves
+        .into_iter()
+        .map(|(label, ptr)| {
+            let mut v = root.clone();
+            if let Some(slot) = v.pointer_mut(&ptr) {
+                *slot = replacement.clone();
+            }
+            (label, v.to_string())
+        })
+        .collect()
+}
+
+/// Collect `(label, json_pointer)` for string leaves, bounded in depth/count.
+fn collect_string_leaves(
+    v: &serde_json::Value,
+    label: &str,
+    ptr: &str,
+    out: &mut Vec<(String, String)>,
+    depth: usize,
+) {
+    use serde_json::Value;
+    if depth > 8 || out.len() >= 64 {
+        return;
+    }
+    match v {
+        Value::String(_) => out.push((label.to_string(), ptr.to_string())),
+        Value::Object(map) => {
+            for (k, child) in map {
+                let l = if label.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{label}.{k}")
+                };
+                let p = format!("{ptr}/{}", k.replace('~', "~0").replace('/', "~1"));
+                collect_string_leaves(child, &l, &p, out, depth + 1);
+            }
+        }
+        Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                let l = format!("{label}[{i}]");
+                let p = format!("{ptr}/{i}");
+                collect_string_leaves(child, &l, &p, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Send one injection point through the active safety gate.
+pub async fn send_injection_point(
+    client: &reqwest::Client,
+    p: &InjectionPoint,
+) -> Option<(u16, String)> {
+    match &p.body {
+        None => get_response_body(client, &p.url).await,
+        Some(body) => body_response(client, &p.method, &p.url, "application/json", body).await,
+    }
+}
+
+/// Attach a curl PoC that reproduces `p` (GET, or method + JSON body).
+fn attach_point_poc(
+    finding: Finding,
+    p: &InjectionPoint,
+    canary_sent: &str,
+    canary_received: &str,
+    raw_response: String,
+    execution_time_ms: u64,
+) -> Finding {
+    let Some(body) = p.body.as_deref() else {
+        return crate::agent::poc::attach_get_poc(
+            finding,
+            &p.url,
+            canary_sent,
+            canary_received,
+            raw_response,
+            execution_time_ms,
+        );
+    };
+    let headers = [("Content-Type".to_string(), "application/json".to_string())];
+    let req = crate::agent::poc::PocHttpRequest {
+        method: &p.method,
+        url: &p.url,
+        headers: &headers,
+        body: Some(body),
+    };
+    finding.with_poc(crate::agent::poc::build_poc_proof(
+        &req,
+        canary_sent,
+        canary_received,
+        raw_response,
+        execution_time_ms,
+    ))
+}
+
 pub async fn get_body(client: &reqwest::Client, url: &str) -> Option<(u16, String)> {
     get_response_body(client, url).await
 }
@@ -417,18 +617,31 @@ async fn post_response_body(
     content_type: &str,
     body: &str,
 ) -> Option<(u16, String)> {
+    body_response(client, "POST", url, content_type, body).await
+}
+
+/// Send `body` with an arbitrary method through the active safety gate
+/// (`--read-only-safe` rejects non-GET verbs there).
+async fn body_response(
+    client: &reqwest::Client,
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &str,
+) -> Option<(u16, String)> {
     if let Some(gate) = active_gate() {
         if gate
-            .before_url_request("POST", url, Some(body))
+            .before_url_request(method, url, Some(body))
             .await
             .is_err()
         {
             return None;
         }
     }
+    let method = reqwest::Method::from_bytes(method.to_ascii_uppercase().as_bytes()).ok()?;
     let start = std::time::Instant::now();
     match client
-        .post(url)
+        .request(method, url)
         .header("Content-Type", content_type)
         .body(body.to_string())
         .timeout(Duration::from_secs(8))
@@ -681,9 +894,9 @@ impl ScanPlugin for SqlInjectionPlugin {
         ];
 
         for payload in error_payloads {
-            let variants = build_injection_urls_adv(target, payload);
-            for (param, url) in variants {
-                if let Some((_, body)) = get_response_body(client, &url).await {
+            for point in injection_points(target, payload) {
+                let param = &point.param;
+                if let Some((_, body)) = send_injection_point(client, &point).await {
                     let body_lower = body.to_lowercase();
                     for sig in &db_signatures {
                         // Require the DB error to be NEW vs the baseline — i.e.
@@ -691,7 +904,7 @@ impl ScanPlugin for SqlInjectionPlugin {
                         if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
                             let snippet: String = body.chars().take(500).collect();
                             findings.push(
-                                crate::agent::poc::attach_get_poc(
+                                attach_point_poc(
                                     Finding::new(
                                         "SQL Injection (Error-Based)",
                                         Severity::Critical,
@@ -700,16 +913,16 @@ impl ScanPlugin for SqlInjectionPlugin {
                                         "Use parameterized queries or prepared statements. Never interpolate user input into SQL.",
                                         "active/sqli",
                                     )
-                                    .with_parameter(&param)
+                                    .with_parameter(param)
                                     .with_evidence(format!(
                                         "Payload `{}` produced DB error signature `{}` not present in baseline",
                                         payload, sig
                                     ))
                                     .with_cwe(89)
                                     .with_owasp("A03:2021 – Injection"),
-                                    &url,
+                                    &point,
                                     payload,
-                                    *sig,
+                                    sig,
                                     snippet,
                                     0,
                                 ),
@@ -759,15 +972,15 @@ impl ScanPlugin for PathTraversalPlugin {
         };
 
         for payload in payloads {
-            let variants = build_injection_urls_adv(target, payload);
-            for (param, url) in variants {
-                if let Some((_, body)) = get_response_body(client, &url).await {
+            for point in injection_points(target, payload) {
+                let param = &point.param;
+                if let Some((_, body)) = send_injection_point(client, &point).await {
                     let body_lower = body.to_lowercase();
                     for sig in &signatures {
                         if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
                             let snippet: String = body.chars().take(500).collect();
                             findings.push(
-                                crate::agent::poc::attach_get_poc(
+                                attach_point_poc(
                                     Finding::new(
                                         "Path Traversal — /etc/passwd Readable",
                                         Severity::Critical,
@@ -776,13 +989,13 @@ impl ScanPlugin for PathTraversalPlugin {
                                         "Validate and sanitize file path inputs. Use an allowlist of permitted paths.",
                                         "active/path-traversal",
                                     )
-                                    .with_parameter(&param)
+                                    .with_parameter(param)
                                     .with_evidence(format!("Payload: {} — Response contains '{}' (absent from baseline)", payload, sig))
                                     .with_cwe(22)
                                     .with_owasp("A01:2021 – Broken Access Control"),
-                                    &url,
+                                    &point,
                                     payload,
-                                    *sig,
+                                    sig,
                                     snippet,
                                     0,
                                 ),
@@ -1144,9 +1357,9 @@ impl ScanPlugin for CmdInjectionPlugin {
         };
 
         for (payload, sigs) in payloads_and_sigs {
-            let variants = build_injection_urls_adv(target, payload);
-            for (param, url) in variants {
-                if let Some((_, body)) = get_response_body(client, &url).await {
+            for point in injection_points(target, payload) {
+                let param = &point.param;
+                if let Some((_, body)) = send_injection_point(client, &point).await {
                     let body_lower = body.to_lowercase();
                     for sig in &sigs {
                         if crate::verify::signature_is_new(&baseline.body_lower, &body_lower, sig) {
@@ -1159,7 +1372,7 @@ impl ScanPlugin for CmdInjectionPlugin {
                                     "Never pass user input to shell commands. Use language APIs instead of shell exec. Apply strict input validation.",
                                     "active/cmd-injection",
                                 )
-                                .with_parameter(&param)
+                                .with_parameter(param)
                                 .with_evidence(format!("Payload '{}' — Response contains '{}' (absent from baseline)", payload, sig))
                                 .with_cwe(78)
                                 .with_owasp("A03:2021 – Injection")
@@ -1226,9 +1439,9 @@ impl ScanPlugin for SstiPlugin {
         ];
 
         for payload in &probes {
-            let variants = build_injection_urls_adv(target, payload);
-            for (param, url) in variants {
-                if let Some((_, body)) = get_response_body(client, &url).await {
+            for point in injection_points(target, payload) {
+                let param = &point.param;
+                if let Some((_, body)) = send_injection_point(client, &point).await {
                     // Confirmed only if: the product appears, the raw expression
                     // did NOT (so it was evaluated, not echoed), and the product
                     // was not already in the baseline.
@@ -1245,7 +1458,7 @@ impl ScanPlugin for SstiPlugin {
                                 "Never pass user input into template source. Use a logic-less/sandboxed template engine and pass data as bound variables.",
                                 "active/ssti",
                             )
-                            .with_parameter(&param)
+                            .with_parameter(param)
                             .with_evidence(format!(
                                 "Payload `{}` evaluated to `{}` ({}×{}), absent from baseline",
                                 payload, expected, a, b

@@ -1,0 +1,42 @@
+# External storage encryption evidence: etcd Secret encryption, KMS-backed disks and snapshots.
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - kms:
+          apiVersion: v2
+          name: aws-kms
+          endpoint: unix:///var/run/kmsplugin/socket.sock
+      - identity: {}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-kms
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  kmsKeyId: arn:aws:kms:eu-west-1:111122223333:key/fixture
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ebs-snap-kms
+driver: ebs.csi.aws.com
+deletionPolicy: Delete
+parameters:
+  encrypted: "true"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  storageClassName: gp3-kms
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi

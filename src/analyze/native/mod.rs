@@ -17,8 +17,10 @@ pub mod forms;
 pub mod hashes;
 pub mod js_surface;
 pub mod params;
+pub mod rust_auth;
 pub mod sbom;
 pub mod secrets;
+pub mod transport_encryption;
 
 pub const SOURCE_TOOL: &str = "rustzap-native";
 
@@ -38,12 +40,32 @@ pub const NATIVE_MODULES: &[&str] = &[
     "sast/dlp-pii",
     "sast/crypto-audit",
     "sca/native-sbom",
+    transport_encryption::TRANSPORT_PLUGIN,
+    transport_encryption::BACKUP_PLUGIN,
+    transport_encryption::STORAGE_PLUGIN,
+    "sast/rust-auth",
 ];
 
 pub struct NativeScanResult {
     pub findings: Vec<Finding>,
     pub inventory: Inventory,
     pub attack_plan: Vec<AttackPlanEntry>,
+    /// Analyzer/file caps that were hit (#41).
+    pub omitted: Vec<crate::coverage::OmittedRecord>,
+}
+
+/// Record `source` as capped when it produced at least `limit` results.
+fn note_cap(out: &mut Vec<crate::coverage::OmittedRecord>, source: &str, len: usize, limit: usize) {
+    if len >= limit {
+        out.push(crate::coverage::OmittedRecord {
+            source: source.to_string(),
+            limit,
+            omitted: None,
+            reason: format!(
+                "{source} stopped at its cap of {limit}; remaining results were not collected"
+            ),
+        });
+    }
 }
 
 /// Run inventory, then JS/HTML/param analyzers in parallel over `repo`,
@@ -55,7 +77,14 @@ pub async fn run(repo: &Path) -> Result<NativeScanResult> {
 /// Like [`run`], but with an explicit walk configuration (ignore/symlink flags).
 pub async fn run_with(repo: &Path, walk: WalkConfig) -> Result<NativeScanResult> {
     let files = collect_repo_files_with(repo, walk);
-    run_on_files(repo, &files).await
+    let mut res = run_on_files(repo, &files).await?;
+    note_cap(
+        &mut res.omitted,
+        "files",
+        files.len(),
+        inventory::MAX_REPO_FILES,
+    );
+    Ok(res)
 }
 
 pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanResult> {
@@ -83,6 +112,8 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     let sbom_root = Arc::clone(&root);
     let cloud_root = Arc::clone(&root);
     let cloud_files = Arc::clone(&files);
+    let rust_auth_root = Arc::clone(&root);
+    let rust_auth_files = Arc::clone(&files);
 
     let (
         js_res,
@@ -95,6 +126,7 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
         hashes_res,
         sbom_res,
         cloud_res,
+        rust_auth_res,
     ) = tokio::join!(
         tokio::task::spawn_blocking(move || js_surface::scan(js_root.as_path(), js_files.as_ref())),
         tokio::task::spawn_blocking(move || {
@@ -121,6 +153,9 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
         tokio::task::spawn_blocking(move || {
             cloud::scan(cloud_root.as_path(), cloud_files.as_ref())
         }),
+        tokio::task::spawn_blocking(move || {
+            rust_auth::scan(rust_auth_root.as_path(), rust_auth_files.as_ref())
+        }),
     );
 
     let js = js_res.context("js_surface analyzer task failed")?;
@@ -133,6 +168,46 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     let hashes_findings = hashes_res.context("hashes analyzer task failed")?;
     let sbom_report = sbom_res.context("sbom analyzer task failed")?;
     let cloud_findings = cloud_res.context("cloud analyzer task failed")?;
+    let rust_auth_findings = rust_auth_res.context("rust_auth analyzer task failed")?;
+
+    let mut omitted = Vec::new();
+    for (source, len, limit) in [
+        (
+            "sast/js-surface",
+            js.len(),
+            js_surface::MAX_SECRET_FINDINGS + js_surface::MAX_URL_FINDINGS + 20,
+        ),
+        ("sast/dom-sinks", sinks.len(), dom_sinks::MAX_SINK_FINDINGS),
+        (
+            "sast/forms",
+            form_result.findings.len(),
+            forms::MAX_FORM_FINDINGS,
+        ),
+        (
+            "sast/params",
+            param_result.findings.len(),
+            params::MAX_PARAM_FINDINGS,
+        ),
+        (
+            "sast/secrets",
+            secret_findings.len(),
+            secrets::MAX_SECRET_FINDINGS,
+        ),
+        (
+            "iac/native",
+            config_findings.len(),
+            config_audit::MAX_CONFIG_FINDINGS,
+        ),
+        ("sast/dlp-pii", dlp_findings.len(), dlp::MAX_DLP_FINDINGS),
+        (
+            "sast/crypto-audit",
+            hashes_findings.len(),
+            hashes::MAX_CRYPTO_FINDINGS,
+        ),
+        ("iac/cloud", cloud_findings.len(), 100),
+    ] {
+        note_cap(&mut omitted, source, len, limit);
+    }
 
     let mut findings = vec![inv_finding];
     findings.extend(js);
@@ -145,6 +220,17 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
     findings.extend(hashes_findings);
     findings.extend(sbom_report.findings);
     findings.extend(cloud_findings);
+    // Kept outside the join tuple above to keep this wiring additive.
+    let te_root = Arc::clone(&root);
+    let te_files = Arc::clone(&files);
+    findings.extend(
+        tokio::task::spawn_blocking(move || {
+            transport_encryption::scan(te_root.as_path(), te_files.as_ref())
+        })
+        .await
+        .context("transport_encryption analyzer task failed")?,
+    );
+    findings.extend(rust_auth_findings);
     sort_native_findings(&mut findings);
 
     let mut attack_plan = form_result.attack_plan;
@@ -154,6 +240,7 @@ pub async fn run_on_files(repo: &Path, files: &[PathBuf]) -> Result<NativeScanRe
         findings,
         inventory,
         attack_plan: merge_attack_plan(attack_plan),
+        omitted,
     })
 }
 

@@ -21,6 +21,7 @@ Use this file so changes to **RustZAP** are correct, safe, and shippable. When i
 - `rate-limit-missing` is a **bounded detection probe** (a fixed ≤15-request burst through `HttpSafetyGate`, checking only for the *absence* of 429/503/`Retry-After`), not a load/DoS attack. It is opt-in only and must never be added to a CLI default `--plugins` list. Actual load/stress testing against an authorized target is the separate, already-opt-in `rustzap stress` subcommand (`src/stress.rs`) — do not blur the two or make `rate-limit-missing` send more than its fixed burst size.
 - `cache-deception` and `cache-poisoning` (`src/cache_abuse.rs`) are opt-in only — higher false-positive risk (they require a shared cache in front of the target to mean anything) and heavier request patterns than the rest of the active suite.
 - `rfi` (`src/active.rs`) follows the `sqli-oob` pattern: inert unless `RUSTZAP_OOB_DOMAIN` names a listener, and even then only reports `tentative` — never infer success from the HTTP response.
+- `auth-lifecycle` (subcommand), `--auth-a/--auth-b`, `--authz-matrix`, `--browser-discovery` and `--jwt-crack` are opt-in only. `auth-lifecycle` changes account state: it requires the scenario's synthetic-identity and mutation acknowledgements and is refused under `--read-only-safe`.
 
 ---
 
@@ -41,7 +42,7 @@ Before saying work is complete:
 cargo test
 ```
 
-(There are **195** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, TUI analyze helpers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
+(There are **565** integration + unit tests today — **adding tests for new logic is strongly preferred**, especially for passive helpers, native static analyzers, TUI analyze helpers, and report serialization. Golden passive matrix: `tests/passive_golden.rs`.)
 
 ### Smoke run (after build)
 
@@ -64,7 +65,14 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 | `src/passive.rs` | Header/body checks; `PassiveScanner::check_url` |
 | `src/active.rs` | `ScanPlugin` trait; **registered** active plugins (incl. `crlf-injection`, `host-header-injection`, `rfi`) |
 | `src/sqli_advanced.rs` | Extra `ScanPlugin` types — **verify whether `mod sqli_advanced` exists in `main.rs`** when debugging “plugin missing” |
-| `src/sensitive_paths.rs` | `sensitive-paths` opt-in plugin — curated well-known/backup path wordlist |
+| `src/sensitive_paths.rs` | `sensitive-paths` opt-in plugin — bounded GETs vs a missing-path baseline, per-file content checks, management-surface recognition (Prometheus, Keycloak, Argo CD) |
+| `src/active/authz.rs` | Opt-in multi-identity BOLA / authz matrix (`--auth-a/--auth-b`, `--authz-matrix`) |
+| `src/active/auth_lifecycle.rs` | Opt-in `auth-lifecycle` subcommand (state-changing; never a plugin) |
+| `src/browser_discovery.rs` | Opt-in headless-browser discovery over CDP (scope, budgets, exclusions enforced) |
+| `src/coverage.rs` | Execution coverage: `ExecutionRecord`/`Outcome`/`Coverage`; request counts via a task-local fed by `HttpSafetyGate` |
+| `src/evidence.rs` | Shared export redaction + finding fingerprint (single source of truth; `agent::trace::redact` re-exports it) |
+| `src/finding_dedup.rs`, `src/jwt.rs` | Finding dedup into `instances[]`; `passive/jwt` pass (`--jwt-crack` opt-in) |
+| `src/analyze/native/rust_auth.rs`, `transport_encryption.rs` | `sast/rust-auth` (syn; fixtures in `tests/fixtures/rust_auth/` are data only); `iac/*-encryption` |
 | `src/cache_abuse.rs` | Opt-in `cache-deception` / `cache-poisoning` plugins |
 | `src/rate_limit.rs` | Opt-in `rate-limit-missing` plugin — bounded burst, not a load/DoS attack |
 | `src/report.rs` | JSON/CSV/HTML report; `Finding` aggregation |
@@ -101,7 +109,7 @@ Use **localhost or lab targets** (e.g. docker-compose Juice-Shop from README) fo
 
 ### Active scan gating (critical)
 
-In `active.rs`, URLs **without** query parameters are **skipped** for active scanning unless the URL string contains `'?'`. Do not “fix” this without understanding impact on crawl-only pages and traffic volume.
+In `active.rs`, URLs **without** query parameters are **skipped** for active scanning unless the URL string contains `'?'`. Do not “fix” this without understanding impact on crawl-only pages and traffic volume. Exception: imported requests with a JSON body (`has_json_body`, OpenAPI/HAR, never DELETE) pass the gate so body fields get fuzzed; `--read-only-safe` blocks them.
 
 ### Passive checks
 

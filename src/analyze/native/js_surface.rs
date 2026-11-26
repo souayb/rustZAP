@@ -10,8 +10,8 @@ use crate::analyze::inventory::{
 use crate::analyze::native::SOURCE_TOOL;
 use crate::types::{CodeLocation, Confidence, Finding, Severity};
 
-const MAX_SECRET_FINDINGS: usize = 50;
-const MAX_URL_FINDINGS: usize = 30;
+pub(crate) const MAX_SECRET_FINDINGS: usize = 50;
+pub(crate) const MAX_URL_FINDINGS: usize = 30;
 
 struct JsPatterns {
     secrets: Vec<(&'static str, Regex)>,
