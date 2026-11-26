@@ -70,6 +70,50 @@ pub struct ScanConfig {
     pub authz: crate::active::authz::AuthzOptions,
 }
 
+/// Credentials sent with every scan request. A flag wins; otherwise the matching
+/// `RUSTZAP_*` environment variable is used (keeps secrets out of argv and off the TUI).
+#[derive(clap::Args, Clone, Default)]
+pub struct AuthArgs {
+    /// Cookie header value, e.g. "session=abc; role=user" (env: RUSTZAP_COOKIES)
+    #[arg(long)]
+    pub cookies: Option<String>,
+    /// Authorization header value, e.g. "Bearer <token>" (env: RUSTZAP_AUTH)
+    #[arg(long)]
+    pub auth: Option<String>,
+    /// API key header as "Name: value" (env: RUSTZAP_API_KEY)
+    #[arg(long)]
+    pub api_key: Option<String>,
+    /// Basic auth as "username:password" (env: RUSTZAP_BASIC_AUTH)
+    #[arg(long)]
+    pub basic_auth: Option<String>,
+}
+
+impl AuthArgs {
+    /// Fill unset credentials from the environment (`lookup` is `std::env::var` in production).
+    pub fn resolve_with(self, lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let pick = |flag: Option<String>, var: &str| {
+            flag.or_else(|| lookup(var).filter(|v| !v.is_empty()))
+        };
+        Self {
+            cookies: pick(self.cookies, "RUSTZAP_COOKIES"),
+            auth: pick(self.auth, "RUSTZAP_AUTH"),
+            api_key: pick(self.api_key, "RUSTZAP_API_KEY"),
+            basic_auth: pick(self.basic_auth, "RUSTZAP_BASIC_AUTH"),
+        }
+    }
+
+    pub fn resolve(self) -> Self {
+        self.resolve_with(|v| std::env::var(v).ok())
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.cookies.is_some()
+            || self.auth.is_some()
+            || self.api_key.is_some()
+            || self.basic_auth.is_some()
+    }
+}
+
 /// Shared HTTP client factory
 pub fn build_client(config: &ScanConfig) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
@@ -961,6 +1005,25 @@ fn unique_hosts(discovered: &[DiscoveredUrl]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::types::UrlSource;
+
+    #[test]
+    fn auth_args_flag_wins_then_env_and_empty_env_is_ignored() {
+        let env = |v: &str| match v {
+            "RUSTZAP_AUTH" => Some("Bearer env".to_string()),
+            "RUSTZAP_COOKIES" => Some("sid=env".to_string()),
+            "RUSTZAP_API_KEY" => Some(String::new()),
+            _ => None,
+        };
+        let a = AuthArgs {
+            auth: Some("Bearer flag".into()),
+            ..Default::default()
+        }
+        .resolve_with(env);
+        assert_eq!(a.auth.as_deref(), Some("Bearer flag"));
+        assert_eq!(a.cookies.as_deref(), Some("sid=env"));
+        assert!(a.api_key.is_none() && a.basic_auth.is_none());
+        assert!(a.is_set() && !AuthArgs::default().is_set());
+    }
 
     fn du(url: &str) -> DiscoveredUrl {
         DiscoveredUrl::new(url, "GET", UrlSource::Seed)

@@ -773,6 +773,14 @@ rustzap scan \
   --basic-auth "username:password"
 ```
 
+`rustzap audit --target URL` accepts the same four flags for its live-scan half.
+
+Each credential can also come from an environment variable, which keeps secrets out of the process arguments (a flag wins when both are set): `RUSTZAP_COOKIES`, `RUSTZAP_AUTH`, `RUSTZAP_API_KEY`, `RUSTZAP_BASIC_AUTH`. The TUI Scan tab has no credential fields; it uses these variables and shows whether any are set, never their values.
+
+```bash
+RUSTZAP_AUTH="Bearer eyJhbGciOiJIUzI1NiJ9..." rustzap tui
+```
+
 Use authentication only against systems you are authorized to assess.
 
 ---

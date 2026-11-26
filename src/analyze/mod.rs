@@ -724,6 +724,7 @@ pub async fn run_audit_cli(
     active_all_paths: bool,
     passive_all_methods: bool,
     safety: crate::safety::SafetyPolicy,
+    creds: crate::scanner::AuthArgs,
 ) -> Result<()> {
     let start = Instant::now();
     let parsed_tools = parse_tools(&tools)?;
@@ -769,10 +770,10 @@ pub async fn run_audit_cli(
             sarif_out: None,
             timeout_secs: timeout,
             user_agent: None,
-            cookies: None,
-            auth_header: None,
-            api_key: None,
-            basic_auth: None,
+            cookies: creds.cookies,
+            auth_header: creds.auth,
+            api_key: creds.api_key,
+            basic_auth: creds.basic_auth,
             insecure,
             plugins: plugins.split(',').map(|s| s.trim().to_string()).collect(),
             openapi_path: None,
@@ -1434,6 +1435,7 @@ mod tests {
             false,
             false,
             crate::safety::SafetyPolicy::default(),
+            Default::default(),
         )
         .await
         .expect("audit static");
