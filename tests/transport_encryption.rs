@@ -16,7 +16,26 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn run(name: &str) -> Vec<Finding> {
-    let root = fixture(name);
+    let src = fixture(name);
+    // `.env` may not be committed (scripts/dev-check.sh), so the fixture ships it as
+    // `dotenv` and the test materialises the real name in a temp copy.
+    let root = if src.join("dotenv").exists() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rz-te-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for e in std::fs::read_dir(&src).unwrap() {
+            let e = e.unwrap();
+            let n = e.file_name();
+            let to = if n == "dotenv" { ".env".into() } else { n };
+            std::fs::copy(e.path(), tmp.join(to)).unwrap();
+        }
+        tmp
+    } else {
+        src
+    };
     scan(&root, &collect_repo_files(&root))
 }
 

@@ -332,7 +332,8 @@ async fn secrets_never_appear_in_findings() {
     let f = run_ok(&scenario(&base, FULL_POLICY, API_STEPS)).await;
     let out = serde_json::to_string(&f).unwrap();
     for secret in [ORIGINAL_PW, NEW_PW, FALLBACK_PW, "SECRET"] {
-        assert!(!out.contains(secret), "leaked `{secret}` in {out}");
+        // No secret or output in the message: a failure must not print them.
+        assert!(!out.contains(secret), "a secret leaked into findings");
     }
 }
 

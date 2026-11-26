@@ -23,8 +23,6 @@ Thumbs.db
 .env
 .env.*
 !.env.example
-# Fake compose interpolation fixture for env-override resolution tests
-!tests/fixtures/transport_encryption/compose_vulnerable/.env
 
 # Generated scanner / analyzer / stress output (CLI, TUI, docker compose)
 /report.json
